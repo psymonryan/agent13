@@ -1,0 +1,45 @@
+---
+language: "{{LANGUAGE}}"
+title: "{{TITLE}}"
+description: "{{DESCRIPTION}}"
+---
+
+```{{LANGUAGE}}
+# {{CODE_DESCRIPTION}}
+
+{{CODE}}
+```
+
+## Usage Notes
+
+- **Purpose**: {{PURPOSE}}
+- **Parameters**: {{PARAMETERS}}
+- **Returns**: {{RETURNS}}
+- **Dependencies**: {{DEPENDENCIES}}
+
+## Example Integration
+
+```yaml
+skill:
+  name: {{SKILL_NAME}}
+  action: {{ACTION_NAME}}
+  parameters:
+    code: "{{CODE_SNIPPET}}"
+    language: "{{LANGUAGE}}"
+```
+
+## Best Practices
+
+1. {{BEST_PRACTICE_1}}
+2. {{BEST_PRACTICE_2}}
+3. {{BEST_PRACTICE_3}}
+
+## Error Handling
+
+```{{LANGUAGE}}
+try:
+    {{CODE}}
+except {{EXCEPTION_TYPE}} as e:
+    # Handle error: {{ERROR_DESCRIPTION}}
+    {{ERROR_HANDLING_CODE}}
+```

@@ -1,0 +1,161 @@
+---
+# Basic Skill with Templates
+# Demonstrates how to use templates within a skill
+
+name: "basic-skill-with-templates"
+version: "1.0.0"
+
+description: |
+  A skill template that demonstrates using template files for reusable components.
+  
+  What: This skill shows how to structure skills with template files
+  When: Use this as a starting point for skills that need reusable components
+
+author: "Your Name or Organization"
+license: "MIT"
+
+keywords: ["template", "reusable", "components"]
+requirements: "None"
+
+# End of YAML frontmatter ---
+---
+
+# Skill Documentation
+
+## Overview
+
+This template demonstrates how to structure a skill with reusable template files stored in the `assets/templates/` directory.
+
+## Directory Structure
+
+```
+.vibe/skills/my-skill/
+├── SKILL.md          # Main skill documentation
+├── README.md         # Quick reference
+├── assets/
+│   ├── templates/    # Reusable templates
+│   │   ├── template1.md
+│   │   └── template2.md
+│   └── ...           # Other assets
+├── references/       # Detailed documentation
+└── scripts/          # Utility scripts
+```
+
+## Using Templates
+
+### Template Reference
+
+This skill includes the following templates:
+
+- `assets/templates/example-template.md` - A reusable documentation template
+- `assets/templates/code-snippet.yml` - A code snippet template
+
+### How to Use Templates
+
+1. Store reusable components in `assets/templates/`
+2. Reference them in your documentation using relative paths
+3. Include them using markdown include syntax or copy them as needed
+
+## Example Template Usage
+
+```markdown
+<!-- Include a template -->
+include: assets/templates/example-template.md
+
+<!-- Or reference it -->
+See the [example template](assets/templates/example-template.md) for details.
+```
+
+## Best Practices for Template-Based Skills
+
+1. **Keep templates generic**: Design templates to be reusable across multiple skills
+2. **Document template parameters**: Clearly document what variables need to be replaced
+3. **Version your templates**: Include version information in templates
+4. **Provide examples**: Show how to use each template with real-world scenarios
+5. **Organize by category**: Group related templates together
+
+## Creating New Templates
+
+When creating templates for your skill:
+
+1. Place them in `assets/templates/`
+2. Name them descriptively (e.g., `api-integration.yml`, `configuration-guide.md`)
+3. Include usage instructions within the template itself
+4. Document the template in your main SKILL.md file
+
+## Template Examples
+
+### Example 1: Documentation Template
+
+```markdown
+---
+title: "Documentation Template"
+version: "1.0"
+---
+
+# {{TITLE}}
+
+## Overview
+
+{{OVERVIEW}}
+
+## Usage
+
+{{USAGE_INSTRUCTIONS}}
+
+## Examples
+
+{{EXAMPLES}}
+```
+
+### Example 2: Code Snippet Template
+
+```yaml
+---
+language: "python"
+title: "Example Code Snippet"
+---
+
+```python
+# {{DESCRIPTION}}
+
+def {{FUNCTION_NAME}}({{PARAMETERS}}):
+    """{{DOCSTRING}}"""
+    {{CODE}}
+```
+
+## Template Management
+
+### Validating Templates
+
+Ensure your templates are valid by:
+
+1. Checking YAML frontmatter syntax (if used)
+2. Verifying all placeholders are documented
+3. Testing templates with real content
+4. Ensuring templates work in the target context
+
+### Updating Templates
+
+When updating templates:
+
+1. Increment the version in the template's frontmatter
+2. Document changes in the template's header
+3. Update any skills that use the template
+4. Consider backward compatibility
+
+## Troubleshooting Template Issues
+
+### Common Issues
+
+- **Placeholder not replaced**: Ensure all `{{PLACEHOLDER}}` tags are replaced
+- **Template not found**: Verify the path is correct and relative to the calling file
+- **Syntax errors**: Check YAML/Markdown syntax in templates
+- **Context mismatch**: Ensure templates are designed for the right use case
+
+### Debugging Tips
+
+1. Test templates in isolation before integrating
+2. Use simple examples first, then add complexity
+3. Document all template parameters and requirements
+4. Provide fallback content for optional parameters

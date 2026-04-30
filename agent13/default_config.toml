@@ -1,0 +1,70 @@
+# Agent13 Configuration
+# Config directory: ~/.agent13 (or $AGENT13_CONFIG_DIR)
+# Environment: ~/.env then ./.env (local overrides global)
+
+[[providers]]
+name = "studio"
+api_base = "http://c10:8012/v1"
+api_key_env_var = "OPENAI_API_KEY"
+
+[[providers]]
+name = "studio-oMLX"
+api_base = "http://c10:8111/v1"
+api_key_env_var = "OPENAI_API_KEY"
+
+[[providers]]
+name = "openrouter"
+api_base = "https://openrouter.ai/api/v1"
+api_key_env_var = "OPENROUTER_API_KEY"
+
+[[providers]]
+name = "c144"
+api_base = "http://c144:8012/v1"
+api_key_env_var = "OPENAI_API_KEY"
+# read_timeout = 2400  # Seconds to wait for tokens during streaming (default: 2400)
+# connect_timeout = 30  # Seconds to wait for initial connection (default: 30)
+
+# Use this for testing with model 'devstral2'
+[[providers]]
+name = "test"
+api_base = "http://c144:8012/v1"
+api_key_env_var = "OPENAI_API_KEY"
+
+[[providers]]
+name = "green"
+api_base = "http://green:9292/v1"
+api_key_env_var = "OPENAI_API_KEY"
+
+# Global tool filtering (applies to ALL tools: builtin + MCP)
+# If enabled_tools is non-empty, only matching tools are active (whitelist)
+# Otherwise, disabled_tools acts as a blacklist
+# Patterns: glob (tui_*) or regex (re:^tui.*)
+# enabled_tools = []
+# disabled_tools = ["tui_*"]
+
+# MCP Servers - HTTP transport (remote)
+# [[mcp_servers]]
+# name = "hvac_server"
+# transport = "http"
+# url = "http://c10.vestek.lan:4040/mcp"
+# enabled_tools = []
+# disabled_tools = []
+
+# MCP Servers - stdio transport (local process)
+[[mcp_servers]]
+name = "web_research"
+transport = "stdio"
+command = "uvx"
+args = ["web-research-assistant"]
+env = { "SEARXNG_BASE_URL" = "http://searxng/search" }
+enabled_tools = []
+disabled_tools = []
+
+[[mcp_servers]]
+name = "fetch_server"
+transport = "stdio"
+command = "uvx"
+args = ["mcp-server-fetch", "--ignore-robots-txt"]
+env = {}
+enabled_tools = []
+disabled_tools = []

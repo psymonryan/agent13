@@ -1,0 +1,76 @@
+---
+# Basic Skill Template
+# This is a minimal valid skill template following the agentskills.io specification
+
+name: "basic-skill"  # Must match directory name, lowercase alphanumeric + hyphens only
+version: "1.0.0"  # Semantic versioning
+
+description: |
+  A brief description of what this skill does and when to use it.
+  
+  What: This skill provides [brief description of functionality]
+  When: Use this skill when [brief description of use case]
+
+author: "Your Name or Organization"
+license: "MIT"  # or "Apache-2.0", "GPL-3.0", etc.
+
+# Optional fields
+keywords: ["example", "template", "basic"]
+requirements: "None"  # or list specific requirements
+
+# End of YAML frontmatter ---
+---
+
+# Skill Documentation
+
+## Getting Started
+
+This is a basic skill template. Replace this content with your skill's documentation.
+
+### Prerequisites
+
+List any prerequisites or dependencies here.
+
+### Installation
+
+If your skill requires installation, describe it here.
+
+### Usage
+
+Provide examples of how to use this skill:
+
+```yaml
+# Example usage
+skill:
+  name: basic-skill
+  action: example_action
+  parameters:
+    param1: value1
+    param2: value2
+```
+
+## Reference
+
+### Actions
+
+List all available actions and their parameters:
+
+- `example_action`: Description of what this action does
+  - `param1`: Description of parameter 1
+  - `param2`: Description of parameter 2
+
+### Parameters
+
+Describe all parameters in detail.
+
+## Examples
+
+Provide complete examples of using this skill.
+
+## Best Practices
+
+Include any best practices or recommendations for using this skill.
+
+## Troubleshooting
+
+List common issues and their solutions.

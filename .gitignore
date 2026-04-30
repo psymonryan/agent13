@@ -1,0 +1,24 @@
+# OS
+.DS_Store
+
+# Project
+samples
+.agent13
+
+# Python
+__pycache__/
+*.py[cod]
+
+# Testing
+pytest-of-*
+.pytest_cache/
+
+# Virtual env
+.venv/
+venv/
+
+# Build artifacts
+dist/
+build/
+*.egg-info/
+.testing

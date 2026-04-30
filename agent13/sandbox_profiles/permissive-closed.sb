@@ -1,0 +1,90 @@
+;; permissive-closed.sb
+;; Sandbox profile for permissive-closed mode
+;; - File write: project directory only
+;; - File read: anywhere
+;; - Network: blocked
+;;
+;; Parameters (set via -D on sandbox-exec command line):
+;;   PROJECT_DIR  - the project working directory
+;;   AGENT_DIR    - agent config dir (~/.agent13 or AGENT13_CONFIG_DIR)
+;;   USER_CACHE   - user cache dir (~/.cache)
+;;   USER_LOCAL   - user local share dir (~/.local/share)
+;;   USER_LOCAL_BIN - user local bin dir (~/.local/bin)
+;;   USER_HOME_SSH - user SSH directory (~/.ssh)
+
+(version 1)
+(deny default)
+
+;; Allow all reads
+(allow file-read*)
+
+;; Allow writes only to project directory
+(allow file-write*
+    (subpath (param "PROJECT_DIR")))
+
+;; Allow writes to agent config directory (history, etc.)
+(allow file-write*
+    (subpath (param "AGENT_DIR")))
+
+;; Allow writes to /tmp directory (note: /tmp is symlink to /private/tmp on macOS)
+(allow file-write*
+    (subpath "/tmp")
+    (subpath "/private/tmp")
+    (subpath "/var/folders")
+    (subpath "/private/var/folders"))
+
+;; Deny network access
+(deny network*)
+
+;; Allow process execution
+(allow process-exec
+    (subpath (param "PROJECT_DIR"))
+    (subpath "/usr/bin")
+    (subpath "/bin")
+    (subpath "/usr/local/bin")
+    (subpath "/opt/local/bin")
+    (subpath "/Library/Developer/CommandLineTools")
+    (subpath (param "USER_CACHE"))
+    (subpath (param "USER_LOCAL"))
+    (subpath (param "USER_LOCAL_BIN"))
+    (subpath "/opt/local/Library/Frameworks/Python.framework")
+    (literal "/usr/bin/env")
+    (literal "/opt/local/bin/uv")
+    (literal "/opt/local/bin/uvx"))
+
+;; Allow process fork
+(allow process-fork)
+
+;; Allow signals
+(allow signal)
+
+;; Allow mach lookups (needed for many system services)
+(allow mach-lookup)
+
+;; Allow sysctl read
+(allow sysctl-read)
+
+;; Allow device access (needed for /dev/null, etc.)
+(allow file-read* file-write* (literal "/dev/null"))
+(allow file-read* (literal "/dev/urandom"))
+(allow file-read* (literal "/dev/random"))
+
+;; Allow PTY devices (needed for pexpect tests)
+(allow file-read* file-write*
+    (literal "/dev/ptmx")
+    (regex #"^/dev/ttys[0-9]+$"))
+
+;; Allow ioctl for PTY
+(allow file-ioctl
+    (literal "/dev/ptmx")
+    (regex #"^/dev/ttys[0-9]+$"))
+
+;; Allow IPC
+(allow ipc-posix-sem)
+(allow ipc-posix-shm)
+(allow ipc-sysv-sem)
+(allow ipc-sysv-shm)
+
+;; Allow writes to SSH directory (known_hosts updates via ssh)
+(allow file-write*
+    (subpath (param "USER_HOME_SSH")))

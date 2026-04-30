@@ -13,10 +13,10 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v4
+        uses: astral-sh/setup-uv@v8.1.0
 
       - name: Set up Python
         run: uv python install 3.11
@@ -24,10 +24,31 @@ jobs:
       - name: Build package
         run: uv build
 
-      - name: Create Release
-        uses: softprops/action-gh-release@v2
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v5
         with:
-          files: dist/*.whl dist/*.tar.gz
+          name: dist
+          path: dist/
+
+      - name: Security audit dependencies
+        run: |
+          python -m venv /tmp/audit-venv
+          /tmp/audit-venv/bin/pip install --upgrade pip
+          /tmp/audit-venv/bin/pip install pip-audit dist/*.whl
+          /tmp/audit-venv/bin/pip-audit
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v5
+        with:
+          name: dist
+          path: dist/
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v3
+        with:
+          files: |
+            dist/*.whl
+            dist/*.tar.gz
           generate_release_notes: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -1,0 +1,4 @@
+# Rename this to .env (or add these items to the one in your ~/.env)
+OPENAI_API_KEY=dummy
+OPENAI_BASE_URL=http:localhost:8012/v1
+OPENROUTER_API_KEY="sk-or-v1-1234566788876_This_is_a_fake_key_7788765443445566777654444566788"

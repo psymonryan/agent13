@@ -1,6 +1,6 @@
 [project]
 name = "agent13"
-version = "0.1.9"
+version = "0.1.10"
 description = "Context-lean AI agent - minimal VRAM fits in a small cupboard, a postbox or even a clock"
 readme = "README.md"
 requires-python = ">=3.10"

@@ -11,6 +11,7 @@ Config keys (in ~/.agent13/config.toml):
 
 import json
 import logging
+import os
 import subprocess
 import tempfile
 from datetime import datetime, timezone
@@ -138,14 +139,17 @@ def _build_manual_command(wheel_url: str) -> str:
     return f"uv tool install --force {wheel_url}"
 
 
-def check_for_update(interval_hours: float = 24) -> Optional[str]:
+def check_for_update(
+    interval_hours: float = 24,
+) -> Optional[dict]:
     """Check if a newer version is available on GitHub.
 
     Args:
         interval_hours: Minimum hours between checks (throttle).
 
     Returns:
-        A notification string if an update is available, None otherwise.
+        A dict with update info if an update is available, None otherwise.
+        Dict keys: remote_tag, local_version, wheel_url, manual_cmd
     """
     if not _should_check(interval_hours):
         return None
@@ -161,18 +165,43 @@ def check_for_update(interval_hours: float = 24) -> Optional[str]:
     if _is_newer(remote_tag, __version__):
         wheel_url = release.get("wheel_url", "")
         manual_cmd = _build_manual_command(wheel_url) if wheel_url else ""
-        parts = [
-            f"⬆ Update available: {remote_tag} (you have {__version__}).",
-            "Type /upgrade to apply.",
-        ]
-        if manual_cmd:
-            parts.append(f"Or run: {manual_cmd}")
-        parts.append(
-            "Disable these notifications: set check_enabled = false "
-            "in [updates] section of ~/.agent13/config.toml"
-        )
-        return " ".join(parts)
+        return {
+            "remote_tag": remote_tag,
+            "local_version": __version__,
+            "wheel_url": wheel_url,
+            "manual_cmd": manual_cmd,
+        }
     return None
+
+
+def format_update_notice(info: dict) -> str:
+    """Format update info dict into a human-readable multi-line notice.
+
+    Args:
+        info: Dict from check_for_update() with keys:
+              remote_tag, local_version, wheel_url, manual_cmd
+
+    Returns:
+        Formatted multi-line string suitable for terminal display.
+    """
+    remote_tag = info["remote_tag"]
+    local_version = info["local_version"]
+    manual_cmd = info.get("manual_cmd", "")
+
+    lines = [
+        f"⬆ Update available: {remote_tag} (you have {local_version})",
+        "",
+        "  From TUI use:  /upgrade",
+    ]
+    if manual_cmd:
+        lines.append(f"  Or run:        {manual_cmd}")
+    lines.append("")
+    lines.append(
+        "  To disable this check set:\n"
+        "      check_enabled = false in [updates] section\n"
+        "  of ~/.agent13/config.toml"
+    )
+    return "\n".join(lines)
 
 
 def perform_update() -> tuple[bool, str]:
@@ -216,12 +245,16 @@ def perform_update() -> tuple[bool, str]:
         )
 
     # Step 3: Write wheel to temp file and install
+    #   uv validates wheel filenames against PEP 427, which requires
+    #   {distribution}-{version}-{python}-{abi}-{platform}.whl — a bare
+    #   tmpXXXX.whl will be rejected.  Extract the real filename from
+    #   the URL so the temp path passes validation.
     try:
-        with tempfile.NamedTemporaryFile(
-            suffix=".whl", delete=False
-        ) as tmp:
-            tmp.write(resp.content)
-            tmp_path = tmp.name
+        wheel_name = wheel_url.rsplit("/", 1)[-1]  # e.g. agent13-0.2.0-py3-none-any.whl
+        tmp_dir = tempfile.gettempdir()
+        tmp_path = os.path.join(tmp_dir, wheel_name)
+        with open(tmp_path, "wb") as f:
+            f.write(resp.content)
 
         result = subprocess.run(
             ["uv", "tool", "install", "--force", tmp_path],
@@ -251,7 +284,6 @@ def perform_update() -> tuple[bool, str]:
     finally:
         # Clean up temp file
         try:
-            import os
             os.unlink(tmp_path)
         except (OSError, NameError):
             pass

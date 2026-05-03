@@ -19,22 +19,29 @@ Agent13 works with any OpenAI-compatible endpoint:
 - **Ollama** - Local model runner (with OpenAI-compatible endpoint) - based on llama.cpp (which tbh I'd prefer)
 - **Any OpenAI API** - Direct connection to OpenAI (never actually tried this)
 
-## Step 1: Install Agent13
+## Step 1: Install
+
+Make sure you have [uv](https://docs.astral.sh/uv/getting-started/installation/#installation-methods) installed:
 
 ```bash
-# Clone from source
+curl -LsSf https://astral.sh/uv/install.sh | sh
+```
+
+Install package directly from github:
+
+```
+uv tool install https://github.com/psymonryan/agent13/releases/download/v0.1.10/agent13-0.1.10-py3-none-any.whl
+```
+
+Or install from source (for hacking on the agent itself):
+
+```bash
 git clone https://github.com/psymonryan/agent13
 cd agent13
 uv sync
-
-# Install as a development tool
-uv tool install -e .
-```
-
-Verify the installation:
-
-```bash
-agent13 --version
+uv run agent13.py      # run from source
+# or
+uv tool install -e .   # install as editable tool
 ```
 
 ## Step 2: Set Up Your API Key

@@ -107,7 +107,6 @@ description: What this skill does and when to use it.
 | `license` | License information | `license: MIT` |
 | `compatibility` | Environment requirements | `compatibility: Requires Docker Swarm, bash, jq` |
 | `metadata` | Additional metadata | `metadata:\n  version: 1.0.0\n  author: Your Name` |
-| `allowed-tools` | Pre-approved tools (experimental) | `allowed-tools: bash grep read_file` |
 
 ### Frontmatter Examples
 

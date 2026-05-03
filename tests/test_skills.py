@@ -18,8 +18,6 @@ class TestSkillMetadata:
         )
         assert meta.name == "test-skill"
         assert meta.description == "A test skill"
-        assert meta.user_invocable is True
-        assert meta.allowed_tools == []
 
     def test_metadata_with_all_fields(self):
         """Test metadata with all optional fields."""
@@ -29,24 +27,11 @@ class TestSkillMetadata:
             license="MIT",
             compatibility="python>=3.10",
             metadata={"author": "test"},
-            allowed_tools=["command", "read_file"],
-            user_invocable=False,
         )
         assert meta.name == "full-skill"
         assert meta.license == "MIT"
         assert meta.compatibility == "python>=3.10"
         assert meta.metadata == {"author": "test"}
-        assert meta.allowed_tools == ["command", "read_file"]
-        assert meta.user_invocable is False
-
-    def test_allowed_tools_string_parsing(self):
-        """Test that allowed_tools can be a space-separated string."""
-        meta = SkillMetadata(
-            name="tool-skill",
-            description="Skill with tools",
-            allowed_tools="command read_file edit_file",
-        )
-        assert meta.allowed_tools == ["command", "read_file", "edit_file"]
 
     def test_invalid_name_pattern(self):
         """Test that invalid names are rejected."""
@@ -173,39 +158,6 @@ description: A test skill for discovery
         manager = SkillManager(mock_config)
         assert "test-skill" in manager.skills
         assert manager.skills["test-skill"].description == "A test skill for discovery"
-
-    def test_user_invocable_filter(self, tmp_path):
-        """Test filtering user-invocable skills."""
-        # Create user-invocable skill
-        skill1_dir = tmp_path / "public-skill"
-        skill1_dir.mkdir()
-        (skill1_dir / "SKILL.md").write_text("""---
-name: public-skill
-description: Public skill
-user-invocable: true
----
-""")
-
-        # Create non-user-invocable skill
-        skill2_dir = tmp_path / "private-skill"
-        skill2_dir.mkdir()
-        (skill2_dir / "SKILL.md").write_text("""---
-name: private-skill
-description: Private skill
-user-invocable: false
----
-""")
-
-        def mock_config():
-            class MockConfig:
-                skill_paths = [tmp_path]
-                include_skills = False
-
-            return MockConfig()
-
-        manager = SkillManager(mock_config)
-        assert "public-skill" in manager.user_invocable_skills
-        assert "private-skill" not in manager.user_invocable_skills
 
     def test_skill_shadowing(self, tmp_path):
         """Test that earlier skills shadow later ones."""

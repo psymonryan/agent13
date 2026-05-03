@@ -1,10 +1,10 @@
-# Getting Started with Agent13
+# Getting Started with agent13
 
-A step-by-step guide to get Agent13 running for the first time.
+A step-by-step guide to get agent13 running for the first time.
 
 ## Prerequisites
 
-- **Python 3.11+** - Agent13 requires Python 3.11 or later
+- **Python 3.11+** - agent13 requires Python 3.11 or later
 - **uv** - Modern Python package manager ([install uv](https://docs.astral.sh/uv/getting-started/installation/))
 - **An OpenAI-compatible API** - Any server that speaks the OpenAI chat completions API with tool calling support
 
@@ -113,10 +113,10 @@ For best results with Agent13, use models with strong tool-calling support:
 | Model        | Provider            | Notes                                                                   |
 | ------------ | ------------------- | ----------------------------------------------------------------------- |
 | Qwen-3.6-27B | Local               | Excellent tool calling, good context handling                           |
-| devstral2    | Local               | Strong coding and tool use                                              |
+| devstral2    | Local               | Strong coding and tool use, but probably superceded by Qwen now         |
 | GLM-5.1      | Local/Remote        | Good reasoning, excellent coding, not everyone can fit this one locally |
-| Kimi-K2.5    | Local               | Reasoning model, needs `read_timeout = 2400 if running locally`         |
-| GPT-4o       | OpenAI / openrouter | Cloud model, reliable tool calling                                      |
+| Kimi-K2.5    | Local               | Very smart reasoning model - but GLM writes better code (IMO)           |
+| GPT-4o       | OpenAI / openrouter | Cloud model, reliable tool calling (never used it myself ;-) )          |
 
 > **Tip:** If you're using a reasoning model (DeepSeek-R1, GLM-5.1), add `read_timeout = 2400` to your provider config. These models can go silent for 10+ minutes while loading into VRAM from a slow disk.
 
@@ -243,26 +243,11 @@ def greet(name: str) -> str:
 
 Restart agent13 and the tool is automatically available.
 
-### Add a Custom Skill
+### Skills
 
-Create `~/.agent13/skills/my-skill/SKILL.md`:
+Type `/get-new-skill` then ask agent13 to look for the skill you need. Use `/manage-skills` to create a new skill, improve an existing skill, or validate skill structure for standards compliance. (both of these slash commands are skills themselves)
 
-```markdown
----
-name: my-skill
-description: My custom skill
-user-invocable: true
-allowed-tools:
-  - read_file
-  - command
----
-
-# My Skill
-
-When this skill is active, always start by reading the project structure.
-```
-
-Load it in the TUI with `/skill my-skill`.
+For the full skill specification, see [agentskills.io](https://agentskills.io/specification).
 
 ### Configure Sandbox Mode
 

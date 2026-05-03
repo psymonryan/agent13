@@ -1,63 +1,72 @@
-# AGENT13
+# agent13 README
 
 ![Agent13 - built for tight spaces](./images/agent13maxing.png)
 
 > Named after the agent from *Get Smart* who always seemed to end up in the tightest places - a mailbox, a fridge, a grandfather clock. Agent13 is the AI that still opererates when there is a VRAM squeeze
 
-Agent13 is a self-coding AI agent with tools designed to work the way the AI expects them to work, and to run on hardware that bigger agents won't touch. It was built 100% by itself (after an initial bootstrap using Mistral Vibe) using local models (Qwen-3.5-27B, GLM-5.X, Kimi-K2.5).
+Agent13 is a self-coding AI agent harness with tools designed to work the way the AI expects them to work, and to run on hardware that bigger agents won't touch. It was built 100% by itself (after an initial bootstrap using Mistral Vibe) using local models (Qwen-3.5-27B, GLM-5.X, Kimi-K2.5).
 
 ## ✨ Why agent13?
 
-**Tool design that works.**\
-\
-Most agents fix poor tool-use by adding more instructions to the system prompt - longer lists of "do this, don't do that." Agent13 takes the opposite approach: every tool was refined by watching how the AI actually used it, and then redesigned when it failed. The result is near-100% tool-use success with many open-weight models, other agents I tried gave me 50%+ failure rates when I used them outside of their model ecosystem (eg: Mistral Vibe when using GLM, Qwen, MiniMax, Kimi rather than devstral)
+**Tools adapted to the Models to minimise Failure.**
 
-**Runs where others won't.**\
-\
-Designed to run with 24 GB VRAM setups. Works with any OpenAI-compatible API - Llama-swap, Ollama, LM Studio, oMLX, llama-server, or cloud providers. Models that go silent for 10+ minutes are handled gracefully with configurable read timeouts. (eg: If you just swapped model and it is taking a while to load)
+Most agents fix poor tool-use by adding more instructions to the tool prompts - longer lists of "do this, don't do that, make sure you always.."
 
-**Clean architecture, no surprises.**\
-\
+Agent13 takes the opposite approach: **every tool was refined by watching how the models actually used them, and then the tool was modified to suit the AI's expectation of how it should work.**
+
+The result for this approach is nearly 100% tool-use success with many open-weight models, other agents I tried gave me 50% or worse failure rates when I used them outside of their model's ecosystem (eg: Mistral Vibe when using GLM, Qwen, MiniMax, Kimi rather than the prescribed mistral/devstral models)
+
+**Runs where others won't.**
+
+Claude code will consume 65k tokens *before* your request is even considered, where as the agent13 system prompt is basically: "*You are a tool using AI assistant.*"
+The user can then decides if more context consumption is needed with options or commands (eg: --skills --mcp)
+
+Designed to run with low VRAM setups. Works with any OpenAI-compatible API - Llama-swap, Ollama, LM Studio, oMLX, llama-server, or cloud providers. Models that go silent for 10+ minutes are handled gracefully with configurable read timeouts. (eg: If you just swapped model and it is taking a while to load)
+
+**Clean architecture, no surprises.**
+
 Event-driven throughout. Library-first design - import `from agent13 import Agent` for scripting. Headless mode with structured output for CI and testing / self-debugging. Tool groups, MCP servers, skills, and sandbox modes and more.
 
 ## Features
 
-- **Near-100% tool-use success** - Tools designed around AI expectations, refined through real usage
+- **Near-100% tool-use success** - Tools designed around AI expectations, refined through real usage.
 - **Low VRAM native** - Runs on 24 GB GPUs, any OpenAI-compatible API
-- **Reconfigure Mid-Flight** - While the agents turn is running, give it hints, steer its direction, change its model or provider, pause it and save session for later, all designed to minimise time wasted doing extra prompt processing.
+- **Reconfigureable Mid-Flight** - While the agents turn is running, give it hints, steer its direction, change its model or provider, pause it and save session for later, all designed to minimise time wasted doing extra prompt processing.
 - **Event-driven architecture** - Clean separation between agent core, tools, and UI
 - **TUI interface** - Rich terminal UI with queue management, streaming output, and priority commands
 - **Auto-discovered tools** - Add your own tools as functions and decorate them with `@tool`and they're automatically registered
-- **Skills system** - Reusable instruction sets that extend agent capabilities
+- **Skills system** - Reusable standardised instruction sets that extend agent capabilities
 - **MCP integration** - Connect to Model Context Protocol servers for extended tool access
 - **Multiple modes** - Interactive TUI, batch mode, headless, or importable library
-- **Sandbox mode** - Safe tool execution with configurable profiles (5 modes) - (note: command tool implements sandboxing only under macos atm.)
+- **Sandbox mode** - Safe tool execution with configurable profiles (5 modes) - (note: command tool implements sandboxing only under macos atm.) - Always assume the worst can still happen and get your backup system sorted first
 - **Devel mode** - Toggle developer tools on/off at runtime
-- **No telemetry** - No tracking, no analytics, no phoning home.
+- **No telemetry** - No tracking, no analytics, no phoning home. I wrote this for working with clients that demand privacy, security and soverignty.
 
 ## 🚀 Quick Start
 
-### Installation
+### Install
 
-Clone from source (not yet on PyPI):
+Make sure you have [uv](https://docs.astral.sh/uv/getting-started/installation/#installation-methods) installed:
+
+```bash
+curl -LsSf https://astral.sh/uv/install.sh | sh
+```
+
+Install package directly from github:
+
+```
+uv tool install https://github.com/psymonryan/agent13/releases/download/v0.1.9/agent13-0.1.9-py3-none-any.whl
+```
+
+Or install from source (for hacking on the agent itself):
 
 ```bash
 git clone https://github.com/psymonryan/agent13
 cd agent13
 uv sync
-```
-
-Directly Install:
-
-```bash
-uv tool install -e .
-```
-
-Or build the wheel and install
-
-```text
-uv build
-uv tool install dist/agent13-x.x.x-py3-none-any.whl
+uv run agent13.py      # run from source
+# or
+uv tool install -e .   # install as editable tool
 ```
 
 ### Uninstall
@@ -66,9 +75,15 @@ uv tool install dist/agent13-x.x.x-py3-none-any.whl
 uv tool uninstall agent13
 ```
 
+## Update
+
+```text
+agent13 --update
+```
+
 ### Configuration
 
-Create `~/.agent13/config.toml`:
+`~/.agent13/config.toml`: # Sample is created for you on first run
 
 ```toml
 [[providers]]
@@ -97,7 +112,7 @@ OPENAI_API_KEY=your_key_here
 agent13 local
 
 # Batch mode (single prompt, exits after processing)
-agent13 local -p "Write a Python script to parse logs"
+agent13 local -p "Write a Python script to add all the numbers from 1 to 100"
 
 # List available providers
 agent13 --list-providers
@@ -130,6 +145,7 @@ agent13 local --model 5
 - [Configuration](#-configuration)
   - [Provider Configuration](#provider-configuration)
   - [MCP Server Configuration](#mcp-server-configuration)
+  - [Clipboard Configuration](#clipboard-configuration)
   - [Tool Filtering Configuration](#tool-filtering-configuration)
   - [Environment Variables](#environment-variables)
 - [Architecture](#-architecture)
@@ -163,19 +179,27 @@ One-shot processing for scripting and automation:
 agent13 local -p "Explain the event system"
 ```
 
-Options:
+## Options
 
-- `--model <name>` - Select a specific model
-- `--pretty on|off` - Enable/disable markdown rendering (default: on)
-- `--tool-response raw|json` - Tool output format (default: raw for most models)
+- `--list-providers` - List available providers from config and exit
+- `--version` - Show version number and exit
+- `-p, --prompt <text>` - Run in batch mode with this prompt (exits after processing)
+- `--model <name>` - Select a specific model (number or name; no value lists models)
+- `--system-prompt <name>` - System prompt to use (name from prompt manager)
 - `--sandbox <mode>` - Set sandbox mode for this session
+- `--pretty on|off` - Enable/disable markdown rendering (default: on)
+- `--debug` - Enable debug mode
+- `--tool-response raw|json` - Tool output format (default: raw for most models)
+- `--mcp` - Connect to MCP servers on startup (TUI mode only)
 - `--skills` - Include discovered skills in the system prompt
 - `--journal` - Enable journal mode (progressive context compaction)
 - `--send-reasoning` - Include reasoning tokens in message history
 - `--remove-reasoning` - Strip reasoning tokens between turns
-- `--devel` - Show devel-group tools to the AI (so agent can run itself in tui mode when testing)
-- `--continue` - Resume the previous session (TUI mode)
+- `-c, --continue` - Resume the previous session (TUI mode)
+- `--devel` - Show devel-group tools to the AI
 - `--spinner fast|slow|off` - Control the spinner animation (TUI mode)
+- `--upgrade` - Check for updates and install if available, then exit
+- `--clipboard osc52|system` - Clipboard method (default: osc52 works with remote ssh sessions)
 
 ### Headless Mode
 
@@ -207,16 +231,15 @@ await agent.run()
 
 ### Keybindings
 
-| Key                       | Action                                                          |
-| ------------------------- | --------------------------------------------------------------- |
-| `Esc`                     | Interrupt current processing                                    |
-| `Ctrl+C`                  | Clear input if not empty; interrupt if processing; quit if idle |
-| `Ctrl+D` / `Ctrl+Q`       | Force quit                                                      |
-| `Shift+Up` / `Shift+Down` | Scroll chat                                                     |
-| `Ctrl+O`                  | Toggle reasoning collapse                                       |
-| `Ctrl+Y`                  | Copy full markdown of selected message                          |
-| `Ctrl+Shift+C`            | Copy rendered selection                                         |
-| `Enter`                   | Submit input / close panes                                      |
+| Key                 | Action                                                          |
+| ------------------- | --------------------------------------------------------------- |
+| `Esc`               | Interrupt current processing                                    |
+| `Ctrl+C`            | Clear input if not empty; interrupt if processing; quit if idle |
+| `Ctrl+D` / `Ctrl+Q` | Force quit                                                      |
+| `Ctrl+O`            | Toggle reasoning collapse                                       |
+| `Ctrl+Y`            | Copy full markdown of selected message                          |
+| `Ctrl+Shift+C`      | Copy rendered selection                                         |
+| `Enter`             | Submit input / close panes                                      |
 
 ### Slash Commands
 
@@ -272,6 +295,7 @@ def read_file(filepath: str, offset: int = None, limit: int = None) -> str:
 | `skill`         | Load specialized skills                       |
 | `square_number` | Demo tool                                     |
 | `tui_viewer`    | TUI testing tools (devel group)               |
+| `self_update`   | Check/apply updates from GitHub releases      |
 
 ### Adding Tools
 
@@ -315,22 +339,9 @@ Patterns support:
 
 ## 📚 Skills
 
-Skills are reusable instruction sets in `SKILL.md` files:
+Skills are reusable instruction sets in `SKILL.md` files, following the [agentskills.io](https://agentskills.io/specification) specification.
 
-```markdown
----
-name: code-review
-description: Perform automated code reviews
-allowed-tools:
-  - read_file
-  - edit_file
-user-invocable: true
----
-
-# Code Review Skill
-
-This skill helps analyze code quality and suggest improvements.
-```
+Type `/get-new-skill` then ask agent13 to look for the skill you need. Use `/manage-skills` to create a new skill, improve an existing skill, or validate skill structure for standards compliance. (both of these slash commands are skills themselves)
 
 ### Default Skills
 
@@ -340,13 +351,6 @@ Agent13 ships with these default skills (copied to `~/.agent13/skills/` on first
 - `get-new-skill` - Find and adapt skills from external sources
 - `humanizer` - Remove AI writing patterns
 - `context7` - Context lookup for libraries and APIs
-
-### Creating Skills
-
-1. Create `~/.agent13/skills/my-skill/SKILL.md`
-2. Add YAML frontmatter with metadata
-3. Write instructions in markdown below
-4. Reference with `/skill my-skill` in TUI (if `user-invocable: true`)
 
 ### Skill Discovery Paths
 
@@ -401,6 +405,18 @@ disabled_tools = []
 Supported transports: `http`, `stdio`
 
 MCP tools are named using the pattern `mcp://server_name/tool_name` and appear alongside built-in tools.
+
+### Clipboard Configuration
+
+```toml
+[clipboard]
+method = "osc52"    # "osc52" (terminal escape sequence, default) or "system" (OS clipboard command)
+```
+
+- **osc52** — Uses the OSC 52 terminal escape sequence. Works over SSH and in terminals that support it (Alacritty, Ghostty, Kitty, iTerm2, Windows Terminal v1.18+). Default.
+- **system** — Uses OS commands (`pbcopy` on macOS, `xclip`/`wl-copy` on Linux, `clip.exe` on Windows). Works in tmux, screen, and older terminals. Requires the relevant command to be installed.
+
+Switch at runtime with `/clipboard system` or `/clipboard osc52`. The setting persists to config.
 
 ### Tool Filtering Configuration
 
@@ -517,4 +533,4 @@ MIT License - see [LICENSE](LICENSE) for details.
 
 Agent13 was bootstrapped using Mistral Vibe and then built by itself using local models: Qwen-3.5-27B, GLM-5, GLM-5.1, Kimi-K2.5 on llama-swap/llama-server, then oMLX. Typically features were started with Qwen-3.5-27B then when it got tricky, I would swap to Kimi or GLM-5.1 running on openrouter.
 
-Inspired by the need for a lightweight, controllable agent that respects VRAM constraints whilst remaining usable for long sessions.
+Inspired by the need for a lightweight, controllable agent that fits within VRAM constraints whilst remaining usable for long sessions.

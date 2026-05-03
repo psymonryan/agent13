@@ -1,3 +1,20 @@
+# Self-update checks (GitHub releases)
+# Set check_enabled = false to disable update notifications
+[updates]
+check_enabled = true
+check_interval_hours = 24
+
+# Clipboard method
+# "osc52" = terminal escape sequence (default, works over SSH)
+#   Requires terminal support: Alacritty, Ghostty, Kitty, iTerm2,
+#   Windows Terminal v1.18+. Does NOT work in tmux (without config),
+#   GNU screen, or conhost/PowerShell.
+# "system" = OS-level commands (pbcopy/xclip/wl-copy/clip.exe)
+#   Works locally regardless of terminal, including tmux and screen.
+#   Does NOT work over SSH (writes to remote clipboard).
+# Change at runtime with: /clipboard osc52  or  /clipboard system
+[clipboard]
+method = "osc52"
 # Agent13 Configuration
 # Config directory: ~/.agent13 (or $AGENT13_CONFIG_DIR)
 # Environment: ~/.env then ./.env (local overrides global)

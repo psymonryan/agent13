@@ -164,6 +164,9 @@ class Config:
         mcp_servers: List of MCP server configurations
         skill_paths: Additional paths to search for skills (highest priority)
         include_skills: Whether to include skills in system prompt
+        update_check_enabled: Whether to check for updates on startup
+        update_check_interval_hours: Minimum hours between update checks
+        clipboard_method: Clipboard method - "osc52" or "system"
     """
 
     providers: list[ProviderConfig] = field(default_factory=list)
@@ -172,6 +175,9 @@ class Config:
     include_skills: bool = False
     enabled_tools: list[str] = field(default_factory=list)
     disabled_tools: list[str] = field(default_factory=list)
+    update_check_enabled: bool = True
+    update_check_interval_hours: float = 24
+    clipboard_method: str = "osc52"
 
     @classmethod
     def from_file(cls, path: Optional[Path] = None) -> "Config":
@@ -295,6 +301,23 @@ class Config:
         disabled = data.get("disabled_tools", [])
         if isinstance(disabled, list):
             config.disabled_tools = [str(p) for p in disabled]
+
+        # Parse [updates] section
+        updates_data = data.get("updates", {})
+        if isinstance(updates_data, dict):
+            config.update_check_enabled = updates_data.get(
+                "check_enabled", True
+            )
+            config.update_check_interval_hours = float(
+                updates_data.get("check_interval_hours", 24)
+            )
+
+        # Parse [clipboard] section
+        clipboard_data = data.get("clipboard", {})
+        if isinstance(clipboard_data, dict):
+            method = clipboard_data.get("method", "osc52")
+            if isinstance(method, str) and method in ("osc52", "system"):
+                config.clipboard_method = method
 
         config.validate()
         return config

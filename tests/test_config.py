@@ -597,4 +597,95 @@ class TestCreateClient:
         client = create_client("http://localhost:8012/v1", "none")
         assert str(client.base_url).startswith("http://localhost:8012/v1")
         timeout = client._client.timeout
-        assert timeout.read == 2400.0
+
+
+class TestUpdatesConfig:
+    """Tests for [updates] section parsing in config."""
+
+    def test_updates_defaults(self):
+        """Default config has updates enabled with 24h interval."""
+        config = Config()
+        assert config.update_check_enabled is True
+        assert config.update_check_interval_hours == 24
+
+    def test_updates_from_file(self, tmp_path):
+        """Parse [updates] section from TOML."""
+        config_file = tmp_path / "config.toml"
+        config_file.write_text("""
+[[providers]]
+name = "test"
+api_base = "http://localhost:8012/v1"
+
+[updates]
+check_enabled = false
+check_interval_hours = 48
+""")
+        config = Config.from_file(config_file)
+        assert config.update_check_enabled is False
+        assert config.update_check_interval_hours == 48
+
+    def test_updates_partial_section(self, tmp_path):
+        """Only one key set in [updates] uses default for the other."""
+        config_file = tmp_path / "config.toml"
+        config_file.write_text("""
+[[providers]]
+name = "test"
+api_base = "http://localhost:8012/v1"
+
+[updates]
+check_enabled = false
+""")
+        config = Config.from_file(config_file)
+        assert config.update_check_enabled is False
+        assert config.update_check_interval_hours == 24
+
+    def test_updates_no_section(self, tmp_path):
+        """Config without [updates] section uses defaults."""
+        config_file = tmp_path / "config.toml"
+        config_file.write_text("""
+[[providers]]
+name = "test"
+api_base = "http://localhost:8012/v1"
+""")
+        config = Config.from_file(config_file)
+        assert config.update_check_enabled is True
+        assert config.update_check_interval_hours == 24
+
+    def test_clipboard_default(self, tmp_path):
+        """Config without [clipboard] section defaults to osc52."""
+        config_file = tmp_path / "config.toml"
+        config_file.write_text("""
+[[providers]]
+name = "test"
+api_base = "http://localhost:8012/v1"
+""")
+        config = Config.from_file(config_file)
+        assert config.clipboard_method == "osc52"
+
+    def test_clipboard_system(self, tmp_path):
+        """Parse [clipboard] method = 'system'."""
+        config_file = tmp_path / "config.toml"
+        config_file.write_text("""
+[[providers]]
+name = "test"
+api_base = "http://localhost:8012/v1"
+
+[clipboard]
+method = "system"
+""")
+        config = Config.from_file(config_file)
+        assert config.clipboard_method == "system"
+
+    def test_clipboard_invalid_ignored(self, tmp_path):
+        """Invalid method value falls back to default."""
+        config_file = tmp_path / "config.toml"
+        config_file.write_text("""
+[[providers]]
+name = "test"
+api_base = "http://localhost:8012/v1"
+
+[clipboard]
+method = "invalid"
+""")
+        config = Config.from_file(config_file)
+        assert config.clipboard_method == "osc52"

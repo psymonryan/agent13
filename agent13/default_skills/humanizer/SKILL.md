@@ -8,13 +8,6 @@ description: |
   vague attributions, em dash overuse, rule of three, AI vocabulary words, negative parallelisms,
   and excessive conjunctive phrases. Converts American spelling to British English.
   to British English.
-allowed-tools:
-  - Read
-  - Write
-  - Edit
-  - Grep
-  - Glob
-  - AskUserQuestion
 ---
 
 # Humanizer: Remove AI Writing Patterns

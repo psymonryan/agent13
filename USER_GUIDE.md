@@ -4,6 +4,7 @@ Complete reference for using Agent13 - configuration, tools, skills, TUI command
 
 ## Table of Contents
 
+- [Quick Start](#quick-start)
 - [Running Agent13](#running-agent13)
   - [TUI Mode](#tui-mode)
   - [Batch Mode](#batch-mode)
@@ -18,6 +19,7 @@ Complete reference for using Agent13 - configuration, tools, skills, TUI command
   - [Provider Configuration](#provider-configuration)
   - [MCP Server Configuration](#mcp-server-configuration)
   - [Tool Filtering](#tool-filtering)
+  - [Clipboard Configuration](#clipboard-configuration)
   - [Environment Variables](#environment-variables)
 - [Tools](#tools)
   - [Built-in Tools](#built-in-tools)
@@ -34,6 +36,93 @@ Complete reference for using Agent13 - configuration, tools, skills, TUI command
 - [Journal Mode](#journal-mode)
 - [MCP Integration](#mcp-integration)
 - [Troubleshooting](#troubleshooting)
+- [Updates](#updates)
+- [Clipboard Configuration](#clipboard-configuration)
+
+## Quick Start
+
+### Install
+
+Make sure you have [uv](https://docs.astral.sh/uv/getting-started/installation/#installation-methods) installed:
+
+```bash
+curl -LsSf https://astral.sh/uv/install.sh | sh
+```
+
+Install package directly from github:
+
+```
+uv tool install https://github.com/psymonryan/agent13/releases/download/v0.1.9/agent13-0.1.9-py3-none-any.whl
+```
+
+Or install from source (for hacking on the agent itself):
+
+```bash
+git clone https://github.com/psymonryan/agent13
+cd agent13
+uv sync
+uv run agent13.py      # run from source
+# or
+uv tool install -e .   # install as editable tool
+```
+
+### Uninstall
+
+```text
+uv tool uninstall agent13
+```
+
+### Update
+
+```text
+agent13 --upgrade
+```
+
+Or inside a running session:
+
+```text
+/upgrade
+```
+
+### Configuration
+
+`~/.agent13/config.toml`: # Sample is created for you on first run
+
+```toml
+[[providers]]
+name = "local"
+api_base = "http://localhost:8012/v1"
+api_key_env_var = "OPENAI_API_KEY"
+
+# For slower providers that need longer timeouts
+[[providers]]
+name = "laptop"
+api_base = "http://laptop.local.home:8012/v1"
+api_key_env_var = "OPENAI_API_KEY"
+read_timeout = 2400  # 40 min for long load and response times
+```
+
+Set your API key in `~/.env`:
+
+```bash
+OPENAI_API_KEY=your_key_here
+```
+
+### First Run
+
+```bash
+# Interactive TUI (will prompt you for model name/number)
+agent13 local
+
+# Batch mode (single prompt, exits after processing)
+agent13 local -p "Write a Python script to add all the numbers from 1 to 100"
+
+# List available providers
+agent13 --list-providers
+
+# Run on local provider and select model 5 (or give model name)
+agent13 local --model 5
+```
 
 ## Running Agent13
 
@@ -137,7 +226,7 @@ The `Agent` constructor accepts:
 | `--version`                 | Show version and exit                                       |
 | `-p`, `--prompt`            | Run in batch mode with this prompt                          |
 | `--model`                   | Select model by name or number; with no value, lists models |
-| `--prompt-name`             | System prompt to use                                        |
+| `--system-prompt`           | System prompt to use                                        |
 | `--sandbox`                 | Sandbox mode (permissive-open, permissive-closed, etc.)     |
 | `--pretty on\|off`          | Enable/disable markdown rendering (default: on)             |
 | `--debug`                   | Enable debug logging                                        |
@@ -150,6 +239,8 @@ The `Agent` constructor accepts:
 | `-c`, `--continue`          | Continue from last auto-saved session                       |
 | `--devel`                   | Enable devel mode (show devel-group tools)                  |
 | `--spinner fast\|slow\|off` | Spinner style (default: fast)                               |
+| `--upgrade`                 | Check for updates and apply, then exit                      |
+| `--clipboard osc52\|system` | Clipboard method for this session (default: osc52)          |
 
 ## TUI Reference
 
@@ -240,15 +331,17 @@ Commands are typed in the input field with a `/` prefix:
 
 #### Other
 
-| Command                 | Description                                |
-| ----------------------- | ------------------------------------------ |
-| `/history`              | Show input history                         |
-| `/delete [h\|q\|s] num` | Delete items from history queue, or saves  |
-| `/snippet`              | Manage text snippets (saved user messages) |
+| Command                      | Description                                                |
+| ---------------------------- | ---------------------------------------------------------- |
+| `/history`                   | Show input history                                         |
+| `/delete [h\|q\|s] num`      | Delete items from history queue, or saves                  |
+| `/snippet`                   | Manage text snippets (saved user messages)                 |
+| `/upgrade [--copy]`          | Check for updates and apply (or copy command to clipboard) |
+| `/clipboard [osc52\|system]` | Show or set clipboard method (default: osc52)              |
 
 #### Skill Commands
 
-User-invocable skills appear as slash commands. For example, if you have a skill named `code-review` with `user-invocable: true`, you can invoke it with:
+Each installed skill appears as a slash command. For example, a skill named `code-review` can be invoked with:
 
 ```text
 /code-review
@@ -349,6 +442,36 @@ disabled_tools = ["square_number", "re:^tui_.*$"]
 
 Tool filtering applies to both built-in and MCP tools.
 
+### Clipboard Configuration
+
+Control how text is copied to the clipboard:
+
+```toml
+[clipboard]
+method = "osc52"    # "osc52" (terminal escape sequence, default) or "system" (OS clipboard command)
+```
+
+**Methods:**
+
+| Method   | How it works                                         | Best for                                                                                    |
+| -------- | ---------------------------------------------------- | ------------------------------------------------------------------------------------------- |
+| `osc52`  | OSC 52 terminal escape sequence                      | SSH sessions, modern terminals (Alacritty, Ghostty, Kitty, iTerm2, Windows Terminal v1.18+) |
+| `system` | OS commands: `pbcopy`, `xclip`/`wl-copy`, `clip.exe` | tmux, screen, older terminals, Windows conhost/PowerShell                                   |
+
+**When to switch:** If mouse select or Ctrl+Y doesn't copy to your clipboard, you likely need `system`. Type `/clipboard system` in the TUI — it persists to your config file.
+
+**Switching at runtime:**
+
+- `/clipboard` — show current method
+- `/clipboard system` — switch to OS clipboard commands
+- `/clipboard osc52` — switch back to terminal escape sequence
+
+**CLI override:**
+
+```bash
+agent13 --clipboard system studio
+```
+
 ### Environment Variables
 
 API keys are loaded from `~/.env` then `./.env` (local overrides global):
@@ -375,6 +498,7 @@ OPENAI_API_KEY=sk-project-key
 | `skill`         | Load a specialized skill by name                                                                                |
 | `square_number` | Demo/example tool (used for testing)                                                                            |
 | `tui_viewer`    | TUI testing tools: launch, screenshot, type, press, wait, quit (devel group - wont load unless you use --devel) |
+| `self_update`   | Check for updates, apply upgrade, or copy install command to clipboard                                          |
 
 ### Tool Groups and Devel Mode
 
@@ -432,42 +556,13 @@ Tools are auto-discovered from the `tools/` package directory. Each `.py` file (
 
 ## Skills
 
-Skills are reusable instruction sets that extend the agent's capabilities. They're defined in `SKILL.md` files with YAML frontmatter.
+Skills are reusable instruction sets that extend the agent's capabilities. They're defined in `SKILL.md` files with YAML frontmatter, following the [agentskills.io](https://agentskills.io/specification) specification.
 
-Agent Skills follow the [agentskills.io](http://agentskills.io) specification
+### Finding and Creating Skills
 
-### Skill Format
+Type `/get-new-skill` then ask agent13 to look for the skill you need. Use `/manage-skills` to create a new skill, improve an existing skill, or validate skill structure for standards compliance. (both of these slash commands are skills themselves)
 
-```markdown
----
-name: code-review
-description: Perform automated code reviews
-allowed-tools:
-  - read_file
-  - edit_file
-  - command
-user-invocable: true
-license: MIT
-compatibility: Python 3.11+
----
-
-# Code Review Skill
-
-When this skill is active, follow these guidelines:
-
-1. Always read the full file before suggesting changes
-2. Provide specific line references for each suggestion
-3. Explain the reasoning behind each change
-```
-
-**Frontmatter fields:**
-
-- `name` - Skill identifier (lowercase, hyphens, matches directory name)
-- `description` - What the skill does (shown in `/skills` list)
-- `allowed-tools` - Tools this skill should use (restricts tool set when active)
-- `user-invocable` - If `true`, appears as a `/skill-name` slash command
-- `license` - License for the skill content
-- `compatibility` - Compatibility notes
+For the full specification including frontmatter fields and best practices, see [agentskills.io](https://agentskills.io/specification).
 
 ### Default Skills
 
@@ -480,45 +575,16 @@ Agent13 ships with these skills (copied to `~/.agent13/skills/` on first run):
 | `humanizer`     | Remove AI writing patterns from text        |
 | `context7`      | Context lookup for libraries and APIs       |
 
-### Creating Skills
-
-1. Create the skill directory:
-
-```bash
-mkdir -p ~/.agent13/skills/my-skill
-```
-
-2. Create `SKILL.md` with frontmatter and instructions:
-
-```markdown
----
-name: my-skill
-description: My custom skill
-user-invocable: true
-allowed-tools:
-  - read_file
-  - command
----
-
-# My Skill
-
-Instructions for the agent when this skill is active...
-```
-
-1. Use in TUI:
-   - If `user-invocable: true`: type `/my-skill` to invoke
-   - Otherwise: the AI can load it with the `skill` tool
-
 ### Managing Skills
 
 - **List skills**: `/skills` in TUI
-- **Invoke skill**: `/skill-name` (if user-invocable) or ask the AI to use the `skill` tool
+- **Invoke skill**: `/skill-name` or ask the AI to use the `skill` tool
 - **Skill paths**: Skills are discovered from:
   1. Project directory: `.agent13/skills/`
   2. Global directory: `~/.agent13/skills/`
   3. Bundled defaults: `agent13/default_skills/` (auto-copied to global on first run)
-
-## Queue and Priority
+     
+     ## Queue and Priority
 
 Agent13 uses a message queue to manage multiple prompts:
 
@@ -662,10 +728,10 @@ Toggle reasoning visibility in the TUI with `Ctrl+O` to collapse/expand reasonin
 
 ## Prompt Management
 
-Customize the system prompt with `--prompt-name`:
+Customize the system prompt with `--system-prompt`:
 
 ```bash
-agent13 local --prompt-name my-prompt
+agent13 local --system-prompt my-prompt
 ```
 
 The prompt name references a file in `~/.agent13/prompts/` (without the `.md` extension). You can also add custom content that gets appended to the default prompt using the `custom_additions` mechanism in the prompt file.
@@ -683,6 +749,32 @@ Use `/history` to view the full conversation history with message IDs. Use `/del
 ```
 
 Deleted messages are removed from the context sent to the model. This is useful for cleaning up off-topic tangents or mistakes.
+
+## Updates
+
+Agent13 checks GitHub releases for new versions on startup (once per day by default). When an update is available, you'll see a notification like:
+
+```
+⬆ Update available: v0.1.9 (you have 0.1.8). Type /upgrade to apply. Or run: uv tool install --force <wheel-url>
+Disable these notifications: set check_enabled = false in [updates] section of ~/.agent13/config.toml
+```
+
+### Applying Updates
+
+| Method              | How                                                                                   |
+| ------------------- | ------------------------------------------------------------------------------------- |
+| `/upgrade`          | In the TUI — checks, downloads wheel from GitHub, installs, then tells you to restart |
+| `/upgrade --copy`   | Copies the manual install command to clipboard instead of running it                  |
+| `agent13 --upgrade` | Non-interactive — check and apply from the command line, then exit                    |
+| Manual              | Run the `uv tool install --force <url>` command from the notification                 |
+
+### Update Configuration
+
+```toml
+[updates]
+check_enabled = true           # set false to disable startup notifications
+check_interval_hours = 24     # minimum hours between checks
+```
 
 ## Troubleshooting
 
@@ -707,6 +799,16 @@ Verify the URL in `~/.agent13/config.toml` matches your server.
 ### Model Doesn't Use Tools
 
 Not all models support tool/function calling. Try a model known for good tool support (see [Getting Started](GETTING_STARTED.md) for recommendations).
+
+### Clipboard Not Working
+
+If mouse select, Ctrl+Y, or `/upgrade --copy` doesn't copy to your clipboard:
+
+1. Type `/clipboard system` in the TUI to switch to OS clipboard commands
+2. This persists to your config — you only need to do it once
+3. On Linux, ensure `xclip` (X11) or `wl-copy` (Wayland) is installed
+
+See [Clipboard Configuration](#clipboard-configuration) for details.
 
 ### Debug Logging
 

@@ -136,6 +136,7 @@ my-skill/
 ## Validation Checklist
 
 ✅ **Required Elements**
+
 - [ ] SKILL.md exists
 - [ ] Valid YAML frontmatter
 - [ ] `name` field (1-64 chars, lowercase, no leading/trailing hyphens)
@@ -143,6 +144,7 @@ my-skill/
 - [ ] Skill name matches directory name
 
 ✅ **Optional Elements (Recommended)**
+
 - [ ] `license` field
 - [ ] `compatibility` field
 - [ ] `metadata` (version, author, etc.)
@@ -151,6 +153,7 @@ my-skill/
 - [ ] `scripts/` directory
 
 ✅ **Content Quality**
+
 - [ ] Clear instructions
 - [ ] Practical examples
 - [ ] Common patterns
@@ -183,10 +186,12 @@ description: A simple skill demonstrating the basic structure. Use when learning
 Say "Hello, World!"
 
 ## Example
+```
+
+Hello, World!
 
 ```
-Hello, World!
-```
+
 ```
 
 ### Skill with Templates
@@ -218,7 +223,7 @@ See `assets/templates/basic-skill-with-templates.yml` for a complete example.
 
 ### Skill Not Found
 
-**Cause**: Skill not in `.vibe/skills/` directory
+**Cause**: Skill not in `.agent13/skills/` directory
 **Solution**: Move skill to correct location
 
 ### Description Too Long

@@ -13,11 +13,12 @@ This document describes the architecture, design decisions, and implementation d
 7. [Queue and Message Flow](#queue-and-message-flow)
 8. [User Interfaces](#user-interfaces)
 9. [Configuration](#configuration)
-10. [MCP Integration](#mcp-integration)
-11. [Skills System](#skills-system)
-12. [Sandbox Security](#sandbox-security)
-13. [Testing Strategy](#testing-strategy)
-14. [Extensibility Points](#extensibility-points)
+10. [Clipboard and Updater](#clipboard-and-updater)
+11. [MCP Integration](#mcp-integration)
+12. [Skills System](#skills-system)
+13. [Sandbox Security](#sandbox-security)
+14. [Testing Strategy](#testing-strategy)
+15. [Extensibility Points](#extensibility-points)
 
 ***
 
@@ -278,6 +279,8 @@ Arguments are coerced from JSON types to Python types using the function's type 
 | `square_number` | Example/test tool                                |
 | `tui_viewer`    | TUI screenshot/interaction tools (devel group)   |
 
+| `self_update`   | Check/apply updates from GitHub releases          |
+
 ***
 
 ## LLM Integration
@@ -508,6 +511,8 @@ async def on_token(event: AgentEventData):
 | `/delete`                      | Delete messages from history                      |
 | `/snippet`                     | Manage text snippets                              |
 | `/spinner`                     | Control spinner animation                         |
+| `/upgrade`                     | Check for updates and apply                       |
+| `/clipboard`                   | Show or set clipboard method (osc52/system)       |
 | `/prioritise`, `/deprioritise` | Change queue item priority                        |
 | `/remove-reasoning`            | Strip reasoning tokens from last turn             |
 | `/list`                        | List providers or models                          |
@@ -565,6 +570,15 @@ url = "http://mcp-server:8080"
 # Skills
 # skill_paths = ["/path/to/custom/skills"]  # additional skill search paths
 # include_skills = true                       # include skills in system prompt
+
+# Clipboard
+[clipboard]
+method = "osc52"    # "osc52" (terminal escape sequence) or "system" (OS clipboard command)
+
+# Updates
+[updates]
+check_enabled = true           # check for updates on startup
+check_interval_hours = 24     # minimum hours between update checks
 ```
 
 ### Environment Files
@@ -600,6 +614,35 @@ def create_client(
 ```
 
 Creates an `AsyncOpenAI` client with separate connect and read timeouts. The default 2400s read timeout accommodates reasoning models that may think for long periods between tokens.
+
+### Clipboard (`agent13/clipboard.py`)
+
+Single source of truth for clipboard operations. Two methods:
+
+| Method | Implementation | Use case |
+| ------ | -------------- | -------- |
+| `osc52` | OSC 52 terminal escape sequence via Textual's `App.copy_to_clipboard` | SSH, modern terminals |
+| `system` | Subprocess: `pbcopy` / `xclip` / `wl-copy` / `clip.exe` | tmux, screen, older terminals |
+
+```python
+def copy_via_system(text: str) -> bool:
+    """Copy via OS command. Returns False if no command available."""
+
+def copy_to_clipboard(app, text: str, method: str = "osc52") -> bool:
+    """Dispatch to the configured method."""
+```
+
+The TUI overrides `App.copy_to_clipboard` to route all clipboard operations (mouse select, Ctrl+Y, `/upgrade --copy`) through the configured method. Non-TUI code (updater, AI tool) calls `copy_via_system` directly.
+
+### Updater (`agent13/updater.py`)
+
+Checks GitHub releases for new versions and performs in-place upgrades:
+
+- **Startup check** — throttled by `~/.agent13/last_update_check.json`, respects `[updates]` config
+- **`/upgrade`** — TUI command to check and apply
+- **`--upgrade`** — CLI flag for non-interactive upgrade
+- **`/upgrade --copy`** — copies the manual install command to clipboard instead of running it
+- **Install method** — downloads `.whl` from GitHub release assets, runs `uv tool install --force <wheel>`
 
 ***
 
@@ -697,7 +740,6 @@ Skills provide:
 - Domain-specific instructions (loaded into the conversation)
 - Bundled resources (scripts, templates)
 - Workflow guidance
-- Optional tool restrictions (`allowed_tools` limits which tools the skill can use)
 
 ### Skill Structure
 
@@ -717,14 +759,14 @@ Each skill is a directory containing a `SKILL.md` file with YAML frontmatter:
 
 ### Skill Frontmatter (`SKILL.md`)
 
+Skills follow the [agentskills.io](https://agentskills.io/specification) specification. Frontmatter fields are defined by the spec; agent13-specific extensions live under `metadata`.
+
 ```yaml
 ---
 name: code-review
 description: Review code for quality, security, and best practices
 license: MIT
 compatibility: ">=0.1.0"
-allowed-tools: read_file edit_file command
-user-invocable: true
 ---
 
 # Code Review Skill

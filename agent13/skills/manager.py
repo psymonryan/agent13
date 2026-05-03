@@ -122,13 +122,6 @@ class SkillManager:
         """All discovered skills keyed by name."""
         return self._skills
 
-    @property
-    def user_invocable_skills(self) -> dict[str, SkillInfo]:
-        """Skills that should appear in slash command menu."""
-        return {
-            name: info for name, info in self._skills.items() if info.user_invocable
-        }
-
     def get_skill(self, name: str) -> SkillInfo | None:
         """Get a skill by name, or None if not found."""
         return self._skills.get(name)

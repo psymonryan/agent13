@@ -536,6 +536,8 @@ class AgentTUI(App):
         "/devel",
         "/snippet",
         "/spinner",
+        "/upgrade",
+        "/clipboard",
     ]
     # Class-level attribute for type checking (instance copy created in __init__)
     SLASH_COMMANDS = _BUILTIN_SLASH_COMMANDS
@@ -561,6 +563,8 @@ class AgentTUI(App):
         "devel": ["on", "off", "status"],
         "snippet": "_get_snippet_completions",
         "spinner": ["fast", "slow", "off", "status"],
+        "upgrade": ["--copy"],
+        "clipboard": ["osc52", "system"],
     }
     # Spinner animation frames by speed mode
     SPINNER_FRAMES_FAST = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]  # braille, 10 frames
@@ -601,6 +605,7 @@ class AgentTUI(App):
         continue_session: bool = False,
         devel_mode: bool = False,
         spinner_speed: str = "fast",
+        clipboard_method: str = "osc52",
     ):
         """Initialize the TUI.
 
@@ -622,6 +627,7 @@ class AgentTUI(App):
             continue_session: Load latest auto-save on startup
             devel_mode: Enable devel mode (show devel-group tools to the AI)
             spinner_speed: Spinner speed - 'fast' (100ms, braille), 'slow' (250ms, classic), or 'off'
+            clipboard_method: Clipboard method - 'osc52' (terminal escape) or 'system' (OS commands)
         """
         super().__init__()
         self.client = client
@@ -692,6 +698,9 @@ class AgentTUI(App):
 
         # Spinner speed (set reactive after super().__init__)
         self._spinner_speed = spinner_speed
+
+        # Clipboard method (osc52 or system)
+        self._clipboard_method = clipboard_method
 
         # State
         self._history = (
@@ -764,11 +773,11 @@ class AgentTUI(App):
         self._register_handlers()
 
     def _register_skill_commands(self) -> None:
-        """Register slash commands for user-invocable skills."""
+        """Register slash commands for all skills."""
         if not self.skill_manager:
             return
         self._register_dynamic_commands(
-            self.skill_manager.user_invocable_skills, "Skill"
+            self.skill_manager.skills, "Skill"
         )
 
     def _register_snippet_commands(self) -> None:
@@ -2727,6 +2736,10 @@ class AgentTUI(App):
             self._handle_snippet_command(args)
         elif command == "spinner":
             self._handle_spinner_command(args)
+        elif command == "upgrade":
+            self._handle_upgrade_command(args)
+        elif command == "clipboard":
+            self._handle_clipboard_command(args)
         elif command in ("quit", "exit"):
             self.agent.stop()
             self.exit()
@@ -2734,7 +2747,7 @@ class AgentTUI(App):
             # Check for skill invocation
             if self.skill_manager:
                 skill = self.skill_manager.get_skill(command)
-                if skill and skill.user_invocable:
+                if skill:
                     content = self.skill_manager.format_skill_content(command)
                     if content:
                         asyncio.create_task(self._send_message(content))
@@ -3065,6 +3078,10 @@ class AgentTUI(App):
             "  [yellow]/remove-reasoning [on|off][/] - Strip reasoning tokens between turns\n"
             "\n[bold]Spinner:[/]\n"
             "  [yellow]/spinner [fast|slow|off|status][/] - Spinner style and speed\n"
+            "\n[bold]Updates:[/]\n"
+            "  [yellow]/upgrade [--copy][/] - Check for updates and apply (or copy command to clipboard)\n"
+            "\n[bold]Clipboard:[/]\n"
+            "  [yellow]/clipboard [osc52|system][/] - Show or set clipboard method\n"
             "\n[bold]Keyboard shortcuts:[/]\n"
             "  [yellow]ESC[/] - Cancel request (use /resume to continue)\n"
             "  [yellow]Ctrl+C[/] - Clear input or quit\n"
@@ -3082,7 +3099,8 @@ class AgentTUI(App):
             f"  prompt: {escape_markup(self.prompt_manager.active_prompt)}\n"
             f"  sandbox: {escape_markup(sandbox_mode.value)}\n"
             f"  remove-reasoning: {'on' if self.agent.remove_reasoning else 'off'}\n"
-            f"  spinner: {self._spinner_speed}"
+            f"  spinner: {self._spinner_speed}\n"
+            f"  clipboard: {self._clipboard_method}"
         )
         self._info_pane_mode = "help"
 
@@ -3753,19 +3771,16 @@ class AgentTUI(App):
 
         lines = ["[bold]Available skills:[/]", ""]
         for name, info in sorted(skills.items()):
-            # Mark user-invocable skills with a slash prefix
-            invocable = "/" if info.user_invocable else " "
             desc = (
                 info.description[:60] + "..."
                 if len(info.description) > 60
                 else info.description
             )
             lines.append(
-                f"  [yellow]{invocable}{escape_markup(name)}[/] - {escape_markup(desc)}"
+                f"  [yellow]/{escape_markup(name)}[/] - {escape_markup(desc)}"
             )
 
         lines.append("")
-        lines.append("[dim]Skills with / prefix are invocable via /<skillname>[/]")
         self._update_info_content("\n".join(lines))
 
     def _handle_journal_command(self, args: str) -> None:
@@ -3897,6 +3912,141 @@ class AgentTUI(App):
                 f"  [yellow]/spinner status[/] - Show current speed\n"
                 f"  Current: {speed}"
             )
+
+    def _handle_upgrade_command(self, args: str) -> None:
+        """Handle /upgrade command - check for updates and apply or copy."""
+        from agent13.updater import (
+            perform_update,
+            fetch_latest_release,
+            _is_newer,
+            _build_manual_command,
+            _write_last_check,
+        )
+        from agent13 import __version__
+        from datetime import datetime, timezone
+
+        args = args.strip().lower()
+        copy_mode = "--copy" in args or "copy" in args
+
+        # Check for update first
+        release = fetch_latest_release()
+        if release is None:
+            self._update_info_content(
+                "[red]Could not reach GitHub releases API.[/]"
+            )
+            return
+
+        now = datetime.now(timezone.utc)
+        _write_last_check(now)
+
+        remote_tag = release["tag_name"]
+        if not _is_newer(remote_tag, __version__):
+            self._update_info_content(
+                f"[green]Already on latest version ({__version__}).[/]"
+            )
+            return
+
+        wheel_url = release.get("wheel_url", "")
+        manual_cmd = _build_manual_command(wheel_url) if wheel_url else ""
+
+        if copy_mode:
+            # Copy the manual command to clipboard
+            if not manual_cmd:
+                self._update_info_content(
+                    f"[red]No wheel asset found for {remote_tag}. "
+                    f"Cannot build install command.[/]"
+                )
+                return
+            self.copy_to_clipboard(manual_cmd)
+            self._update_info_content(
+                f"[green]Copied to clipboard:[/]\n"
+                f"  [dim]{manual_cmd}[/]"
+            )
+        else:
+            # Perform the upgrade
+            self._update_info_content(
+                f"[yellow]Checking for updates...[/]\n"
+                f"  Update available: {remote_tag} (you have {__version__})\n"
+                f"  Downloading and installing..."
+            )
+            success, message = perform_update()
+            if success:
+                self._update_info_content(
+                    f"[green]✓ {message}[/]"
+                )
+            else:
+                parts = [f"[red]✗ {message}[/]"]
+                if manual_cmd:
+                    parts.append(
+                        f"\n  [dim]Manual command: {manual_cmd}[/]"
+                    )
+                self._update_info_content(" ".join(parts))
+
+    def _handle_clipboard_command(self, args: str) -> None:
+        """Handle /clipboard command - show or set clipboard method."""
+        from agent13.clipboard import VALID_METHODS
+
+        args = args.strip().lower()
+
+        if not args:
+            # Show current method
+            method = self._clipboard_method
+            desc = (
+                "terminal escape sequence (works over SSH)"
+                if method == "osc52"
+                else "OS-level commands (works in tmux, screen, PowerShell)"
+            )
+            self._update_info_content(
+                f"Clipboard method: [bold]{method}[/]\n"
+                f"  {desc}\n\n"
+                f"Change with: [yellow]/clipboard osc52[/] or "
+                f"[yellow]/clipboard system[/]"
+            )
+            return
+
+        if args not in VALID_METHODS:
+            self._update_info_content(
+                f"[red]Unknown method: {args}[/]\n"
+                f"Valid methods: [yellow]{', '.join(VALID_METHODS)}[/]"
+            )
+            return
+
+        # Update in-memory
+        self._clipboard_method = args
+
+        # Persist to config file
+        try:
+            from agent13.config_paths import get_config_file
+
+            config_path = get_config_file()
+            if config_path.exists():
+                content = config_path.read_text()
+                # Update or add [clipboard] section
+                import re
+                pattern = r'\[clipboard]\s*\nmethod\s*=\s*"[^"]*"'
+                replacement = f'[clipboard]\nmethod = "{args}"'
+                if re.search(pattern, content):
+                    new_content = re.sub(pattern, replacement, content)
+                else:
+                    # Add [clipboard] section at the end
+                    new_content = content.rstrip() + f"\n\n[clipboard]\nmethod = \"{args}\"\n"
+                config_path.write_text(new_content)
+        except OSError as e:
+            self._update_info_content(
+                f"[yellow]Clipboard set to {args} for this session, "
+                f"but could not save to config: {e}[/]"
+            )
+            return
+
+        desc = (
+            "terminal escape sequence (works over SSH)"
+            if args == "osc52"
+            else "OS-level commands (works in tmux, screen, PowerShell)"
+        )
+        self._update_info_content(
+            f"[green]Clipboard method: {args}[/]\n"
+            f"  {desc}"
+        )
 
     def _handle_save_command(self, args: str) -> None:
         """Handle /save command - save context to file."""
@@ -4545,6 +4695,26 @@ class AgentTUI(App):
             self._interrupt_requested = True
             self.run_worker(self._interrupt_agent_loop())
 
+    def copy_to_clipboard(self, text: str) -> None:
+        """Override Textual's clipboard to respect the configured method.
+
+        Uses the [clipboard] method from config (default: osc52).
+        Falls back to Textual's OSC 52 for "osc52" mode,
+        or uses OS-level subprocess for "system" mode.
+        """
+        from agent13.clipboard import copy_to_clipboard as _copy
+
+        method = self._clipboard_method
+        if method == "system":
+            if not _copy(text, method="system"):
+                self._write_error(
+                    "Clipboard (system) failed. "
+                    "Install xclip, wl-copy, or try /clipboard osc52"
+                )
+        else:
+            # OSC 52 — delegate to Textual's built-in
+            _copy(text, method="osc52", osc52_handler=super().copy_to_clipboard)
+
     def action_copy_selection(self) -> None:
         """Copy rendered selection to clipboard (Ctrl+Shift+C).
 
@@ -4784,7 +4954,7 @@ Provider names are read from ~/.agent13/config.toml
         help="Model to select: number (1, 2, ...) or name. With no value, lists available models and exits",
     )
     parser.add_argument(
-        "--prompt-name",
+        "--system-prompt",
         type=str,
         help="System prompt to use (name from prompt manager)",
     )
@@ -4904,9 +5074,9 @@ Provider names are read from ~/.agent13/config.toml
 
     # Initialize prompt manager and set active prompt if specified
     prompt_manager = PromptManager()
-    if args.prompt_name:
-        if not prompt_manager.set_active(args.prompt_name):
-            print(f"Error: Prompt '{args.prompt_name}' not found", file=sys.stderr)
+    if args.system_prompt:
+        if not prompt_manager.set_active(args.system_prompt):
+            print(f"Error: Prompt '{args.system_prompt}' not found", file=sys.stderr)
             print(
                 f"Available prompts: {', '.join(prompt_manager.prompts)}",
                 file=sys.stderr,

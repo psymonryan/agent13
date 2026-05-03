@@ -226,7 +226,7 @@ Provider names are read from ~/.agent13/config.toml
         help="Model to select: number (1, 2, ...) or name. With no value, lists models",
     )
     parser.add_argument(
-        "--prompt-name",
+        "--system-prompt",
         type=str,
         help="System prompt to use (name from prompt manager)",
     )
@@ -291,11 +291,44 @@ Provider names are read from ~/.agent13/config.toml
         default="fast",
         help="Spinner style/speed: fast (braille, 100ms), slow (classic, 250ms), or off",
     )
+    parser.add_argument(
+        "--upgrade",
+        action="store_true",
+        help="Check for updates and install if available, then exit",
+    )
+    parser.add_argument(
+        "--clipboard",
+        choices=["osc52", "system"],
+        default="osc52",
+        help="Clipboard method: osc52 (terminal escape sequence) or system (OS clipboard command)",
+    )
 
     args = parser.parse_args()
+    # Track whether --clipboard was explicitly passed (vs default)
+    args._clipboard_explicit = "--clipboard" in sys.argv
 
     # Ensure default skills are available for new users
     ensure_default_skills()
+
+    # Handle --upgrade flag (check + apply, then exit)
+    if args.upgrade:
+        from agent13.updater import perform_update
+
+        success, message = perform_update()
+        if success:
+            print(f"✓ {message}")
+        else:
+            print(f"✗ {message}", file=sys.stderr)
+        sys.exit(0 if success else 1)
+
+    # Check for updates (throttled, respects config)
+    from agent13.updater import check_for_update
+
+    cfg = get_config()
+    if cfg.update_check_enabled:
+        update_msg = check_for_update(cfg.update_check_interval_hours)
+        if update_msg:
+            print(f"\n  {update_msg}\n", file=sys.stderr)
 
     # Initialize debug logging if --debug flag is set
     if args.debug:
@@ -379,9 +412,9 @@ Provider names are read from ~/.agent13/config.toml
 
     # Initialize prompt manager
     prompt_manager = PromptManager()
-    if args.prompt_name:
-        if not prompt_manager.set_active(args.prompt_name):
-            print(f"Error: Prompt '{args.prompt_name}' not found", file=sys.stderr)
+    if args.system_prompt:
+        if not prompt_manager.set_active(args.system_prompt):
+            print(f"Error: Prompt '{args.system_prompt}' not found", file=sys.stderr)
             print(
                 f"Available prompts: {', '.join(prompt_manager.prompts)}",
                 file=sys.stderr,
@@ -451,6 +484,7 @@ Provider names are read from ~/.agent13/config.toml
         continue_session=args.continue_session,
         devel_mode=args.devel,
         spinner_speed=args.spinner,
+        clipboard_method=args.clipboard if args._clipboard_explicit else cfg.clipboard_method,
     )
 
 

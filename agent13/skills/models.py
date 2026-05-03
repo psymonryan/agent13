@@ -2,7 +2,7 @@
 
 from pathlib import Path
 from typing import Any
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field
 
 
 class SkillMetadata(BaseModel):
@@ -26,23 +26,6 @@ class SkillMetadata(BaseModel):
     license: str | None = Field(default=None)
     compatibility: str | None = Field(default=None, max_length=500)
     metadata: dict[str, Any] = Field(default_factory=dict)
-    allowed_tools: list[str] = Field(
-        default_factory=list,
-        validation_alias="allowed-tools",
-    )
-    user_invocable: bool = Field(
-        default=True,
-        validation_alias="user-invocable",
-    )
-
-    @field_validator("allowed_tools", mode="before")
-    @classmethod
-    def parse_allowed_tools(cls, v: str | list[str] | None) -> list[str]:
-        if v is None:
-            return []
-        if isinstance(v, str):
-            return v.split()
-        return list(v)
 
 
 class SkillInfo(BaseModel):
@@ -53,8 +36,6 @@ class SkillInfo(BaseModel):
     license: str | None = None
     compatibility: str | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
-    allowed_tools: list[str] = Field(default_factory=list)
-    user_invocable: bool = True
     skill_path: Path  # Path to SKILL.md file
 
     model_config = {"arbitrary_types_allowed": True}
@@ -72,7 +53,5 @@ class SkillInfo(BaseModel):
             license=meta.license,
             compatibility=meta.compatibility,
             metadata=meta.metadata,
-            allowed_tools=meta.allowed_tools,
-            user_invocable=meta.user_invocable,
             skill_path=skill_path.resolve(),
         )

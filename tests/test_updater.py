@@ -145,8 +145,8 @@ class TestCheckForUpdate:
             }
             assert check_for_update(0) is None  # interval=0 forces check
 
-    def test_returns_message_when_update_available(self, tmp_path):
-        """Should return a message if remote version is newer."""
+    def test_returns_dict_when_update_available(self, tmp_path):
+        """Should return a dict if remote version is newer."""
         state_file = tmp_path / "last_update_check.json"
         with (
             patch("agent13.updater._LAST_CHECK_FILE", state_file),
@@ -160,11 +160,10 @@ class TestCheckForUpdate:
             }
             result = check_for_update(0)  # interval=0 forces check
         assert result is not None
-        assert "0.2.0" in result
-        assert "0.1.8" in result
-        assert "Update available" in result
-        assert "/upgrade" in result
-        assert "uv tool install --force" in result
+        assert result["remote_tag"] == "0.2.0"
+        assert result["local_version"] == "0.1.8"
+        assert result["wheel_url"] == "https://example.com/wheel.whl"
+        assert "uv tool install --force" in result["manual_cmd"]
 
     def test_returns_none_when_fetch_fails(self, tmp_path):
         """Should return None gracefully if GitHub is unreachable."""

@@ -52,7 +52,7 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 Install package directly from github:
 
 ```
-uv tool install https://github.com/psymonryan/agent13/releases/download/v0.1.9/agent13-0.1.9-py3-none-any.whl
+uv tool install https://github.com/psymonryan/agent13/releases/download/v0.2.0/agent13-0.2.0-py3-none-any.whl
 ```
 
 Or install from source (for hacking on the agent itself):

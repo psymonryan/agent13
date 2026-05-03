@@ -322,13 +322,31 @@ Provider names are read from ~/.agent13/config.toml
         sys.exit(0 if success else 1)
 
     # Check for updates (throttled, respects config)
-    from agent13.updater import check_for_update
+    from agent13.updater import check_for_update, format_update_notice, perform_update
 
     cfg = get_config()
     if cfg.update_check_enabled:
-        update_msg = check_for_update(cfg.update_check_interval_hours)
-        if update_msg:
-            print(f"\n  {update_msg}\n", file=sys.stderr)
+        update_info = check_for_update(cfg.update_check_interval_hours)
+        if update_info:
+            notice = format_update_notice(update_info)
+            print(f"\n{notice}\n", file=sys.stderr)
+
+            # Interactive prompt: only in TUI mode on a real terminal
+            is_batch = args.prompt is not None
+            if not is_batch and sys.stdin.isatty():
+                try:
+                    print(file=sys.stderr)
+                    choice = input("  Apply update now? [y/N] ").strip().lower()
+                except (EOFError, KeyboardInterrupt):
+                    choice = ""
+                if choice in ("y", "yes"):
+                    success, message = perform_update()
+                    if success:
+                        print(f"✓ {message}")
+                    else:
+                        print(f"✗ {message}", file=sys.stderr)
+                    sys.exit(0 if success else 1)
+                # Any other input → continue to TUI as normal
 
     # Initialize debug logging if --debug flag is set
     if args.debug:

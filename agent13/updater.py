@@ -138,14 +138,17 @@ def _build_manual_command(wheel_url: str) -> str:
     return f"uv tool install --force {wheel_url}"
 
 
-def check_for_update(interval_hours: float = 24) -> Optional[str]:
+def check_for_update(
+    interval_hours: float = 24,
+) -> Optional[dict]:
     """Check if a newer version is available on GitHub.
 
     Args:
         interval_hours: Minimum hours between checks (throttle).
 
     Returns:
-        A notification string if an update is available, None otherwise.
+        A dict with update info if an update is available, None otherwise.
+        Dict keys: remote_tag, local_version, wheel_url, manual_cmd
     """
     if not _should_check(interval_hours):
         return None
@@ -161,18 +164,43 @@ def check_for_update(interval_hours: float = 24) -> Optional[str]:
     if _is_newer(remote_tag, __version__):
         wheel_url = release.get("wheel_url", "")
         manual_cmd = _build_manual_command(wheel_url) if wheel_url else ""
-        parts = [
-            f"⬆ Update available: {remote_tag} (you have {__version__}).",
-            "Type /upgrade to apply.",
-        ]
-        if manual_cmd:
-            parts.append(f"Or run: {manual_cmd}")
-        parts.append(
-            "Disable these notifications: set check_enabled = false "
-            "in [updates] section of ~/.agent13/config.toml"
-        )
-        return " ".join(parts)
+        return {
+            "remote_tag": remote_tag,
+            "local_version": __version__,
+            "wheel_url": wheel_url,
+            "manual_cmd": manual_cmd,
+        }
     return None
+
+
+def format_update_notice(info: dict) -> str:
+    """Format update info dict into a human-readable multi-line notice.
+
+    Args:
+        info: Dict from check_for_update() with keys:
+              remote_tag, local_version, wheel_url, manual_cmd
+
+    Returns:
+        Formatted multi-line string suitable for terminal display.
+    """
+    remote_tag = info["remote_tag"]
+    local_version = info["local_version"]
+    manual_cmd = info.get("manual_cmd", "")
+
+    lines = [
+        f"⬆ Update available: {remote_tag} (you have {local_version})",
+        "",
+        "  From TUI use:  /upgrade",
+    ]
+    if manual_cmd:
+        lines.append(f"  Or run:        {manual_cmd}")
+    lines.append("")
+    lines.append(
+        "  To disable this check set:\n"
+        "      check_enabled = false in [updates] section\n"
+        "  of ~/.agent13/config.toml"
+    )
+    return "\n".join(lines)
 
 
 def perform_update() -> tuple[bool, str]:

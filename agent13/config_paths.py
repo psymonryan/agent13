@@ -93,11 +93,8 @@ def get_history_path(project_name: str | None = None, suffix: str = "") -> Path:
 
 
 def get_prompts_file() -> Path:
-    """Return the path to prompts.yaml (~/.agent/prompts.yaml).
-
-    Note: This uses ~/.agent/ (not ~/.agent13/) for backward compatibility.
-    """
-    return Path.home() / ".agent" / "prompts.yaml"
+    """Return the path to prompts.yaml (~/.agent13/prompts.yaml)."""
+    return get_config_dir() / "prompts.yaml"
 
 
 def get_snippets_file() -> Path:

@@ -347,6 +347,16 @@ def log_assistant_response(text: str, reasoning: str = None) -> None:
     log_event("assistant_response", data)
 
 
+def log_journal_debug(step: str, data: dict[str, Any]) -> None:
+    """Log journal debug event for diagnosing journal_all issues.
+
+    Args:
+        step: Decision point name (e.g. "journal_all_start", "has_tool_calls")
+        data: Diagnostic data dictionary
+    """
+    log_event("journal_debug", {"step": step, **data})
+
+
 def log_journal_reflection(
     incoming_message: str, summary: str, message_count: int
 ) -> None:

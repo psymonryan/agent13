@@ -554,13 +554,14 @@ class AgentTUI(App):
         "pretty": ["on", "off"],
         "tool-response": ["raw", "json"],
         "provider": "_get_provider_completions",  # Method to get provider names
-        "prompt": "_get_prompt_completions",  # Method for subcommand handling
+        "prompt": "_get_prompt_completions",  # Method to get prompt names
         "delete": "_get_delete_completions",  # Delete from history, queue, or saves
         "journal": ["on", "off", "last", "all", "status"],
         "remove-reasoning": ["on", "off"],
         "save": "_get_save_completions",  # Method to list save files
         "load": "_get_save_completions",  # Same method for load
         "devel": ["on", "off", "status"],
+        "skills": ["on", "off", "list", "status"],
         "snippet": "_get_snippet_completions",
         "spinner": ["fast", "slow", "off", "status"],
         "upgrade": ["--copy"],
@@ -671,12 +672,15 @@ class AgentTUI(App):
 
         # Initialize agent with tools
         config = get_config()
+        # Determine skills mode: skill tool visible when skills are included
+        skills_mode = bool(self.skill_manager and self.skill_manager.skills)
         self.agent = Agent(
             client=client,
             model=model,
             system_prompt=effective_system_prompt,
             tools=get_filtered_tools(
                 devel=devel_mode,
+                skills=skills_mode,
                 enabled_tools=config.enabled_tools or None,
                 disabled_tools=config.disabled_tools or None,
             ),
@@ -686,6 +690,7 @@ class AgentTUI(App):
             send_reasoning=send_reasoning,
             remove_reasoning=remove_reasoning,
             devel_mode=devel_mode,
+            skills_mode=skills_mode,
         )
 
         # Set MCP server configs for lazy initialization
@@ -1051,35 +1056,17 @@ class AgentTUI(App):
     def _get_prompt_completions(self, partial: str, full_text: str = "") -> list[str]:
         """Get completions for /prompt command.
 
-        Handles subcommands: list, use <name>
+        Completes prompt names directly (flat command, no subcommands).
 
         Args:
-            partial: Everything after "/prompt " (e.g., "u", "use ", "use dev")
+            partial: Everything after "/prompt " (e.g., "d", "def", "default")
             full_text: Full input text (unused, kept for API consistency)
         """
-        if not partial or " " not in partial:
-            # Completing subcommand: "", "u", "us", "use", "li", "list"
-            subcmds = ["list", "use"]
-            if not partial:
-                return subcmds
-            partial_lower = partial.lower()
-            return [s for s in subcmds if s.lower().startswith(partial_lower)]
-
-        # Has a space - completing argument after subcommand
-        # e.g., "use ", "use d", "use dev"
-        subcmd_part, arg_partial = partial.split(" ", 1)
-        subcmd = subcmd_part.lower()
-
-        if subcmd == "use":
-            # Complete prompt names
-            prompt_names = list(self.prompt_manager.prompts.keys())
-            if not arg_partial:
-                return prompt_names
-            arg_lower = arg_partial.lower()
-            return [n for n in prompt_names if n.lower().startswith(arg_lower)]
-
-        # Unknown subcommand - no completions
-        return []
+        prompt_names = list(self.prompt_manager.prompts.keys())
+        if not partial:
+            return prompt_names
+        partial_lower = partial.lower()
+        return [n for n in prompt_names if n.lower().startswith(partial_lower)]
 
     def _get_snippet_completions(self, partial: str, full_text: str = "") -> list[str]:
         """Get completions for /snippet command.
@@ -1226,7 +1213,7 @@ class AgentTUI(App):
             return self._get_command_completions(partial)
         elif completion_type == "/cmd_param":
             # Parse the command and get parameter completions
-            # full_text is like "/model dev" or "/prompt use dev"
+            # full_text is like "/model dev" or "/prompt concise"
             parts = full_text.split(maxsplit=1)
             if len(parts) >= 1:
                 cmd = parts[0][1:]  # Remove leading /
@@ -2463,7 +2450,7 @@ class AgentTUI(App):
                 return f"{n / 1000:.1f}k"
             return str(n)
 
-        total_str = format_tokens(self.total_tokens)
+        total_str = format_tokens(self.prompt_tokens)
 
         queue_info = (
             f" | Queue: {self.agent.queue.pending_count}"
@@ -2721,7 +2708,7 @@ class AgentTUI(App):
         elif command == "tools":
             self._handle_tools_command()
         elif command == "skills":
-            self._handle_skills_command()
+            self._handle_skills_command(args)
         elif command == "journal":
             self._handle_journal_command(args)
         elif command == "remove-reasoning":
@@ -2765,41 +2752,61 @@ class AgentTUI(App):
                 return
             self._update_info_content(f"[red]Unknown command: {escape_markup(cmd)}[/]")
 
+    def _enter_command_completion(
+        self, command: str, matches: list[str], current_value: str | None = None
+    ) -> None:
+        """Enter tab-completion mode for a slash command.
+
+        Sets the input to /command and shows completions, starting at
+        the current_value if provided (e.g. current model or active prompt).
+
+        Args:
+            command: Slash command name (e.g. "model", "prompt")
+            matches: List of completion matches
+            current_value: Current value to highlight and start at (optional)
+        """
+        input_field = self.query_one("#input-field", ChatTextArea)
+        input_field.text = f"/{command} "
+        cursor_col = len(f"/{command} ")
+        input_field.move_cursor((0, cursor_col))
+
+        # Trigger completion for the current input context
+        completion_type, start_loc, end_loc = self._get_completion_context(
+            f"/{command} ", 0, cursor_col
+        )
+        if completion_type == "none" or not matches:
+            self.call_later(input_field.focus)
+            return
+
+        # Find starting index — default to 0, or current_value's position
+        start_idx = 0
+        if current_value and current_value in matches:
+            start_idx = matches.index(current_value)
+
+        if len(matches) == 1:
+            # Single match - complete immediately
+            self._apply_completion(input_field, matches[0], start_loc, end_loc)
+        else:
+            # Multiple matches - enter completion mode
+            self._completion_matches = matches
+            self._completion_index = start_idx
+            self._completion_prefix = ""
+            self._completion_start = start_loc
+            self._completion_end = end_loc
+            self._apply_completion(
+                input_field, matches[start_idx], start_loc, end_loc
+            )
+            self._completion_text = input_field.text
+            self._show_completions(matches, matches[start_idx])
+
+        self.call_later(input_field.focus)
+
     def _handle_model_command(self, args: str) -> None:
         """Handle /model command."""
         if not args:
-            # Show model list via completion system
-            input_field = self.query_one("#input-field", ChatTextArea)
-            input_field.text = "/model "
-            cursor_col = len("/model ")
-            input_field.move_cursor((0, cursor_col))
-            # Trigger completion for the current input context
-            completion_type, start_loc, end_loc = self._get_completion_context(
-                "/model ", 0, cursor_col
-            )
-            if completion_type != "none":
-                matches = self._get_completions_for_context(
-                    completion_type, "", "/model "
-                )
-                if matches:
-                    if len(matches) == 1:
-                        # Single match - complete immediately
-                        self._apply_completion(
-                            input_field, matches[0], start_loc, end_loc
-                        )
-                    else:
-                        # Multiple matches - enter completion mode
-                        self._completion_matches = matches
-                        self._completion_index = 0
-                        self._completion_prefix = ""
-                        self._completion_start = start_loc
-                        self._completion_end = end_loc
-                        self._apply_completion(
-                            input_field, matches[0], start_loc, end_loc
-                        )
-                        self._completion_text = input_field.text
-                        self._show_completions(matches, matches[0])
-            self.call_later(input_field.focus)
+            # Show model list via completion system, starting at current model
+            matches = self._get_model_completions("")
+            self._enter_command_completion("model", matches, self.model)
             return
 
         model = self._resolve_model(args)
@@ -3054,13 +3061,13 @@ class AgentTUI(App):
             "  [yellow]/delete q N[/] - Delete queue item N\n"
             "  [yellow]/delete s NAME[/] - Delete saved context\n"
             "  [yellow]/clear [all][/] - Clear context (all: also clear scrollback)\n"
-            "  [yellow]/prompt [list|use NAME][/] - Manage prompts\n"
+            "  [yellow]/prompt [name][/] - Switch system prompt (tab to list)\n"
             "  [yellow]/pretty [on|off][/] - Toggle markdown rendering\n"
             "  [yellow]/tool-response [raw|json][/] - Set tool response format\n"
             "  [yellow]/sandbox [mode][/] - Show/set sandbox mode\n"
             "  [yellow]/mcp [connect|disconnect|reload][/] - List/manage MCP servers\n"
             "  [yellow]/tools[/] - Show tool usage statistics\n"
-            "  [yellow]/skills[/] - List available skills\n"
+            "  [yellow]/skills[/] - Toggle/list skills mode (on|off|list|status)\n"
             "\n[bold]Save/Load:[/]\n"
             "  [yellow]/save <name> [-y][/] - Save context to ./.agent13/saves/<name>.ctx\n"
             "  [yellow]/load <name>[/] - Load context from ./.agent13/saves/<name>.ctx\n"
@@ -3107,45 +3114,22 @@ class AgentTUI(App):
     def _handle_prompt_command(self, args: str) -> None:
         """Handle /prompt command."""
         if not args:
-            # Show current prompt
-            prompt = self.prompt_manager.get_prompt()
-            preview = prompt[:200] + "..." if len(prompt) > 200 else prompt
-            self._update_info_content(
-                f"[bold]Current prompt ({self.prompt_manager.active_prompt}):[/]\n"
-                f"  {preview}\n\n"
-                "[dim]Usage: /prompt [list|use NAME][/]"
+            # Show prompt list via completion system, starting at active prompt
+            matches = list(self.prompt_manager.prompts.keys())
+            self._enter_command_completion(
+                "prompt", matches, self.prompt_manager.active_prompt
             )
             return
 
-        parts = args.split(maxsplit=1)
-        subcmd = parts[0].lower()
-        subargs = parts[1] if len(parts) > 1 else ""
-
-        if subcmd == "list":
-            lines = ["[bold]Available prompts:[/]"]
-            for name in self.prompt_manager.prompts:
-                marker = (
-                    " (active)" if name == self.prompt_manager.active_prompt else ""
-                )
-                lines.append(f"  [yellow]{escape_markup(name)}[/]{marker}")
-            self._update_info_content("\n".join(lines))
-        elif subcmd == "use":
-            if not subargs:
-                self._update_info_content("[red]Usage: /prompt use NAME[/]")
-                return
-            if self.prompt_manager.set_active(subargs.strip()):
-                self.agent.set_system_prompt(self.prompt_manager.get_prompt())
-                asyncio.create_task(
-                    self._write_system(f"Switched to prompt: {escape_markup(subargs)}")
-                )
-            else:
-                self._update_info_content(
-                    f"[red]Prompt not found: {escape_markup(subargs)}[/]"
-                )
+        name = args.strip()
+        if self.prompt_manager.set_active(name):
+            self.agent.set_system_prompt(self.prompt_manager.get_prompt())
+            asyncio.create_task(
+                self._write_system(f"Switched to prompt: {escape_markup(name)}")
+            )
         else:
             self._update_info_content(
-                f"[red]Unknown prompt command: {escape_markup(subcmd)}[/]\n"
-                "[dim]Usage: /prompt [list|use NAME][/]"
+                f"[red]Prompt not found: {escape_markup(name)}[/]"
             )
 
     def _handle_snippet_command(self, args: str) -> None:
@@ -3758,30 +3742,82 @@ class AgentTUI(App):
 
         self._update_info_content("\n".join(lines))
 
-    def _handle_skills_command(self) -> None:
-        """Handle /skills command - list available skills."""
+    def _handle_skills_command(self, args: str) -> None:
+        """Handle /skills command - toggle skills mode or list available skills.
+
+        Args:
+            args: Subcommand - 'on', 'off', 'list', 'status', or empty (lists)
+        """
         if not self.skill_manager:
             self._update_info_content("[dim]No skill manager configured[/]")
             return
 
-        skills = self.skill_manager.skills
-        if not skills:
-            self._update_info_content("[dim]No skills available[/]")
-            return
+        args = args.strip().lower()
 
-        lines = ["[bold]Available skills:[/]", ""]
-        for name, info in sorted(skills.items()):
-            desc = (
-                info.description[:60] + "..."
-                if len(info.description) > 60
-                else info.description
+        if args == "on":
+            self.agent.set_skills_mode(True)
+            self._rebuild_system_prompt_with_skills(True)
+            self._update_info_content(
+                "[green]Skills mode enabled[/]\n"
+                "The AI can now see and use the skill tool. "
+                "Skill descriptions added to system prompt."
             )
-            lines.append(
-                f"  [yellow]/{escape_markup(name)}[/] - {escape_markup(desc)}"
+        elif args == "off":
+            self.agent.set_skills_mode(False)
+            self._rebuild_system_prompt_with_skills(False)
+            self._update_info_content(
+                "[yellow]Skills mode disabled[/]\n"
+                "The skill tool is now hidden from the AI. "
+                "You can still invoke skills directly via slash commands."
             )
+        elif args == "status":
+            status = "on" if self.agent.skills_mode else "off"
+            color = "green" if self.agent.skills_mode else "yellow"
+            count = len(self.skill_manager.skills) if self.skill_manager.skills else 0
+            self._update_info_content(
+                f"[{color}]Skills mode: {status}[/]\n"
+                f"{count} skill(s) available"
+            )
+        else:
+            # Default: list skills (also handles 'list' subcommand)
+            skills = self.skill_manager.skills
+            if not skills:
+                self._update_info_content("[dim]No skills available[/]")
+                return
 
-        lines.append("")
-        self._update_info_content("\n".join(lines))
+            status = "on" if self.agent.skills_mode else "off"
+            lines = [f"[bold]Available skills[/] (mode: {status})", ""]
+            for name, info in sorted(skills.items()):
+                desc = (
+                    info.description[:60] + "..."
+                    if len(info.description) > 60
+                    else info.description
+                )
+                lines.append(
+                    f"  [yellow]/{escape_markup(name)}[/] - {escape_markup(desc)}"
+                )
+
+            lines.append("")
+            lines.append("[dim]Use /skills on|off to toggle AI visibility[/]")
+            self._update_info_content("\n".join(lines))
+
+    def _rebuild_system_prompt_with_skills(self, include: bool) -> None:
+        """Rebuild the system prompt with or without the skills section.
+
+        Args:
+            include: True to append skills section, False to strip it
+        """
+        from agent13.prompts import get_skills_section
+
+        base = self.prompt_manager.get_prompt()
+        if include and self.skill_manager and self.skill_manager.skills:
+            skills_section = get_skills_section(self.skill_manager.skills)
+            if skills_section:
+                self.agent.set_system_prompt(f"{base}\n\n{skills_section}")
+            else:
+                self.agent.set_system_prompt(base)
+        else:
+            self.agent.set_system_prompt(base)
 
     def _handle_journal_command(self, args: str) -> None:
         """Handle /journal command - control journal mode."""
@@ -4130,10 +4166,19 @@ class AgentTUI(App):
             return
 
         success, message, incomplete = load_context(self.agent, path)
+        from agent13.debug_log import log_journal_debug
+        log_journal_debug("auto_save_load", {
+            "success": success,
+            "message": message,
+            "path": str(path),
+            "messages_count": len(self.agent.messages),
+            "has_tool_calls": self.agent._has_tool_calls(),
+        })
         if success:
             # Reset TUI token counters
             self.prompt_tokens = self.agent.prompt_tokens
             self.completion_tokens = self.agent.completion_tokens
+            self.total_tokens = self.agent.prompt_tokens + self.agent.completion_tokens
             # Note: We intentionally do NOT sync model from loaded context
             # User keeps their current provider/model settings
             self.update_status()

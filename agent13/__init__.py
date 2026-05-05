@@ -34,7 +34,7 @@ __version__ = _get_version()
 from agent13.events import AgentEvent, AgentEventData, EventHandler  # noqa: E402
 from agent13.queue import AgentQueue, ItemStatus, QueueItem  # noqa: E402
 from agent13.history import History, get_default_history_path  # noqa: E402
-from agent13.prompts import PromptManager  # noqa: E402
+from agent13.prompts import PromptManager, ensure_default_prompts  # noqa: E402
 from agent13.snippets import SnippetManager  # noqa: E402
 from agent13.core import Agent, AgentStatus, PauseState, SpinnerSpeed  # noqa: E402
 from agent13.llm import (  # noqa: E402
@@ -115,6 +115,7 @@ __all__ = [
     "History",
     "get_default_history_path",
     "PromptManager",
+    "ensure_default_prompts",
     "SnippetManager",
     # Core
     "Agent",

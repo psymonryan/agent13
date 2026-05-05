@@ -4,17 +4,55 @@ from __future__ import annotations
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from agent13.config_paths import get_prompts_file
+from agent13.config_paths import get_prompts_file, ensure_config_dir
 from agent13.yaml_store import load_yaml, save_yaml
 
 DEFAULT_PROMPT = "You are a tool using AI assistant."
+
+REFLECTION_PROMPT = (
+    "Since you have just used tools, reflect on each one, then stop.\n"
+    "- what was your goal when calling the tools\n"
+    "- what did you achieve with these calls\n"
+    "Skip where the goal was not achieved"
+)
+
+# Default prompts bundled with the package
+DEFAULT_PROMPTS_FILE = Path(__file__).parent / "default_prompts.yaml"
 
 if TYPE_CHECKING:
     from agent13.skills import SkillInfo
 
 
+def ensure_default_prompts() -> None:
+    """Copy default prompts to user's config directory if they don't exist.
+
+    This provides starter prompts for new users.
+    """
+    prompts_file = get_prompts_file()
+
+    # If prompts already exist, don't overwrite
+    if prompts_file.exists():
+        return
+
+    # Check if we have a default prompts file to copy
+    if not DEFAULT_PROMPTS_FILE.exists():
+        return
+
+    # Ensure config directory exists
+    ensure_config_dir()
+
+    # Copy default prompts
+    try:
+        prompts_file.write_text(DEFAULT_PROMPTS_FILE.read_text())
+    except OSError as e:
+        # Log warning but don't fail
+        import logging
+
+        logging.getLogger(__name__).warning("Failed to copy default prompts: %s", e)
+
+
 class PromptManager:
-    """Manages system prompts stored in ~/.agent/prompts.yaml
+    """Manages system prompts stored in ~/.agent13/prompts.yaml
 
     Prompts are stored in YAML format with prompt names as keys.
     The active prompt is used for system messages in conversations.
@@ -24,7 +62,7 @@ class PromptManager:
         """Initialize prompt manager.
 
         Args:
-            config_path: Path to prompts YAML file (defaults to ~/.agent/prompts.yaml).
+            config_path: Path to prompts YAML file (defaults to ~/.agent13/prompts.yaml).
         """
         self.config_path = Path(config_path) if config_path else get_prompts_file()
         self.prompts: dict[str, str] = {}
@@ -120,8 +158,8 @@ class PromptManager:
         """
         base = self.get_prompt()
         if self.custom_additions:
-            additions = "\\n\\n".join(self.custom_additions)
-            return f"{base}\\n\\n{additions}"
+            additions = "\n\n".join(self.custom_additions)
+            return f"{base}\n\n{additions}"
         return base
 
     def list_prompts(self) -> list[dict]:

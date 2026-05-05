@@ -10,7 +10,7 @@ from typing import Callable, Awaitable, Optional, TYPE_CHECKING
 from openai import AsyncOpenAI
 
 from agent13.events import AgentEvent, AgentEventData, EventHandler
-from agent13.prompts import DEFAULT_PROMPT
+from agent13.prompts import DEFAULT_PROMPT, REFLECTION_PROMPT
 from agent13.queue import AgentQueue, QueueItem
 from agent13.llm import (
     stream_response_with_tools,
@@ -29,6 +29,7 @@ from agent13.debug_log import (
     log_tool_call,
     log_tool_result,
     log_journal_reflection,
+    log_journal_debug,
     # TPS debug logging
     is_debug_enabled,
     log_tps_event,
@@ -204,6 +205,7 @@ class Agent:
         send_reasoning: bool = False,
         remove_reasoning: bool = False,
         devel_mode: bool = False,
+        skills_mode: bool = False,
     ):
         """Initialize the agent.
 
@@ -222,6 +224,7 @@ class Agent:
             remove_reasoning: If True, strip reasoning tokens between turns.
                              Defaults to False (preserve reasoning between turns).
             devel_mode: If True, include tools in the "devel" group (e.g. TUI viewer).
+            skills_mode: If True, include tools in the "skills" group (e.g. skill tool).
         """
         self.client = client
         self.model = model
@@ -235,6 +238,7 @@ class Agent:
         self.send_reasoning = send_reasoning
         self.remove_reasoning = remove_reasoning
         self._devel_mode = devel_mode
+        self._skills_mode = skills_mode
         self.execute_tool = execute_tool
         self.response_format = response_format
         self.journal_mode = journal_mode
@@ -324,12 +328,21 @@ class Agent:
             True if any assistant message has tool_calls or any message
             has role 'tool'.
         """
-        for msg in self.messages:
-            if msg.get("role") == "assistant" and msg.get("tool_calls"):
-                return True
-            if msg.get("role") == "tool":
-                return True
-        return False
+        assistant_tc = sum(
+            1 for m in self.messages
+            if m.get("role") == "assistant" and m.get("tool_calls")
+        )
+        tool_msgs = sum(
+            1 for m in self.messages if m.get("role") == "tool"
+        )
+        result = assistant_tc > 0 or tool_msgs > 0
+        log_journal_debug("has_tool_calls", {
+            "messages_count": len(self.messages),
+            "assistant_with_tool_calls": assistant_tc,
+            "tool_messages": tool_msgs,
+            "result": result,
+        })
+        return result
 
     def _find_last_user_idx(self, start: int | None = None) -> int | None:
         """Return index of the last non-interrupt user message.
@@ -361,21 +374,26 @@ class Agent:
             Returns None if no tool-using turn is found.
         """
         if not self.messages:
+            log_journal_debug("find_earliest_tool_turn", {
+                "messages_count": 0,
+                "result": None,
+                "reason": "no_messages",
+            })
             return None
 
         # Step 1: Find the first assistant message with tool_calls
-        # that belongs to a turn NOT marked with _journal_skip
         first_tool_idx = None
         for i, msg in enumerate(self.messages):
             if msg.get("role") == "assistant" and msg.get("tool_calls"):
-                # Check if the user message starting this turn is skipped
-                user_i = self._find_last_user_idx(start=i - 1)
-                if user_i is not None and self.messages[user_i].get("_journal_skip"):
-                    continue
                 first_tool_idx = i
                 break
 
         if first_tool_idx is None:
+            log_journal_debug("find_earliest_tool_turn", {
+                "messages_count": len(self.messages),
+                "result": None,
+                "reason": "no_tool_calls_found",
+            })
             return None
 
         # Step 2: Find the non-interrupt user message that starts this turn
@@ -416,6 +434,11 @@ class Agent:
             # concluding assistant text (e.g. after --continue or interrupted runs)
             end_idx = len(self.messages) - 1
 
+        log_journal_debug("find_earliest_tool_turn", {
+            "messages_count": len(self.messages),
+            "result": (user_idx, end_idx),
+            "first_tool_idx": first_tool_idx,
+        })
         return (user_idx, end_idx)
 
     def _count_tool_turns(self) -> int:
@@ -429,6 +452,10 @@ class Agent:
             Number of tool-using turn groups.
         """
         if not self.messages:
+            log_journal_debug("count_tool_turns", {
+                "messages_count": 0,
+                "result": 0,
+            })
             return 0
 
         count = 0
@@ -442,6 +469,10 @@ class Agent:
                     count += 1
                     in_tool_turn = True
 
+        log_journal_debug("count_tool_turns", {
+            "messages_count": len(self.messages),
+            "result": count,
+        })
         return count
 
     def _has_tool_calls_in_last_turn(self) -> bool:
@@ -517,6 +548,44 @@ class Agent:
                         return True
 
         return False
+
+    def _find_skill_call_ranges(self, start: int, end: int) -> list[tuple[int, int]]:
+        """Find sub-ranges within [start, end] that contain skill calls.
+
+        Each skill call range includes the assistant message with the skill
+        tool_call and the corresponding tool result messages that follow it.
+        These ranges must be preserved verbatim during journalling.
+
+        Args:
+            start: Start index (inclusive).
+            end: End index (inclusive).
+
+        Returns:
+            List of (skill_start, skill_end) tuples, sorted by index.
+        """
+        skill_ranges = []
+        i = start
+        while i <= end:
+            msg = self.messages[i]
+            if msg.get("role") == "assistant" and msg.get("tool_calls"):
+                has_skill = any(
+                    tc.get("function", {}).get("name") == "skill"
+                    for tc in msg["tool_calls"]
+                )
+                if has_skill:
+                    skill_start = i
+                    # Include this assistant message and all following
+                    # tool result messages
+                    skill_end = i
+                    j = i + 1
+                    while j <= end and self.messages[j].get("role") == "tool":
+                        skill_end = j
+                        j += 1
+                    skill_ranges.append((skill_start, skill_end))
+                    i = skill_end + 1
+                    continue
+            i += 1
+        return skill_ranges
 
     def _repair_interrupted_messages(self) -> None:
         """Repair message history after an interrupt (task cancellation).
@@ -704,12 +773,16 @@ class Agent:
         return groups
 
     def _compact_previous_turn(
-        self, tool_summary: str, final_message: str = ""
+        self,
+        tool_summary: str,
+        final_message: str = "",
+        preserved_skills: list[dict] | None = None,
     ) -> None:
         """Compact the previous turn by replacing tool exploration with a summary.
 
         Finds the last non-interrupt user message and replaces everything after
         it with:
+        - Preserved skill messages (if any) — verbatim, at the start
         - The tool summary (summarizing tool calls and results)
         - The original final assistant message (preserving the conclusion)
 
@@ -720,6 +793,10 @@ class Agent:
         Args:
             tool_summary: Summary of tool exploration.
             final_message: The original final assistant response to preserve.
+            preserved_skills: Skill call/result messages to preserve verbatim.
+                Inserted at the start of the compacted turn (before the
+                summary), since skill content was loaded before the work
+                that the summary describes.
         """
         if not self.messages:
             return
@@ -736,11 +813,20 @@ class Agent:
         )
 
         # Keep messages up to and including the last non-interrupt user message
-        # Then append the combined summary
         self.messages = self.messages[: last_user_idx + 1]
+
+        # Insert preserved skill messages before the summary
+        if preserved_skills:
+            self.messages.extend(preserved_skills)
+
+        # Then append the combined summary
         self.messages.append({"role": "assistant", "content": combined_content})
 
-    async def _reflect_on_tool_use(self) -> str | None:
+    async def _reflect_on_tool_use(
+        self,
+        skill_names: list[str] | None = None,
+        messages: list[dict] | None = None,
+    ) -> str | None:
         """Ask the LLM to summarize its tool use for context compaction.
 
         Makes a separate API call with a reflection prompt focused on tool calls.
@@ -754,22 +840,26 @@ class Agent:
 
         Emits streaming events so the TUI can display "Reflecting:" feedback.
 
+        Args:
+            skill_names: Names of skills loaded this turn. If provided,
+                a brief note is prepended to the reflection prompt so the
+                LLM can reference skills in its summary without seeing the
+                full skill content.
+            messages: Messages to reflect on. Defaults to self.messages.copy().
+
         Returns:
             The tool use summary text, or None if reflection fails.
         """
         from agent13.llm import stream_response_with_tools
 
-        # Build reflection prompt focused on tool use
-        reflection_prompt = (
-            "Since you have just used tools, reflect on each one, then stop.\n"
-            "- what was your goal when calling the tools\n"
-            "- what did you achieve with these calls\n"
-            "Skip where the goal was not achieved\n"
-            "When done, wait until asked before doing any more reflection"
-        )
+        # Build reflection prompt — add skill names if present
+        reflection_prompt = REFLECTION_PROMPT
+        if skill_names:
+            skill_note = f"[Skills loaded this turn: {', '.join(skill_names)}]"
+            reflection_prompt = f"{skill_note}\n\n{reflection_prompt}"
 
         # Build temporary messages for reflection API call
-        temp_messages = self.messages.copy()
+        temp_messages = (messages or self.messages).copy()
         temp_messages.append({"role": "user", "content": reflection_prompt})
 
         try:
@@ -844,7 +934,10 @@ class Agent:
             return None
 
     async def _journal_one_turn(
-        self, token_count_messages: list | None = None, **event_extras
+        self,
+        token_count_messages: list | None = None,
+        skill_ranges: list[tuple[int, int]] | None = None,
+        **event_extras,
     ) -> tuple[bool, str | None, int, int]:
         """Reflect on tool use, compact the turn, and emit a journal event.
 
@@ -852,16 +945,69 @@ class Agent:
         journal_last_turn, and journal_all. It performs the 5-step sequence:
         reflect → get final message → count tokens → compact → emit.
 
+        When skill_ranges are provided, skill messages are extracted before
+        reflection (so the LLM doesn't waste tokens on content that will
+        be preserved verbatim), a skill-names note is added to the
+        reflection prompt, and the full skill messages are reinserted at
+        the start of the compacted turn.
+
         Args:
             token_count_messages: Messages to count tokens from.
                 Defaults to self.messages[-4:] (approximate last turn).
+            skill_ranges: Ranges of (skill_start, skill_end) indices
+                within self.messages that contain skill calls and results.
+                These are extracted before reflection and reinserted
+                verbatim at the start of the compacted turn.
             **event_extras: Additional fields merged into the JOURNAL_COMPACT event
                 (e.g. retrospective=True, mode="all", iteration, total_turns).
 
         Returns:
             Tuple of (success, summary_or_None, tokens_before, tokens_after).
         """
-        tool_summary = await self._reflect_on_tool_use()
+        # Extract skill messages and build reflection input without them
+        preserved_skills: list[dict] | None = None
+        skill_names: list[str] | None = None
+        reflect_messages: list[dict] | None = None
+
+        if skill_ranges:
+            # Collect skill message dicts for later reinsertion
+            preserved_skills = []
+            skill_names = []
+            for sr_start, sr_end in skill_ranges:
+                for idx in range(sr_start, sr_end + 1):
+                    preserved_skills.append(self.messages[idx])
+                # Extract skill name from the assistant message's tool_calls
+                for idx in range(sr_start, sr_end + 1):
+                    msg = self.messages[idx]
+                    if msg.get("role") == "assistant" and msg.get("tool_calls"):
+                        for tc in msg["tool_calls"]:
+                            fn_name = tc.get("function", {}).get("name", "")
+                            if fn_name == "skill":
+                                args = tc.get("function", {}).get("arguments", {})
+                                # arguments may be a JSON string or dict
+                                if isinstance(args, str):
+                                    try:
+                                        args = json.loads(args)
+                                    except (json.JSONDecodeError, ValueError):
+                                        args = {}
+                                skill_name = args.get("name", "")
+                                if skill_name and skill_name not in skill_names:
+                                    skill_names.append(skill_name)
+
+            # Build reflection messages with skill ranges removed
+            reflect_messages = []
+            skip_indices = set()
+            for sr_start, sr_end in skill_ranges:
+                for idx in range(sr_start, sr_end + 1):
+                    skip_indices.add(idx)
+            for idx, msg in enumerate(self.messages):
+                if idx not in skip_indices:
+                    reflect_messages.append(msg)
+
+        tool_summary = await self._reflect_on_tool_use(
+            skill_names=skill_names,
+            messages=reflect_messages,
+        )
         if not tool_summary:
             return False, None, 0, 0
 
@@ -874,7 +1020,9 @@ class Agent:
         )
         tokens_after = len(tool_summary.split()) + len(final_message.split())
 
-        self._compact_previous_turn(tool_summary, final_message)
+        self._compact_previous_turn(
+            tool_summary, final_message, preserved_skills=preserved_skills
+        )
 
         await self.emit(
             AgentEvent.JOURNAL_COMPACT,
@@ -910,13 +1058,17 @@ class Agent:
         after the agent finishes its turn, via _journal_one_turn(), so the
         message history is always compacted before the user sees it.
 
+        Skill calls in the turn are handled gracefully: skill messages are
+        extracted before reflection (so the LLM doesn't process content
+        that will be preserved verbatim), a skill-names note is added to
+        the reflection prompt, and the full skill messages are reinserted
+        at the start of the compacted turn.
+
         Conditions for reflection:
         - journal_mode is True
         - There are messages to compact
         - Last turn had tool calls
         - No interrupt is in progress
-        - Last turn does NOT contain a skill tool call (skill content
-          must be preserved verbatim, not summarized away)
         """
         if not self.journal_mode:
             return
@@ -926,17 +1078,28 @@ class Agent:
             return
         if self.queue.has_interrupt:
             return
-        if self._has_skill_call_in_last_turn():
-            return
+
+        # Find skill call ranges in the last turn (if any)
+        last_user_idx = self._find_last_user_idx()
+        skill_ranges = None
+        if last_user_idx is not None:
+            end_idx = len(self.messages) - 1
+            ranges = self._find_skill_call_ranges(last_user_idx, end_idx)
+            if ranges:
+                skill_ranges = ranges
 
         # Reflect, compact, and emit
-        await self._journal_one_turn()
+        await self._journal_one_turn(skill_ranges=skill_ranges)
 
     async def journal_last_turn(self) -> tuple[bool, str]:
         """Journal the most recent tool-using turn immediately.
 
         This performs retrospective compaction on the last turn, similar to
         what happens when journal_mode is enabled and a new message arrives.
+
+        Skill calls in the turn are handled gracefully: skill messages are
+        extracted before reflection and reinserted verbatim at the start
+        of the compacted turn.
 
         Called from _process_item when a journal_last queue item is processed.
         Status management is handled by _process_item.
@@ -950,12 +1113,18 @@ class Agent:
         if not self._has_tool_calls_in_last_turn():
             return False, "No tool calls in the most recent turn"
 
-        if self._has_skill_call_in_last_turn():
-            return False, "Last turn contains a skill call (cannot compact)"
+        # Find skill call ranges in the last turn (if any)
+        last_user_idx = self._find_last_user_idx()
+        skill_ranges = None
+        if last_user_idx is not None:
+            end_idx = len(self.messages) - 1
+            ranges = self._find_skill_call_ranges(last_user_idx, end_idx)
+            if ranges:
+                skill_ranges = ranges
 
         # Reflect, compact, and emit
         success, _, tokens_before, tokens_after = await self._journal_one_turn(
-            retrospective=True
+            retrospective=True, skill_ranges=skill_ranges
         )
         if not success:
             return False, "Reflection produced no summary"
@@ -980,20 +1149,45 @@ class Agent:
         4. Restores messages after the compacted turn
         5. Repeats until no tool-using turns remain
 
+        Skill calls within a turn are handled by _journal_one_turn():
+        skill messages are extracted before reflection and reinserted
+        verbatim at the start of the compacted turn.
+
         This preserves user messages and non-tool assistant messages verbatim
         — only the tool-calling machinery gets compacted.
 
         Returns:
             Tuple of (success: bool, message: str) describing the outcome.
         """
+        log_journal_debug("journal_all", {
+            "step": "start",
+            "messages_count": len(self.messages),
+            "journal_mode": self.journal_mode,
+            "first_3_roles": [m.get("role") for m in self.messages[:3]] if self.messages else [],
+        })
         if not self.messages:
+            log_journal_debug("journal_all", {
+                "step": "early_return",
+                "reason": "no_messages",
+                "messages_count": 0,
+            })
             return False, "No messages in context"
 
         if not self._has_tool_calls():
+            log_journal_debug("journal_all", {
+                "step": "early_return",
+                "reason": "no_tool_calls",
+                "messages_count": len(self.messages),
+            })
             return False, "No tool-using turns to journal"
 
         total_turns = self._count_tool_turns()
         if total_turns == 0:
+            log_journal_debug("journal_all", {
+                "step": "early_return",
+                "reason": "zero_tool_turns",
+                "messages_count": len(self.messages),
+            })
             return False, "No tool-using turns to journal"
 
         total_tokens_before = 0
@@ -1008,12 +1202,15 @@ class Agent:
 
             user_idx, end_idx = boundary
 
-            # Skip turns containing skill calls — their content must
-            # be preserved verbatim. Mark the turn's user message so
-            # _find_earliest_tool_turn skips it on subsequent iterations.
-            if self._has_skill_call_in_range(user_idx, end_idx):
-                self.messages[user_idx]["_journal_skip"] = True
-                continue
+            # Find skill call ranges within this turn
+            skill_ranges = self._find_skill_call_ranges(user_idx, end_idx)
+
+            if skill_ranges:
+                log_journal_debug("journal_all_skill_ranges", {
+                    "user_idx": user_idx,
+                    "end_idx": end_idx,
+                    "skill_ranges": skill_ranges,
+                })
 
             # Save messages after this turn (they'll be restored after compaction)
             tail = self.messages[end_idx + 1 :]
@@ -1025,12 +1222,16 @@ class Agent:
             turn_msgs = self.messages[user_idx:]
 
             # Reflect, compact, and emit
+            # skill_ranges is passed so _journal_one_turn can extract
+            # skill messages before reflection and reinsert them at the
+            # start of the compacted turn.
             success, _, tokens_before, tokens_after = await self._journal_one_turn(
                 token_count_messages=turn_msgs,
                 retrospective=True,
                 mode="all",
                 iteration=iteration + 1,
                 total_turns=total_turns,
+                skill_ranges=skill_ranges or None,
             )
 
             # Restore the tail
@@ -1048,9 +1249,6 @@ class Agent:
                     },
                 )
                 if iteration == 0:
-                    # Clean up markers before returning
-                    for msg in self.messages:
-                        msg.pop("_journal_skip", None)
                     return False, "Reflection produced no summary"
                 # Partial success — stop iterating but report what we did
                 break
@@ -1059,17 +1257,13 @@ class Agent:
             total_tokens_before += tokens_before
             total_tokens_after += tokens_after
 
-        # Clean up _journal_skip markers from skill-protected turns
-        for msg in self.messages:
-            msg.pop("_journal_skip", None)
-
         if iteration == 0:
             return False, "No tool-using turns to journal"
 
         savings = total_tokens_before - total_tokens_after
         return True, (
             f"Journalled {iteration} turn(s): "
-            f"{total_tokens_before}\u2192{total_tokens_after} words (saved {savings})"
+            f"{total_tokens_before}→{total_tokens_after} words (saved {savings})"
         )
 
     async def add_message(
@@ -1535,6 +1729,13 @@ class Agent:
                 from agent13.persistence import load_context
 
                 success, message, incomplete = load_context(self, item.text)
+                log_journal_debug("load_context", {
+                    "success": success,
+                    "message": message,
+                    "messages_count": len(self.messages),
+                    "has_tool_calls": self._has_tool_calls(),
+                    "first_3_roles": [m.get("role") for m in self.messages[:3]] if self.messages else [],
+                })
                 self.queue.complete_current()
                 log_queue_complete(item.id, "complete")
                 await self._emit_queue_update()
@@ -2157,6 +2358,30 @@ class Agent:
         self._devel_mode = enabled
         self.tools = get_filtered_tools(
             devel=enabled,
+            skills=self._skills_mode,
+            enabled_tools=config.enabled_tools or None,
+            disabled_tools=config.disabled_tools or None,
+        )
+
+    @property
+    def skills_mode(self) -> bool:
+        """Whether skills-mode tools are visible to the AI."""
+        return self._skills_mode
+
+    def set_skills_mode(self, enabled: bool) -> None:
+        """Toggle skills mode and rebuild the built-in tool list.
+
+        Args:
+            enabled: True to show skills-group tools, False to hide them
+        """
+        from agent13.tools import get_filtered_tools
+        from agent13.config import get_config
+
+        config = get_config()
+        self._skills_mode = enabled
+        self.tools = get_filtered_tools(
+            devel=self._devel_mode,
+            skills=enabled,
             enabled_tools=config.enabled_tools or None,
             disabled_tools=config.disabled_tools or None,
         )

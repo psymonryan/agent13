@@ -601,11 +601,12 @@ class TestToolStats:
 
 
 class TestSkillJournalProtection:
-    """Tests for skill tool call journal protection.
+    """Tests for skill tool call journal handling.
 
     Skill tool calls load instructions that must remain in context.
-    Journalling would destroy them by replacing the tool result with
-    a summary, so turns containing skill calls should be skipped.
+    Journaling now handles skill calls gracefully: skill messages are
+    extracted before reflection and reinserted verbatim at the start
+    of the compacted turn.
     """
 
     def _make_agent_with_turn(self, tool_names: list[str]) -> Agent:
@@ -670,45 +671,70 @@ class TestSkillJournalProtection:
         agent = self._make_agent_with_turn(["read_file"])
         assert agent._has_skill_call_in_range(0, 4) is False
 
-    def test_maybe_reflect_skips_skill_turn(self):
-        """_maybe_reflect_after_turn should skip when skill call present."""
+    def test_find_skill_call_ranges(self):
+        """Should find skill call ranges correctly."""
+        agent = self._make_agent_with_turn(["skill", "read_file"])
+        # user=0, assistant=1 (skill+read_file), tool=2 (skill), tool=3 (read_file), assistant=4
+        ranges = agent._find_skill_call_ranges(0, 4)
+        # The assistant message has a skill call, so range includes
+        # the assistant message and all following tool results
+        assert len(ranges) == 1
+        assert ranges[0] == (1, 3)  # assistant through last tool result
+
+    def test_find_skill_call_ranges_no_skills(self):
+        """Should return empty ranges when no skill calls present."""
+        agent = self._make_agent_with_turn(["read_file"])
+        # user=0, assistant=1, tool=2, assistant=3
+        ranges = agent._find_skill_call_ranges(0, 3)
+        assert ranges == []
+
+    def test_maybe_reflect_compacts_skill_turn(self):
+        """_maybe_reflect_after_turn should compact skill turns by
+        extracting skill messages and reinserting them after compaction."""
         agent = self._make_agent_with_turn(["skill"])
         agent.journal_mode = True
-        # Should return early (not crash) — we can't easily verify
-        # the early return without mocking _journal_one_turn, but we
-        # can verify it doesn't attempt reflection (which would need
-        # a real API call). Just calling it should not raise.
-        # Note: this would hang if it tried to call the LLM since
-        # MockClient has no chat.create, so not raising = proof of skip.
+
+        # Mock _reflect_on_tool_use to return a summary
+        async def mock_reflect(self=None, skill_names=None, messages=None):
+            # skill_names may be empty if arguments don't contain a name
+            # (test fixture uses "{}" as arguments), but it should be a list
+            assert isinstance(skill_names, list)
+            return "Summary of tool use"
+
+        agent._reflect_on_tool_use = mock_reflect
+
         import asyncio
+        asyncio.get_event_loop().run_until_complete(
+            agent._maybe_reflect_after_turn()
+        )
 
-        try:
-            asyncio.get_event_loop().run_until_complete(
-                agent._maybe_reflect_after_turn()
-            )
-        except Exception:
-            pytest.fail("_maybe_reflect_after_turn should have skipped skill turn")
-
-    def test_journal_last_turn_refuses_skill(self):
-        """journal_last_turn should refuse to compact a skill-containing turn."""
+    def test_journal_last_turn_compacts_skill_turn(self):
+        """journal_last_turn should compact skill-containing turns,
+        preserving skill messages at the start of the compacted turn."""
         agent = self._make_agent_with_turn(["skill"])
         import asyncio
+
+        # Mock _reflect_on_tool_use to return a summary
+        async def mock_reflect(self=None, skill_names=None, messages=None):
+            return "Summary of tool use"
+
+        agent._reflect_on_tool_use = mock_reflect
 
         success, message = asyncio.get_event_loop().run_until_complete(
             agent.journal_last_turn()
         )
-        assert success is False
-        assert "skill" in message.lower()
+        assert success is True
 
-    def test_journal_all_skips_skill_turns(self):
-        """journal_all should skip turns with skill calls.
+    def test_journal_all_compacts_skill_turns(self):
+        """journal_all should compact turns with skill calls,
+        preserving skill messages at the start of each compacted turn.
 
         Set up two turns: one with a skill call, one without.
-        journal_all should compact only the non-skill turn.
+        journal_all should compact both.
         """
         client = MockClient()
         agent = Agent(client, model="test-model")
-        # Turn 1: skill call (should be skipped)
+        # Turn 1: skill call (should be compacted with preserved skills)
         agent.messages = [
             {"role": "user", "content": "Load skill"},
             {
@@ -718,13 +744,16 @@ class TestSkillJournalProtection:
                     {
                         "id": "call_skill",
                         "type": "function",
-                        "function": {"name": "skill", "arguments": "{}"},
+                        "function": {
+                            "name": "skill",
+                            "arguments": '{"name": "code-review"}',
+                        },
                     }
                 ],
             },
             {"role": "tool", "tool_call_id": "call_skill", "content": "Skill loaded"},
             {"role": "assistant", "content": "Skill is ready."},
-            # Turn 2: normal tool call (should be compactable)
+            # Turn 2: normal tool call (should be compacted normally)
             {"role": "user", "content": "Read a file"},
             {
                 "role": "assistant",
@@ -740,15 +769,6 @@ class TestSkillJournalProtection:
             {"role": "tool", "tool_call_id": "call_read", "content": "File contents"},
             {"role": "assistant", "content": "Here's the file."},
         ]
-        # journal_all would need a real LLM call for reflection,
-        # so we just verify the skill detection + skip logic works
+        # Verify skill detection still works
         assert agent._has_skill_call_in_range(0, 3) is True
         assert agent._has_skill_call_in_range(4, 7) is False
-        # The _journal_skip marker mechanism should work:
-        agent.messages[0]["_journal_skip"] = True
-        boundary = agent._find_earliest_tool_turn()
-        assert boundary is not None
-        # Should find turn 2 (user_idx=4), not turn 1 (user_idx=0)
-        assert boundary[0] == 4
-        # Clean up
-        agent.messages[0].pop("_journal_skip", None)

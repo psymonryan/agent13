@@ -74,6 +74,7 @@ async def run_batch_with_display(
     send_reasoning: bool = False,
     remove_reasoning: bool = False,
     devel_mode: bool = False,
+    skills_mode: bool = False,
 ):
     """Run batch mode with Rich display."""
     # Initialize prompt manager
@@ -98,6 +99,7 @@ async def run_batch_with_display(
         system_prompt=system_prompt,
         tools=get_filtered_tools(
             devel=devel_mode,
+            skills=skills_mode,
             enabled_tools=_config.enabled_tools or None,
             disabled_tools=_config.disabled_tools or None,
         ),
@@ -106,6 +108,7 @@ async def run_batch_with_display(
         send_reasoning=send_reasoning,
         remove_reasoning=remove_reasoning,
         devel_mode=devel_mode,
+        skills_mode=skills_mode,
     )
 
     # Use RichDisplay for pretty mode, simple print for non-pretty
@@ -310,6 +313,10 @@ Provider names are read from ~/.agent13/config.toml
     # Ensure default skills are available for new users
     ensure_default_skills()
 
+    # Ensure default prompts are available for new users
+    from agent13.prompts import ensure_default_prompts
+    ensure_default_prompts()
+
     # Handle --upgrade flag (check + apply, then exit)
     if args.upgrade:
         from agent13.updater import perform_update
@@ -476,6 +483,7 @@ Provider names are read from ~/.agent13/config.toml
             send_reasoning=args.send_reasoning,
             remove_reasoning=args.remove_reasoning,
             devel_mode=args.devel,
+            skills_mode=include_skills and bool(skill_manager.skills),
         )
         log_session_end()
         sys.exit(0)

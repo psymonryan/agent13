@@ -503,18 +503,21 @@ def name_matches(name: str, patterns: list[str]) -> bool:
 
 def get_filtered_tools(
     devel: bool = False,
+    skills: bool = False,
     enabled_tools: list[str] | None = None,
     disabled_tools: list[str] | None = None,
 ) -> list[dict]:
-    """Get tool schemas filtered by devel mode and config-level allow/deny lists.
+    """Get tool schemas filtered by devel/skills mode and config-level allow/deny lists.
 
     Filtering is applied in order:
     1. Group filter: tools in the "devel" group are hidden unless devel=True
-    2. Config filter: if enabled_tools is non-empty, only matching tools pass
+    2. Group filter: tools in the "skills" group are hidden unless skills=True
+    3. Config filter: if enabled_tools is non-empty, only matching tools pass
        (whitelist); otherwise disabled_tools acts as a blacklist.
 
     Args:
         devel: If True, include tools in the "devel" group (default: False)
+        skills: If True, include tools in the "skills" group (default: False)
         enabled_tools: Whitelist patterns (empty/None = all pass)
         disabled_tools: Blacklist patterns (applied only if enabled_tools empty)
 
@@ -533,7 +536,11 @@ def get_filtered_tools(
         if not devel and "devel" in tool_groups:
             continue
 
-        # 2. Config-level enabled/disabled filter
+        # 2. Group filter: hide "skills" group unless in skills mode
+        if not skills and "skills" in tool_groups:
+            continue
+
+        # 3. Config-level enabled/disabled filter
         if enabled_tools:
             # Whitelist mode: only tools matching enabled_tools pass
             if not name_matches(tool_name, enabled_tools):

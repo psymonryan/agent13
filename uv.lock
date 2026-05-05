@@ -4,7 +4,7 @@ requires-python = ">=3.10"
 
 [[package]]
 name = "agent13"
-version = "0.1.10"
+version = "0.1.11"
 source = { editable = "." }
 dependencies = [
     { name = "mcp" },

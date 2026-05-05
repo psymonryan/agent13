@@ -4,7 +4,7 @@ from tools import tool
 from agent13.context import skill_manager_ctx
 
 
-@tool(is_async=True)
+@tool(is_async=True, groups=["skills"])
 async def skill(name: str) -> str:
     """Load a specialized skill by name. Returns instructions and bundled resources.
 
@@ -15,7 +15,4 @@ async def skill(name: str) -> str:
     if sm is None:
         return "Skills system not available."
 
-    result = sm.format_skill_content(name)
-    if result is None:
-        return f"Skill '{name}' not found."
-    return result
+    return sm.format_skill_content(name)

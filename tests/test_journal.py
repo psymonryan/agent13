@@ -222,7 +222,7 @@ class TestJournalModeIntegration:
         # Track if _reflect_on_tool_use was called
         reflect_called = False
 
-        async def track_reflect():
+        async def track_reflect(self=None, skill_names=None, messages=None):
             nonlocal reflect_called
             reflect_called = True
             return None
@@ -262,7 +262,7 @@ class TestJournalModeIntegration:
         # Track if _reflect_on_tool_use was called
         reflect_called = False
 
-        async def track_reflect():
+        async def track_reflect(self=None, skill_names=None, messages=None):
             nonlocal reflect_called
             reflect_called = True
             return None
@@ -303,7 +303,7 @@ class TestJournalModeIntegration:
         # Track if _reflect_on_tool_use was called
         reflect_called = False
 
-        async def track_reflect():
+        async def track_reflect(self=None, skill_names=None, messages=None):
             nonlocal reflect_called
             reflect_called = True
             return None
@@ -343,7 +343,7 @@ class TestJournalModeIntegration:
         agent.messages = original_messages.copy()
 
         # Mock reflection to fail
-        async def failing_reflect():
+        async def failing_reflect(self=None, skill_names=None, messages=None):
             return None  # Simulates failure
 
         agent._reflect_on_tool_use = failing_reflect
@@ -382,7 +382,7 @@ class TestJournalModeIntegration:
         ]
 
         # Mock _reflect_on_tool_use to return a summary
-        async def mock_reflect():
+        async def mock_reflect(self=None, skill_names=None, messages=None):
             return "Summary of tool use"
 
         agent._reflect_on_tool_use = mock_reflect
@@ -435,7 +435,7 @@ class TestJournalModeIntegration:
         ]
 
         # Mock _reflect_on_tool_use to return a brief summary
-        async def mock_reflect():
+        async def mock_reflect(self=None, skill_names=None, messages=None):
             return "Brief summary"
 
         agent._reflect_on_tool_use = mock_reflect
@@ -558,7 +558,7 @@ class TestImmediateCompaction:
         ]
 
         # Mock _reflect_on_tool_use to return a summary
-        async def mock_reflect():
+        async def mock_reflect(self=None, skill_names=None, messages=None):
             return "Reflected summary"
 
         agent._reflect_on_tool_use = mock_reflect
@@ -597,7 +597,7 @@ class TestImmediateCompaction:
         ]
 
         # Mock _reflect_on_tool_use to return None (failure)
-        async def mock_reflect():
+        async def mock_reflect(self=None, skill_names=None, messages=None):
             return None
 
         agent._reflect_on_tool_use = mock_reflect
@@ -626,7 +626,7 @@ class TestImmediateCompaction:
         ]
 
         # Mock _reflect_on_tool_use
-        async def mock_reflect():
+        async def mock_reflect(self=None, skill_names=None, messages=None):
             return "Summary of tools"
 
         agent._reflect_on_tool_use = mock_reflect
@@ -1023,7 +1023,7 @@ class TestJournalAll:
             {"role": "assistant", "content": "Here is the file"},
         ]
 
-        async def mock_reflect():
+        async def mock_reflect(self=None, skill_names=None, messages=None):
             return "Used read_file to read the file"
 
         agent._reflect_on_tool_use = mock_reflect
@@ -1065,7 +1065,7 @@ class TestJournalAll:
 
         reflect_count = 0
 
-        async def mock_reflect():
+        async def mock_reflect(self=None, skill_names=None, messages=None):
             nonlocal reflect_count
             reflect_count += 1
             return f"Summary of tool use round {reflect_count}"
@@ -1098,7 +1098,7 @@ class TestJournalAll:
             {"role": "assistant", "content": "Here is the file"},
         ]
 
-        async def mock_reflect():
+        async def mock_reflect(self=None, skill_names=None, messages=None):
             return "Used read_file"
 
         agent._reflect_on_tool_use = mock_reflect
@@ -1139,7 +1139,7 @@ class TestJournalAll:
 
         reflect_count = 0
 
-        async def mock_reflect():
+        async def mock_reflect(self=None, skill_names=None, messages=None):
             nonlocal reflect_count
             reflect_count += 1
             if reflect_count == 1:
@@ -1170,7 +1170,7 @@ class TestJournalAll:
             {"role": "assistant", "content": "Here is the file"},
         ]
 
-        async def mock_reflect():
+        async def mock_reflect(self=None, skill_names=None, messages=None):
             return None
 
         agent._reflect_on_tool_use = mock_reflect
@@ -1195,7 +1195,7 @@ class TestJournalAll:
             {"role": "assistant", "content": "Here is the file"},
         ]
 
-        async def mock_reflect():
+        async def mock_reflect(self=None, skill_names=None, messages=None):
             return "Used read_file"
 
         agent._reflect_on_tool_use = mock_reflect
@@ -1232,7 +1232,7 @@ class TestJournalAll:
             {"role": "assistant", "content": "You're welcome"},
         ]
 
-        async def mock_reflect():
+        async def mock_reflect(self=None, skill_names=None, messages=None):
             return "Used read_file"
 
         agent._reflect_on_tool_use = mock_reflect
@@ -1283,7 +1283,7 @@ class TestJournalingViaQueue:
 
         reflected = False
 
-        async def mock_reflect():
+        async def mock_reflect(self=None, skill_names=None, messages=None):
             nonlocal reflected
             reflected = True
             return "Used read_file"
@@ -1335,7 +1335,7 @@ class TestJournalingViaQueue:
             {"role": "assistant", "content": "Here is the file"},
         ]
 
-        async def mock_reflect():
+        async def mock_reflect(self=None, skill_names=None, messages=None):
             return None  # Simulate failure
 
         agent._reflect_on_tool_use = mock_reflect
@@ -1360,7 +1360,7 @@ class TestJournalingViaQueue:
             {"role": "assistant", "content": "Here is the file"},
         ]
 
-        async def mock_reflect():
+        async def mock_reflect(self=None, skill_names=None, messages=None):
             raise RuntimeError("API error")
 
         agent._reflect_on_tool_use = mock_reflect
@@ -1399,7 +1399,7 @@ class TestJournalAllIterative:
         call_count = 0
         snapshots = []
 
-        async def mock_reflect():
+        async def mock_reflect(self=None, skill_names=None, messages=None):
             nonlocal call_count
             call_count += 1
             # Snapshot the message state at each reflection call
@@ -1477,7 +1477,7 @@ class TestJournalAllIterative:
 
         reflect_count = 0
 
-        async def mock_reflect():
+        async def mock_reflect(self=None, skill_names=None, messages=None):
             nonlocal reflect_count
             reflect_count += 1
             return f"Round {reflect_count} summary"
@@ -1524,7 +1524,7 @@ class TestJournalAllIterative:
 
         reflect_count = 0
 
-        async def mock_reflect():
+        async def mock_reflect(self=None, skill_names=None, messages=None):
             nonlocal reflect_count
             reflect_count += 1
             return f"Round {reflect_count} summary"

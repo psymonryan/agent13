@@ -486,14 +486,19 @@ class AgentTUI(App):
         Binding("ctrl+d", "force_quit", "Quit", show=False, priority=True),
         Binding("ctrl+q", "force_quit", "Quit", show=False, priority=True),
         Binding("escape", "interrupt", "Interrupt", show=False, priority=True),
-        Binding("shift+up", "scroll_chat_up", "Scroll Up", show=False),
-        Binding("shift+down", "scroll_chat_down", "Scroll Down", show=False),
+        # NOTE: Shift+key combos removed — they don't survive
+        # terminal → ssh → tmux → Textual chain.
+        # Use mouse scroll instead of shift+up/down.
+        # Use Ctrl+Y instead of ctrl+shift+c.
+        # Binding("shift+up", "scroll_chat_up", "Scroll Up", show=False),
+        # Binding("shift+down", "scroll_chat_down", "Scroll Down", show=False),
         # Ctrl+Y: Copy full markdown of message containing selection
         Binding(
             "ctrl+y", "copy_as_markdown", "Copy markdown", show=False, priority=True
         ),
-        # Ctrl+Shift+C: Manual copy of rendered selection
-        Binding("ctrl+shift+c", "copy_selection", "Copy selection", show=False),
+        # Ctrl+Shift+C removed — doesn't survive terminal chain.
+        # Use Ctrl+Y (copy_as_markdown) instead.
+        # Binding("ctrl+shift+c", "copy_selection", "Copy selection", show=False),
         # Ctrl+O: Toggle collapse of most recent reasoning widget
         Binding("ctrl+o", "toggle_collapsed", "Toggle Reasoning", show=False),
     ]
@@ -3097,8 +3102,8 @@ class AgentTUI(App):
             "  [yellow]Up/Down[/] - Navigate input history\n"
             "  [yellow]Shift+Up/Down[/] - Scroll chat\n"
             "\n[bold]Tips:[/]\n"
-            "  Start message with [yellow]![/] to add to front of queue (processed next)\n"
-            "  Start message with [yellow]!![/] to interrupt and process immediately\n"
+            "  [yellow]![/]message — Priority: queued ahead of normal items (after any interrupts)\n"
+            "  [yellow]!![/]message — Inject: add context into the agent's current turn without cancelling\n"
             "\n[bold]Current settings:[/]\n"
             f"  model: {escape_markup(self.model)}\n"
             f"  tool-response: {escape_markup(self.tool_response_format)}\n"
@@ -4008,7 +4013,8 @@ class AgentTUI(App):
             success, message = perform_update()
             if success:
                 self._update_info_content(
-                    f"[green]✓ {message}[/]"
+                    f"[green]✓ {message}[/]\n"
+                    f"[dim]Please restart agent13 to use the new version.[/]"
                 )
             else:
                 parts = [f"[red]✗ {message}[/]"]
@@ -4697,23 +4703,20 @@ class AgentTUI(App):
             input_field.move_cursor((new_cursor_row, new_cursor_col))
             if update_state:
                 self._completion_end = (new_cursor_row, new_cursor_col)
-        else:
-            input_field.move_cursor((start_loc[0], new_cursor_col))
-            if update_state:
-                self._completion_end = (start_loc[0], new_cursor_col)
-
-    def action_scroll_chat_up(self) -> None:
-        """Scroll up and disable auto-scroll."""
-        self._chat.scroll_relative(y=-5, animate=False)
-        self._chat.anchor(False)  # Explicitly clear anchor
-        self.notify("Auto-scroll disabled")
-
-    def action_scroll_chat_down(self) -> None:
-        """Scroll down and re-enable auto-scroll if at bottom."""
-        self._chat.scroll_relative(y=5, animate=False)
-        if self._is_at_bottom():
-            self._chat.anchor()
-            self.notify("Auto-scroll enabled")
+        # NOTE: action_scroll_chat_up/down removed — shift+up/down doesn't
+        # survive terminal → ssh → tmux → Textual chain. Use mouse scroll.
+        # def action_scroll_chat_up(self) -> None:
+        #     """Scroll up and disable auto-scroll."""
+        #     self._chat.scroll_relative(y=-5, animate=False)
+        #     self._chat.anchor(False)  # Explicitly clear anchor
+        #     self.notify("Auto-scroll disabled")
+        #
+        # def action_scroll_chat_down(self) -> None:
+        #     """Scroll down and re-enable auto-scroll if at bottom."""
+        #     self._chat.scroll_relative(y=5, animate=False)
+        #     if self._is_at_bottom():
+        #         self._chat.anchor()
+        #         self.notify("Auto-scroll enabled")
 
     def action_toggle_collapsed(self) -> None:
         """Toggle collapse state of most recent reasoning widget (Ctrl+O)."""
@@ -4760,26 +4763,28 @@ class AgentTUI(App):
             # OSC 52 — delegate to Textual's built-in
             _copy(text, method="osc52", osc52_handler=super().copy_to_clipboard)
 
-    def action_copy_selection(self) -> None:
-        """Copy rendered selection to clipboard (Ctrl+Shift+C).
-
-        Copies the selected rendered text and keeps the selection visible.
-        """
-        # Check chat area selection
-        text = self.screen.get_selected_text()
-        if text:
-            self.copy_to_clipboard(text)
-            self.notify(f"Copied {len(text)} chars", title="Copied")
-            # Keep selection visible
-            return
-
-        # Check input field selection
-        input_field = self.query_one("#input-field", ChatTextArea)
-        if input_field.selected_text:
-            self.copy_to_clipboard(input_field.selected_text)
-            self.notify(
-                f"Copied {len(input_field.selected_text)} chars", title="Copied"
-            )
+    # NOTE: action_copy_selection removed — ctrl+shift+c doesn't survive
+        # terminal → ssh → tmux → Textual chain. Use Ctrl+Y instead.
+        # def action_copy_selection(self) -> None:
+        #     """Copy rendered selection to clipboard (Ctrl+Shift+C).
+        #
+        #     Copies the selected rendered text and keeps the selection visible.
+        #     """
+        #     # Check chat area selection
+        #     text = self.screen.get_selected_text()
+        #     if text:
+        #         self.copy_to_clipboard(text)
+        #         self.notify(f"Copied {len(text)} chars", title="Copied")
+        #         # Keep selection visible
+        #         return
+        #
+        #     # Check input field selection
+        #     input_field = self.query_one("#input-field", ChatTextArea)
+        #     if input_field.selected_text:
+        #         self.copy_to_clipboard(input_field.selected_text)
+        #         self.notify(
+        #             f"Copied {len(input_field.selected_text)} chars", title="Copied"
+        #         )
 
     def action_copy_as_markdown(self) -> None:
         """Copy full markdown of message containing selection (Ctrl+Y).
@@ -4903,12 +4908,7 @@ class AgentTUI(App):
             )
 
     def action_clear_quit(self) -> None:
-        """Handle Ctrl+C: copy selection, clear input, interrupt agent, or quit."""
-        # If there's a selection in the chat area, copy it
-        if self.screen.get_selected_text():
-            self.action_copy_selection()
-            return
-
+        """Handle Ctrl+C: clear input, interrupt agent, or quit."""
         input_field = self.query_one("#input-field", ChatTextArea)
 
         # If text is selected in input, let TextArea handle copy (don't clear)

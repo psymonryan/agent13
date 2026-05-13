@@ -16,7 +16,7 @@ This reference guide provides detailed technical information about creating and 
 
 ### Core Requirements
 
-1. **Skill Directory**: Each skill must be in its own directory under `.vibe/skills/`
+1. **Skill Directory**: Each skill must be in its own directory under `.agent13/skills/`
 2. **Skill Name**: Must match the directory name exactly
 3. **Required Files**: `SKILL.md` (main documentation)
 4. **Optional Files**: `README.md`, any additional documentation
@@ -79,7 +79,7 @@ contributors: ["name1", "name2"]  # Array of strings
 ### Standard Structure
 
 ```
-.vibe/skills/skill-name/
+.agent13/skills/skill-name/
 ├── SKILL.md          # Required: Main skill documentation
 ├── README.md         # Optional: Quick reference/usage guide
 ├── assets/           # Optional: Skill assets
@@ -540,7 +540,7 @@ except yaml.YAMLError as e:
 "
 }
 
-# Usage: validate_skill ".vibe/skills/my-skill"
+# Usage: validate_skill ".agent13/skills/my-skill"
 ```
 
 ### Skill Generator
@@ -556,7 +556,7 @@ def generate_skill(skill_name, author, description, license_type="MIT"):
     """Generate a new skill directory structure"""
     
     # Create directory
-    skill_dir = f".vibe/skills/{skill_name}"
+    skill_dir = f".agent13/skills/{skill_name}"
     os.makedirs(skill_dir, exist_ok=True)
     
     # Create SKILL.md

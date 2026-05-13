@@ -70,6 +70,8 @@ def self_update(action: str = "check") -> str:
 
     if action == "apply":
         success, message = perform_update()
+        if success:
+            message += " Please restart agent13 to use the new version."
         if not success and manual_cmd:
             message += f" Manual command: {manual_cmd}"
         return message

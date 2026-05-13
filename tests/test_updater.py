@@ -12,6 +12,10 @@ from agent13.updater import (
     _write_last_check,
     _find_wheel_asset,
     _build_manual_command,
+    _find_scripts_dir,
+    _rename_locked_scripts_dir,
+    _restore_renamed_scripts_dir,
+    cleanup_old_scripts_dir,
     check_for_update,
     perform_update,
 )
@@ -233,7 +237,7 @@ class TestPerformUpdate:
             success, msg = perform_update()
         assert success is True
         assert "0.1.9" in msg
-        assert "restart" in msg.lower()
+        assert "successfully" in msg.lower()
         # Verify it used uv tool install --force <wheel_path>
         args = mock_run.call_args[0][0]
         assert args[0] == "uv"
@@ -336,3 +340,234 @@ class TestCopyToClipboard:
             )
             result = copy_via_system("test text")
         assert result is False
+
+
+class TestFindScriptsDir:
+    """Tests for _find_scripts_dir helper."""
+
+    def test_returns_dir_of_sys_executable(self):
+        """Should return the directory containing sys.executable."""
+        with (
+            patch("agent13.updater.sys.executable", "/opt/uv/tools/agent13/Scripts/python"),
+            patch("agent13.updater.os.path.isdir", return_value=True),
+        ):
+            result = _find_scripts_dir()
+            assert result == "/opt/uv/tools/agent13/Scripts"
+
+    def test_returns_none_when_not_a_dir(self):
+        """Should return None when the directory doesn't exist."""
+        with (
+            patch("agent13.updater.sys.executable", "/nonexistent/python"),
+            patch("agent13.updater.os.path.isdir", return_value=False),
+        ):
+            assert _find_scripts_dir() is None
+
+
+class TestRenameLockedScriptsDir:
+    """Tests for _rename_locked_scripts_dir Windows helper."""
+
+    def test_returns_none_on_posix(self):
+        """Should return None on non-Windows (no rename needed)."""
+        with patch("agent13.updater.os.name", "posix"):
+            assert _rename_locked_scripts_dir() is None
+
+    def test_renames_dir_to_temp_on_windows(self):
+        """Should rename Scripts dir to temp location on Windows."""
+        with (
+            patch("agent13.updater.os.name", "nt"),
+            patch("agent13.updater._find_scripts_dir", return_value=r"C:\Scripts"),
+            patch("agent13.updater.os.path.exists", return_value=False),
+            patch("agent13.updater.os.rename") as mock_rename,
+        ):
+            result = _rename_locked_scripts_dir()
+        # Result should be in temp dir with agent13-scripts- prefix
+        assert result is not None
+        assert "agent13-scripts-" in result
+        assert result.endswith(".old")
+        mock_rename.assert_called_once()
+
+    def test_returns_none_on_rename_failure(self):
+        """Should return None if os.rename fails."""
+        with (
+            patch("agent13.updater.os.name", "nt"),
+            patch("agent13.updater._find_scripts_dir", return_value=r"C:\Scripts"),
+            patch("agent13.updater.os.path.exists", return_value=False),
+            patch("agent13.updater.os.rename", side_effect=OSError("denied")),
+        ):
+            result = _rename_locked_scripts_dir()
+        assert result is None
+
+    def test_returns_none_when_dir_not_found(self):
+        """Should return None if _find_scripts_dir returns None."""
+        with (
+            patch("agent13.updater.os.name", "nt"),
+            patch("agent13.updater._find_scripts_dir", return_value=None),
+        ):
+            result = _rename_locked_scripts_dir()
+        assert result is None
+
+
+class TestRestoreRenamedScriptsDir:
+    """Tests for _restore_renamed_scripts_dir rollback helper."""
+
+    def test_restores_dir_from_temp(self):
+        """Should rename temp dir back to Scripts path."""
+        with (
+            patch("agent13.updater.os.path.exists", return_value=False),
+            patch("agent13.updater.os.rename") as mock_rename,
+        ):
+            _restore_renamed_scripts_dir("/tmp/agent13-scripts-123.old", r"C:\Scripts")
+        mock_rename.assert_called_once_with(
+            "/tmp/agent13-scripts-123.old",
+            r"C:\Scripts",
+        )
+
+    def test_removes_new_dir_before_restore(self):
+        """Should remove new Scripts dir before restoring from temp."""
+        with (
+            patch("agent13.updater.os.path.exists", return_value=True),
+            patch("agent13.updater.shutil.rmtree") as mock_rmtree,
+            patch("agent13.updater.os.rename") as mock_rename,
+        ):
+            _restore_renamed_scripts_dir("/tmp/agent13-scripts-123.old", r"C:\Scripts")
+        mock_rmtree.assert_called_once_with(r"C:\Scripts")
+        mock_rename.assert_called_once()
+
+
+class TestCleanupOldScriptsDir:
+    """Tests for cleanup_old_scripts_dir startup helper."""
+
+    def test_noop_on_posix(self):
+        """Should do nothing on non-Windows."""
+        with patch("agent13.updater.os.name", "posix"):
+            cleanup_old_scripts_dir()  # Should not raise
+
+    def test_removes_stale_temp_dirs_on_windows(self):
+        """Should remove agent13-scripts-*.old dirs in temp on Windows."""
+        with (
+            patch("agent13.updater.os.name", "nt"),
+            patch("agent13.updater.os.listdir", return_value=[
+                "agent13-scripts-999.old",
+                "other-file.txt",
+            ]),
+            patch("agent13.updater.os.path.exists", return_value=True),
+            patch("agent13.updater.shutil.rmtree") as mock_rmtree,
+        ):
+            cleanup_old_scripts_dir()
+        assert mock_rmtree.call_count == 1
+
+    def test_noop_when_no_stale_dirs(self):
+        """Should do nothing when no stale dirs exist."""
+        with (
+            patch("agent13.updater.os.name", "nt"),
+            patch("agent13.updater.os.listdir", return_value=["other-file.txt"]),
+        ):
+            cleanup_old_scripts_dir()  # Should not raise
+
+
+class TestPerformUpdateWindowsDirRename:
+    """Tests for perform_update using the Windows Scripts dir rename."""
+
+    def test_rename_called_on_windows(self):
+        """Should rename Scripts dir before install on Windows."""
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.content = b"fake-wheel-bytes"
+
+        with (
+            patch("agent13.updater.fetch_latest_release") as mock_fetch,
+            patch("agent13.updater.__version__", "0.1.8"),
+            patch("agent13.updater.httpx.get", return_value=mock_response),
+            patch("agent13.updater.subprocess.run") as mock_run,
+            patch("agent13.updater._rename_locked_scripts_dir", return_value="/tmp/agent13-scripts-123.old"),
+            patch("agent13.updater._find_scripts_dir", return_value=r"C:\Scripts"),
+            patch("agent13.updater.os.path.exists", return_value=False),
+        ):
+            mock_fetch.return_value = {
+                "tag_name": "0.1.9", "html_url": "",
+                "wheel_url": "https://example.com/agent13-0.1.9-py3-none-any.whl",
+            }
+            mock_run.return_value = MagicMock(returncode=0)
+            success, msg = perform_update()
+        assert success is True
+        assert "0.1.9" in msg
+
+    def test_rollback_on_install_failure_windows(self):
+        """Should restore from temp dir when install fails on Windows."""
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.content = b"fake-wheel-bytes"
+
+        with (
+            patch("agent13.updater.fetch_latest_release") as mock_fetch,
+            patch("agent13.updater.__version__", "0.1.8"),
+            patch("agent13.updater.httpx.get", return_value=mock_response),
+            patch("agent13.updater.subprocess.run") as mock_run,
+            patch("agent13.updater._rename_locked_scripts_dir", return_value="/tmp/agent13-scripts-123.old"),
+            patch("agent13.updater._find_scripts_dir", return_value=r"C:\Scripts"),
+            patch("agent13.updater._restore_renamed_scripts_dir") as mock_restore,
+        ):
+            mock_fetch.return_value = {
+                "tag_name": "0.1.9", "html_url": "",
+                "wheel_url": "https://example.com/agent13-0.1.9-py3-none-any.whl",
+            }
+            mock_run.return_value = MagicMock(
+                returncode=1, stderr="Access is denied"
+            )
+            success, msg = perform_update()
+        assert success is False
+        mock_restore.assert_called_once_with(
+            "/tmp/agent13-scripts-123.old", r"C:\Scripts"
+        )
+
+    def test_no_rename_on_posix(self):
+        """Should not try to rename Scripts dir on POSIX."""
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.content = b"fake-wheel-bytes"
+
+        with (
+            patch("agent13.updater.fetch_latest_release") as mock_fetch,
+            patch("agent13.updater.__version__", "0.1.8"),
+            patch("agent13.updater.httpx.get", return_value=mock_response),
+            patch("agent13.updater.subprocess.run") as mock_run,
+            patch("agent13.updater._rename_locked_scripts_dir", return_value=None) as mock_rename,
+        ):
+            mock_fetch.return_value = {
+                "tag_name": "0.1.9", "html_url": "",
+                "wheel_url": "https://example.com/agent13-0.1.9-py3-none-any.whl",
+            }
+            mock_run.return_value = MagicMock(returncode=0)
+            success, msg = perform_update()
+        assert success is True
+        mock_rename.assert_called_once()
+
+    def test_entrypoint_copy_failure_treated_as_success(self):
+        """Should treat entrypoint copy failure as success on Windows."""
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.content = b"fake-wheel-bytes"
+
+        with (
+            patch("agent13.updater.fetch_latest_release") as mock_fetch,
+            patch("agent13.updater.__version__", "0.1.8"),
+            patch("agent13.updater.httpx.get", return_value=mock_response),
+            patch("agent13.updater.subprocess.run") as mock_run,
+            patch("agent13.updater._rename_locked_scripts_dir", return_value="/tmp/agent13-scripts-123.old"),
+            patch("agent13.updater._find_scripts_dir", return_value=r"C:\Scripts"),
+            patch("agent13.updater.os.path.exists", return_value=False),
+            patch("agent13.updater.os.name", "nt"),
+        ):
+            mock_fetch.return_value = {
+                "tag_name": "0.1.9", "html_url": "",
+                "wheel_url": "https://example.com/agent13-0.1.9-py3-none-any.whl",
+            }
+            mock_run.return_value = MagicMock(
+                returncode=1,
+                stderr="error: Failed to install entrypoint\n"
+                "  Caused by: failed to copy file: os error 32",
+            )
+            success, msg = perform_update()
+        assert success is True
+        assert "0.1.9" in msg
+        assert "successfully" in msg

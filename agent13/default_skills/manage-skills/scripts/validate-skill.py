@@ -237,7 +237,7 @@ def main():
 
     if len(sys.argv) != 2:
         print("Usage: python validate-skill.py <skill-directory>")
-        print("Example: python validate-skill.py .vibe/skills/swarm")
+        print("Example: python validate-skill.py .agent13/skills/swarm")
         sys.exit(1)
 
     skill_dir = sys.argv[1]

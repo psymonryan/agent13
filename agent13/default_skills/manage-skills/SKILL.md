@@ -184,8 +184,8 @@ Organize your `SKILL.md` with these sections:
 ### Step 2: Create the Directory
 
 ```bash
-mkdir -p .vibe/skills/my-new-skill
-cd .vibe/skills/my-new-skill
+mkdir -p .agent13/skills/my-new-skill
+cd .agent13/skills/my-new-skill
 ```
 
 ### Step 3: Create SKILL.md
@@ -217,7 +217,7 @@ Fill in the sections with:
 Run the validation script:
 
 ```bash
-cd .vibe/skills/skills
+cd .agent13/skills/skills
 python3 scripts/validate-skill.py ../my-new-skill
 ```
 
@@ -348,7 +348,7 @@ scripts/
 Run the validation script first:
 
 ```bash
-cd .vibe/skills/skills
+cd .agent13/skills/skills
 python3 scripts/validate-skill.py ../your-skill-name
 ```
 
@@ -417,7 +417,7 @@ python3 scripts/validate-skill.py ../your-skill-name
 Run the validation script:
 
 ```bash
-cd .vibe/skills/skills
+cd .agent13/skills/skills
 python3 scripts/validate-skill.py ../your-skill-name
 ```
 
@@ -547,6 +547,6 @@ Clearly state any prerequisites or requirements in the `compatibility` field.
 ### Skill Not Found
 
 **Cause**: Skill not in expected location
-**Solution**: Place skills in `.vibe/skills/` directory
+**Solution**: Place skills in `.agent13/skills/` directory
 
 For more information, see the [Agent Skills Specification](https://agentskills.io/specification).

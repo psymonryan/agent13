@@ -12,7 +12,7 @@ Complete reference for using Agent13 - configuration, tools, skills, TUI command
   - [Library Mode](#library-mode)
 - [Command-Line Options](#command-line-options)
 - [TUI Reference](#tui-reference)
-  - [Keybindings](#keybindings)
+  - [Key bindings](#key-bindings)
   - [Slash Commands](#slash-commands)
   - [Input Features](#input-features)
 - [Configuration](#configuration)
@@ -27,7 +27,7 @@ Complete reference for using Agent13 - configuration, tools, skills, TUI command
   - [Adding Custom Tools](#adding-custom-tools)
 - [Skills](#skills)
   - [Skill Format](#skill-format)
-  - [Default Skills](#default-skkills)
+  - [Default Skills](#default-skills)
   - [Creating Skills](#creating-skills)
   - [Managing Skills](#managing-skills)
 - [Queue and Priority](#queue-and-priority)
@@ -37,7 +37,10 @@ Complete reference for using Agent13 - configuration, tools, skills, TUI command
 - [MCP Integration](#mcp-integration)
 - [Troubleshooting](#troubleshooting)
 - [Updates](#updates)
-- [Clipboard Configuration](#clipboard-configuration)
+- [Snippets](#snippets)
+- [Reasoning Token Control](#reasoning-token-control)
+- [Prompt Management](#prompt-management)
+- [History Management](#history-management)
 
 ## Quick Start
 
@@ -52,7 +55,7 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 Install package directly from github:
 
 ```
-uv tool install https://github.com/psymonryan/agent13/releases/download/v0.1.11/agent13-0.1.11-py3-none-any.whl
+uv tool install https://github.com/psymonryan/agent13/releases/download/v0.1.12/agent13-0.1.12-py3-none-any.whl
 ```
 
 Or install from source (for hacking on the agent itself):
@@ -219,32 +222,32 @@ The `Agent` constructor accepts:
 
 ## Command-Line Options
 
-| Option                      | Description                                                 |
-| --------------------------- | ----------------------------------------------------------- |
-| `provider`                  | Provider name from config or OpenAI-compatible URL          |
-| `--list-providers`          | List available providers and exit                           |
-| `--version`                 | Show version and exit                                       |
-| `-p`, `--prompt`            | Run in batch mode with this prompt                          |
-| `--model`                   | Select model by name or number; with no value, lists models |
-| `--system-prompt`           | System prompt to use                                        |
-| `--sandbox`                 | Sandbox mode (permissive-open, permissive-closed, etc.)     |
-| `--pretty on\|off`          | Enable/disable markdown rendering (default: on)             |
-| `--debug`                   | Enable debug logging                                        |
-| `--tool-response raw\|json` | Tool response format (default: raw)                         |
-| `--mcp`                     | Connect to MCP servers on startup (TUI only)                |
-| `--skills`                  | Include discovered skills in the system prompt              |
-| `--journal`                 | Enable journal mode (context compaction)                    |
-| `--send-reasoning`          | Include reasoning_content in message history                |
-| `--remove-reasoning`        | Strip reasoning tokens between turns                        |
-| `-c`, `--continue`          | Continue from last auto-saved session                       |
-| `--devel`                   | Enable devel mode (show devel-group tools)                  |
-| `--spinner fast\|slow\|off` | Spinner style (default: fast)                               |
-| `--upgrade`                 | Check for updates and apply, then exit                      |
-| `--clipboard osc52\|system` | Clipboard method for this session (default: osc52)          |
+| Option                      | Description                                                 | Default               |
+| --------------------------- | ----------------------------------------------------------- | --------------------- |
+| `provider`                  | Provider name from config or OpenAI-compatible URL          | —                     |
+| `--list-providers`          | List available providers and exit                           | —                     |
+| `--version`                 | Show version and exit                                       | —                     |
+| `-p`, `--prompt`            | Run in batch mode with this prompt                          | —                     |
+| `--model`                   | Select model by name or number; with no value, lists models | prompts interactively |
+| `--system-prompt`           | System prompt to use                                        | default               |
+| `--sandbox`                 | Sandbox mode (permissive-open, permissive-closed, etc.)     | permissive-open       |
+| `--pretty on\|off`          | Enable/disable markdown rendering                          | on                    |
+| `--debug`                   | Enable debug logging                                        | off                   |
+| `--tool-response raw\|json` | Tool response format                                       | raw                   |
+| `--mcp`                     | Connect to MCP servers on startup (TUI only)                | off                   |
+| `--skills`                  | Include discovered skills in the system prompt              | off                   |
+| `--journal`                 | Enable journal mode (context compaction)                    | off                   |
+| `--send-reasoning`          | Include reasoning_content in message history                | off                   |
+| `--remove-reasoning`        | Strip reasoning tokens between turns                        | off                   |
+| `-c`, `--continue`          | Continue from last auto-saved session                       | —                     |
+| `--devel`                   | Enable devel mode (show devel-group tools)                  | off                   |
+| `--spinner fast\|slow\|off` | Spinner style                                              | fast                  |
+| `--upgrade`                 | Check for updates and apply, then exit                      | —                     |
+| `--clipboard osc52\|system` | Clipboard method for this session                           | osc52                 |
 
 ## TUI Reference
 
-### Keybindings
+### Key bindings
 
 | Key                       | Action                                                                                |
 | ------------------------- | ------------------------------------------------------------------------------------- |
@@ -380,9 +383,16 @@ agent13 http://localhost:8012/v1 --model devstral2
 
 **Timeout tips:**
 
-- Default `read_timeout` is 600 seconds (10 minutes)
-- Reasoning models (DeepSeek-R1, GLM-5.1) may need `read_timeout = 2400` (40 minutes)
-- If you see `ReadTimeout` errors, increase this value
+- Default `read_timeout` is 2400 seconds (40 minutes)
+- Default `connect_timeout` is 30 seconds — increase to `60` for remote servers with cold starts
+- If you see `ReadTimeout` errors, increase `read_timeout`
+
+| Model type | Recommended `read_timeout` |
+|---|---|
+| Fast local (7B–14B) | `600` |
+| Fast cloud (OpenRouter, OpenAI) | `300` |
+| Slower models (DeepSeek-R1, GLM-5.1) | `2400` |
+| Slow local server | `2400` |
 
 ### MCP Server Configuration
 
@@ -583,8 +593,7 @@ Agent13 ships with these skills (copied to `~/.agent13/skills/` on first run):
   1. Project directory: `.agent13/skills/`
   2. Global directory: `~/.agent13/skills/`
   3. Bundled defaults: `agent13/default_skills/` (auto-copied to global on first run)
-     
-     ## Queue and Priority
+## Queue and Priority
 
 Agent13 uses a message queue to manage multiple prompts:
 

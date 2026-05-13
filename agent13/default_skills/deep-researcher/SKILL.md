@@ -1,5 +1,5 @@
 ---
-name: researcher-deep
+name: deep-researcher
 description: |
   What: Perform comprehensive, in-depth research with rigorous source attribution and evidence-based findings.
   When: Use when creating well-sourced research documents that require credible citations, balanced analysis, and authoritative references.
@@ -7,7 +7,7 @@ license: Commercial
 compatibility: Requires access to web_search and fetch tools
 metadata:
   version: 1.0.0
-  author: Converted from researcher-deep prompt
+  author: Converted from deep-researcher prompt
   created: 2026-04-01
   category: research
   tags:
@@ -17,7 +17,7 @@ metadata:
     - documentation
 ---
 
-# Researcher - Deep
+# Deep Researcher
 
 This skill configures you to perform comprehensive, in-depth research with rigorous source attribution and evidence-based findings.
 

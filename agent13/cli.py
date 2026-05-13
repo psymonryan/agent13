@@ -189,6 +189,7 @@ class _HelpFormatter(
 async def async_main():
     """Async main entry point."""
     parser = argparse.ArgumentParser(
+        prog="agent13",
         description="agent13 - AI agent with TUI and batch modes",
         formatter_class=_HelpFormatter,
         epilog="""Examples:
@@ -323,10 +324,14 @@ Provider names are read from ~/.agent13/config.toml
 
         success, message = perform_update()
         if success:
-            print(f"✓ {message}")
+            print(f"OK {message}")
         else:
-            print(f"✗ {message}", file=sys.stderr)
+            print(f"Error: {message}", file=sys.stderr)
         sys.exit(0 if success else 1)
+
+    # Clean up any stale .old Scripts dir from a previous Windows update
+    from agent13.updater import cleanup_old_scripts_dir
+    cleanup_old_scripts_dir()
 
     # Check for updates (throttled, respects config)
     from agent13.updater import check_for_update, format_update_notice, perform_update
@@ -349,11 +354,11 @@ Provider names are read from ~/.agent13/config.toml
                 if choice in ("y", "yes"):
                     success, message = perform_update()
                     if success:
-                        print(f"✓ {message}")
+                        print(f"OK {message}")
                     else:
-                        print(f"✗ {message}", file=sys.stderr)
+                        print(f"Error: {message}", file=sys.stderr)
                     sys.exit(0 if success else 1)
-                # Any other input → continue to TUI as normal
+                # Any other input - continue to TUI as normal
 
     # Initialize debug logging if --debug flag is set
     if args.debug:

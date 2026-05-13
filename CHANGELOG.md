@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.12] - 2026-05-13
+
+### Changed
+
+- updated libaries
+- manual improvements to README.md and USER_GUIDE.md
+- renamed researcher-deep skill to deep-researcher
+- further fixes to update code
+- fixed windows inplace update to fix permissions issue
+
 ## [0.1.11] - 2026-05-05
 
 ### Added
@@ -35,7 +45,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - removed unused user-invocable skill feature and doco
 - removed allowed_tools experimental code from skills
 - updated changelog generation to be standards compliant
-- refined the researcher-deep skill
+- refined the deep-researcher skill
 - added quickstart to user guide
 - updated readme with all options
 - renamed --prompt-name to --system-prompt

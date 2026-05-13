@@ -16,13 +16,13 @@ Quickly create, validate, and manage Agent Skills following the [agentskills.io]
 
 ```bash
 # Create skill directory
-mkdir -p .vibe/skills/my-skill
+mkdir -p .agent13/skills/my-skill
 
 # Copy template
-cp .vibe/skills/skills/assets/templates/basic-skill.yml .vibe/skills/my-new-skill/SKILL.md
+cp .agent13/skills/skills/assets/templates/basic-skill.yml .agent13/skills/my-new-skill/SKILL.md
 
 # Edit the template
-vim .vibe/skills/my-skill/SKILL.md
+vim .agent13/skills/my-skill/SKILL.md
 ```
 
 ### Validate Your Skill

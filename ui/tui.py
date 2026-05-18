@@ -23,11 +23,13 @@ from textual.widgets._markdown import MarkdownStream
 from textual.reactive import reactive
 from textual.binding import Binding
 from textual.message import Message
-from textual.events import MouseUp
+from textual.events import Click, MouseUp
 from textual.widget import MountError, Widget
 from ui.chat_input import ChatTextArea
 import time
 import argparse
+from datetime import datetime
+from pathlib import Path
 
 # Re-export from shared module for backwards compatibility
 from agent13.models import fetch_models, print_model_list, select_model
@@ -68,6 +70,7 @@ from agent13.persistence import (
     save_context,
     load_context,
     get_saves_dir,
+    get_auto_save_dir,
     find_latest_auto_save,
     list_saves,
 )
@@ -245,9 +248,10 @@ class ReasoningMessage(Static):
         self._markdown.display = not self.collapsed
         yield self._markdown
 
-    async def on_click(self) -> None:
-        """Toggle collapsed state on click."""
-        await self.set_collapsed(not self.collapsed)
+    async def on_click(self, event: Click) -> None:
+        """Toggle collapsed state only when clicking the header."""
+        if event.widget is self._header:
+            await self.set_collapsed(not self.collapsed)
 
     async def set_collapsed(self, collapsed: bool) -> None:
         """Set collapsed state and update display."""
@@ -543,6 +547,7 @@ class AgentTUI(App):
         "/spinner",
         "/upgrade",
         "/clipboard",
+        "/status",
     ]
     # Class-level attribute for type checking (instance copy created in __init__)
     SLASH_COMMANDS = _BUILTIN_SLASH_COMMANDS
@@ -746,22 +751,40 @@ class AgentTUI(App):
         self._error_state = False  # Track if agent stopped due to error
         self._last_error_type = None  # Type of last error
 
-        # TPS tracking
+        # TPS tracking — elapsed measured from first_token to last_token,
+        # measuring generation speed (excludes prompt evaluation time).
+        # Short responses (< MIN_TOKENS) keep the stale TPS from a prior
+        # longer response, because prompt_eval inflates elapsed on short
+        # turns, making TPS appear too low.
         self._stream_start_time: float | None = (
-            None  # When streaming started (for display timing)
+            None  # When current stream started (debug tracking, elapsed display)
         )
         self._first_token_time: float | None = (
-            None  # When first token arrived (for TPS calculation)
+            None  # When first streamed token arrived (TPS elapsed start)
         )
         self._last_token_time: float | None = (
-            None  # When last token arrived (for TPS calculation)
+            None  # When last token arrived (TPS elapsed end)
         )
-        self._token_count: int = 0  # Count of chunks received in current stream
+        self._token_count: int = 0  # Chunks received in current stream
+        self._last_tps: float = 0.0  # Last calculated TPS (persists across streams)
 
         # Elapsed time tracking
         self._elapsed_start_time: float | None = (
             None  # When current processing session started
         )
+        # Session start time (when TUI was created, for /status run time)
+        self._session_start_time: float = time.time()
+        # Last turn tracking (persists after idle for status bar + /status)
+        self._last_turn_duration: float | None = None  # seconds of last completed turn
+        self._last_turn_end_time: float | None = None   # when last turn finished (epoch)
+        self._turn_count: int = 0                        # completed turns this session
+        self._total_processing_time: float = 0.0         # cumulative seconds across all turns
+        # Resumed session tracking (for --continue and /load /status)
+        self._resumed_saved_at: str | None = None           # ISO timestamp from .ctx file
+        self._resumed_turn_count: int = 0                    # user-role messages in loaded session
+        self._resumed_prompt_tokens: int = 0                  # prompt tokens at load time
+        self._resumed_completion_tokens: int = 0               # completion tokens at load time
+        self._pending_load_path: Path | None = None           # stored before deferred /load
 
         # Tab completion state
         self._completion_matches: list[str] = []  # Current completion matches
@@ -777,7 +800,7 @@ class AgentTUI(App):
         )
 
         # Info pane mode tracking - what content is currently displayed
-        self._info_pane_mode: str | None = None  # None, "history", "queue", "help"
+        self._info_pane_mode: str | None = None  # None, "history", "queue", "help", "status"
 
         # Register event handlers
         self._register_handlers()
@@ -1473,6 +1496,10 @@ class AgentTUI(App):
             if event.event != AgentEvent.ITEM_STARTED:
                 return
             text = event.data.get("text", "")
+            # Clear error state at start of new turn - if we get here, the agent
+            # is healthy and processing a new item, so any previous error is stale
+            self._error_state = False
+            self._last_error_type = None
             # Increment stream generation for new conversation turn
             # This ensures any stale tokens from previous turns are discarded
             self._stream_generation += 1
@@ -1675,6 +1702,9 @@ class AgentTUI(App):
                 self.total_tokens = (
                     self.agent.prompt_tokens + self.agent.completion_tokens
                 )
+                # Capture resumed session stats for /status
+                self._capture_resumed_stats(path=self._pending_load_path)
+                self._pending_load_path = None
                 self.update_status()
                 if incomplete:
                     self._update_info_content(
@@ -1760,7 +1790,8 @@ class AgentTUI(App):
 
             # Update reactive properties (thread-safe via call_later)
             self.call_later(
-                self._update_token_usage, event.data, first_time, effective_last_time
+                self._update_token_usage, event.data, first_time,
+                effective_last_time
             )
 
         @self.agent.on_event
@@ -2233,15 +2264,18 @@ class AgentTUI(App):
                 old_first=self._first_token_time,
                 old_last=self._last_token_time,
                 old_count=self._token_count,
+                old_stream_start=self._stream_start_time,
             )
         self._first_token_time = None
         self._last_token_time = None
         self._token_count = 0
+        self._stream_start_time = time.time()
         if is_debug_enabled():
             log_tps_stream_start(
                 source="stream_start",
                 first_token_time=self._first_token_time,
                 token_count=self._token_count,
+                stream_start_time=self._stream_start_time,
             )
 
     def _update_status(self, status: str) -> None:
@@ -2267,8 +2301,7 @@ class AgentTUI(App):
             # (see on_stream_start handler). Do NOT reset here - status changes
             # happen during a stream (thinking→processing→tooling) and resetting
             # would wipe out timing before TOKEN_USAGE arrives.
-            if self._stream_start_time is None:
-                self._stream_start_time = time.time()
+            # _stream_start_time is set per-stream in _reset_stream_timing
             # Start elapsed timer if not already running (new session)
             if self._elapsed_start_time is None:
                 self._elapsed_start_time = time.time()
@@ -2277,6 +2310,12 @@ class AgentTUI(App):
             # Only reset elapsed timer if no pending queue items
             # (timer continues for queued messages)
             if self.agent.queue.pending_count == 0:
+                if self._elapsed_start_time is not None:
+                    duration = time.time() - self._elapsed_start_time
+                    self._last_turn_duration = duration
+                    self._last_turn_end_time = time.time()
+                    self._total_processing_time += duration
+                    self._turn_count += 1
                 self._elapsed_start_time = None
         elif status == "paused":
             self.processing = False
@@ -2288,14 +2327,22 @@ class AgentTUI(App):
             self.status = "Stopped"
 
     def _update_token_usage(
-        self, data: dict, first_token_time: float = None, last_token_time: float = None
+        self, data: dict, first_token_time: float = None,
+        last_token_time: float = None
     ) -> None:
         """Update token usage from agent event and calculate TPS.
 
+        TPS elapsed is measured from first_token_time to last_token_time,
+        measuring generation speed (excludes prompt evaluation time).
+        This matches how backends report tokens-per-second on normal turns.
+
+        Thresholds suppress TPS on short responses where the measurement is
+        unreliable. See MIN_TOKENS and MIN_ELAPSED below for rationale.
+
         Args:
             data: Token usage data from TOKEN_USAGE event
-            first_token_time: Captured first token time (to avoid race condition)
-            last_token_time: Captured last token time (to avoid race condition)
+            first_token_time: When first token arrived (captured synchronously)
+            last_token_time: When last token arrived (captured synchronously)
         """
         self.prompt_tokens = data.get("prompt_tokens", 0)
         self.completion_tokens = data.get("completion_tokens", 0)
@@ -2304,20 +2351,34 @@ class AgentTUI(App):
         # Use captured timing if provided (to avoid race condition with _reset_stream_timing)
         # Otherwise fall back to instance variables
         first_time = (
-            first_token_time if first_token_time is not None else self._first_token_time
+            first_token_time if first_token_time is not None
+            else self._first_token_time
         )
         last_time = (
             last_token_time if last_token_time is not None else self._last_token_time
         )
-        # Calculate TPS only if we have enough samples for accuracy
-        # Short streams have high variance due to TTFT and chunk granularity
+        # TPS display thresholds — suppress TPS on responses where the
+        # measurement is unreliable or misleading.
+        #
+        # MIN_TOKENS: Minimum completion_tokens to show TPS.
+        #   Short responses (e.g. skill acknowledgments ~30 tokens) produce
+        #   inaccurate TPS because prompt evaluation time dominates elapsed.
+        #   When a large tool result (e.g. skill content) is in the context,
+        #   prompt_eval can be 4-5s of a 7s total elapsed, making TPS appear
+        #   3x lower than the backend's reported generation speed.  Suppressing
+        #   short responses avoids showing these misleading numbers; the stale
+        #   TPS from the previous (longer) response persists instead.
+        #
+        # MIN_ELAPSED: Minimum seconds between first_token and last_token.
+        #   Below this, chunk granularity and TTFT variance make TPS noisy.
+        #   Measuring from first_token (generation speed) means elapsed is
+        #   typically shorter than from stream_start, so 1.5s is sufficient.
+        MIN_TOKENS = 50
+        MIN_ELAPSED = 1.5  # seconds
+        MIN_ELAPSED_FOR_CALC = 0.1  # Floor to prevent division by near-zero elapsed
+
         if first_time and last_time:
             elapsed = last_time - first_time
-            MIN_TOKENS = 50
-            MIN_ELAPSED = 3.0  # seconds - increased to reduce TPS noise
-            MIN_ELAPSED_FOR_CALC = (
-                0.1  # Minimum elapsed to prevent division by tiny numbers
-            )
 
             # Sanity check: reject absurdly short elapsed times (likely race condition)
             if elapsed < MIN_ELAPSED_FOR_CALC:
@@ -2339,8 +2400,11 @@ class AgentTUI(App):
 
                 if threshold_passed:
                     tps_value = self.completion_tokens / elapsed
-                    self._last_tps = tps_value
-            # else: keep previous TPS value, don't update with noisy data
+                    if tps_value > 0:
+                        self._last_tps = tps_value
+            # else: keep previous TPS value — short/low-token responses produce
+            # inaccurate TPS (prompt_eval inflates elapsed), so the stale
+            # TPS from a longer prior response is a better signal
 
             if is_debug_enabled():
                 log_tps_calculation(
@@ -2356,8 +2420,8 @@ class AgentTUI(App):
                 log_tps_calculation(
                     elapsed=0,
                     completion_tokens=self.completion_tokens,
-                    min_elapsed=3.0,
-                    min_tokens=50,
+                    min_elapsed=MIN_ELAPSED,
+                    min_tokens=MIN_TOKENS,
                     threshold_passed=False,
                     tps_value=None,
                 )
@@ -2367,7 +2431,10 @@ class AgentTUI(App):
                 prompt_tokens=self.prompt_tokens,
                 completion_tokens=self.completion_tokens,
                 total_tokens=self.total_tokens,
-                first_token_time=first_time,
+                first_token_time=(
+                    first_token_time if first_token_time is not None
+                    else self._first_token_time
+                ),
                 last_token_time=last_time,
                 token_count=self._token_count,
             )
@@ -2427,6 +2494,13 @@ class AgentTUI(App):
         with special handling for TUI-specific states (pausing, stopped).
         Spinner animates based on processing state.
         """
+        # Guard: bail if widgets aren't mounted yet.
+        # Reactive watchers (e.g. watch_processing) can fire before on_mount
+        # assigns _status_left/_status_right, and reading other reactives
+        # inside this method can trigger further watchers (re-entrancy).
+        if not hasattr(self, "_status_left"):
+            return
+
         # Spinner logic based on processing state and speed setting
         if self._spinner_speed == "off":
             # Show a static indicator when processing, nothing when idle
@@ -2476,6 +2550,11 @@ class AgentTUI(App):
             minutes = elapsed_seconds // 60
             seconds = elapsed_seconds % 60
             elapsed_str = f"dur: {minutes}:{seconds:02d} | "
+        elif self._last_turn_duration is not None:
+            last_seconds = int(self._last_turn_duration)
+            minutes = last_seconds // 60
+            seconds = last_seconds % 60
+            elapsed_str = f"last: {minutes}:{seconds:02d} | "
 
         # Context (always shown, positioned after duration)
         ctx_str = f"Ctx: {total_str}"
@@ -2675,6 +2754,8 @@ class AgentTUI(App):
 
         if command == "help":
             self._handle_help_command()
+        elif command == "status":
+            self._handle_status_command()
         elif command == "model":
             self._handle_model_command(args)
         elif command == "history":
@@ -3056,10 +3137,10 @@ class AgentTUI(App):
 
     def _handle_help_command(self) -> None:
         """Handle /help command."""
-        sandbox_mode = get_current_sandbox_mode()
         self._update_info_content(
             "[bold]Commands:[/]\n"
             "  [yellow]/help[/] - Show this help\n"
+            "  [yellow]/status[/] - Show session status and settings\n"
             "  [yellow]/model [name][/] - Select model (tab to list)\n"
             "  [yellow]/history[/] - Show message history\n"
             "  [yellow]/delete h N[/] - Delete message group N from history\n"
@@ -3103,18 +3184,238 @@ class AgentTUI(App):
             "  [yellow]Shift+Up/Down[/] - Scroll chat\n"
             "\n[bold]Tips:[/]\n"
             "  [yellow]![/]message — Priority: queued ahead of normal items (after any interrupts)\n"
-            "  [yellow]!![/]message — Inject: add context into the agent's current turn without cancelling\n"
-            "\n[bold]Current settings:[/]\n"
-            f"  model: {escape_markup(self.model)}\n"
-            f"  tool-response: {escape_markup(self.tool_response_format)}\n"
-            f"  pretty: {'on' if self.pretty else 'off'}\n"
-            f"  prompt: {escape_markup(self.prompt_manager.active_prompt)}\n"
-            f"  sandbox: {escape_markup(sandbox_mode.value)}\n"
-            f"  remove-reasoning: {'on' if self.agent.remove_reasoning else 'off'}\n"
-            f"  spinner: {self._spinner_speed}\n"
-            f"  clipboard: {self._clipboard_method}"
+            "  [yellow]!![/]message — Inject: add context into the agent's current turn without cancelling"
         )
         self._info_pane_mode = "help"
+
+    def _handle_status_command(self) -> None:
+        """Handle /status command - show session status and settings."""
+        sandbox_mode = get_current_sandbox_mode()
+
+        # Session run time
+        run_secs = int(time.time() - self._session_start_time)
+        hours, remainder = divmod(run_secs, 3600)
+        mins, secs = divmod(remainder, 60)
+        if hours > 0:
+            run_time = f"{hours}h {mins}m {secs}s"
+        elif mins > 0:
+            run_time = f"{mins}m {secs}s"
+        else:
+            run_time = f"{secs}s"
+
+        # Agent status
+        if self.processing:
+            agent_status = "processing"
+        elif self.agent.queue.pending_count > 0:
+            agent_status = "queued"
+        else:
+            agent_status = "idle"
+
+        # Last turn info
+        last_turn_str = ""
+        if self._last_turn_duration is not None:
+            lt_mins, lt_secs = divmod(int(self._last_turn_duration), 60)
+            lt_hours, lt_mins = divmod(lt_mins, 60)
+            if lt_hours > 0:
+                dur_str = f"{lt_hours}h {lt_mins}m {lt_secs}s"
+            elif lt_mins > 0:
+                dur_str = f"{lt_mins}m {lt_secs}s"
+            else:
+                dur_str = f"{lt_secs}s"
+            ago_secs = int(time.time() - self._last_turn_end_time)
+            ago_m, ago_s = divmod(ago_secs, 60)
+            ago_h, ago_m = divmod(ago_m, 60)
+            if ago_h > 0:
+                ago_str = f"{ago_h}h {ago_m}m {ago_s}s ago"
+            elif ago_m > 0:
+                ago_str = f"{ago_m}m {ago_s}s ago"
+            else:
+                ago_str = f"{ago_s}s ago"
+            total_m, total_s = divmod(int(self._total_processing_time), 60)
+            total_h, total_m = divmod(total_m, 60)
+            if total_h > 0:
+                total_str = f"{total_h}h {total_m}m {total_s}s"
+            elif total_m > 0:
+                total_str = f"{total_m}m {total_s}s"
+            else:
+                total_str = f"{total_s}s"
+            last_turn_str = (
+                f"  last turn: [yellow]{dur_str}[/] (completed {ago_str})\n"
+                f"  turns: [yellow]{self._turn_count}[/] | "
+                f"total processing: [yellow]{total_str}[/]\n"
+            )
+
+        # Token counts
+        def fmt_tokens(n: int) -> str:
+            if n >= 1000:
+                return f"{n / 1000:.1f}k"
+            return str(n)
+
+        # Resumed session info (for --continue and /load)
+        resumed_str = ""
+        if self._resumed_turn_count > 0:
+            resumed_lines = []
+            resumed_lines.append("\n[bold]Resumed session[/]")
+            if self._resumed_saved_at:
+                try:
+                    saved_dt = datetime.fromisoformat(self._resumed_saved_at)
+                    ago = int(time.time() - saved_dt.timestamp())
+                    ago_m, ago_s = divmod(ago, 60)
+                    ago_h, ago_m = divmod(ago_m, 60)
+                    if ago_h > 0:
+                        ago_str = f"{ago_h}h {ago_m}m ago"
+                    else:
+                        ago_str = f"{ago_m}m {ago_s}s ago"
+                    saved_str = saved_dt.strftime("%Y-%m-%d %H:%M")
+                    resumed_lines.append(
+                        f"  saved: [yellow]{saved_str}[/] ({ago_str})"
+                    )
+                except (ValueError, OSError):
+                    pass
+            prev_p = fmt_tokens(self._resumed_prompt_tokens)
+            prev_c = fmt_tokens(self._resumed_completion_tokens)
+            prev_t = fmt_tokens(
+                self._resumed_prompt_tokens + self._resumed_completion_tokens
+            )
+            resumed_lines.append(
+                f"  previous: [yellow]{self._resumed_turn_count}[/] turns | "
+                f"{prev_p} prompt / {prev_c} completion / {prev_t} total"
+            )
+            # This-session deltas
+            delta_p = fmt_tokens(self.prompt_tokens - self._resumed_prompt_tokens)
+            delta_c = fmt_tokens(
+                self.completion_tokens - self._resumed_completion_tokens
+            )
+            delta_t = fmt_tokens(
+                (self.prompt_tokens - self._resumed_prompt_tokens)
+                + (self.completion_tokens - self._resumed_completion_tokens)
+            )
+            resumed_lines.append(
+                f"  this session: [yellow]{self._turn_count}[/] turns | "
+                f"{delta_p} prompt / {delta_c} completion / {delta_t} total"
+            )
+            resumed_str = "\n".join(resumed_lines) + "\n"
+
+        prompt_t = fmt_tokens(self.prompt_tokens)
+        completion_t = fmt_tokens(self.completion_tokens)
+        total_t = fmt_tokens(self.prompt_tokens + self.completion_tokens)
+
+        # Tool stats
+        stats = self.agent.tool_stats
+        tools_str = (
+            f"{stats.total_successes}/{stats.total_calls}"
+            if stats.total_calls > 0
+            else "0"
+        )
+
+        # MCP status
+        mcp_str = (
+            "connected" if self.agent.mcp and self.agent.mcp.is_connected()
+            else "off"
+        )
+
+        # Saves info
+        saves_str = ""
+        try:
+            project_name = Path.cwd().name
+            auto_dir = get_auto_save_dir()
+            auto_count = len(list(auto_dir.glob(f"{project_name}-*.ctx")))
+            manual_saves = list_saves()
+            manual_count = len(manual_saves)
+            saves_lines = []
+            saves_lines.append("\n[bold]Saves[/]")
+            saves_lines.append(
+                f"  auto: [yellow]{auto_count}[/] | manual: [yellow]{manual_count}[/]"
+            )
+            # Check for restorable session
+            latest = find_latest_auto_save()
+            if latest:
+                try:
+                    with open(latest) as f:
+                        ctx_data = json.load(f)
+                    saved_at = ctx_data.get("saved_at")
+                    if saved_at:
+                        saved_dt = datetime.fromisoformat(saved_at)
+                        saved_fmt = saved_dt.strftime("%Y-%m-%d %H:%M")
+                        saves_lines.append(
+                            f"  restorable: [green]yes[/] ({saved_fmt})"
+                        )
+                    else:
+                        saves_lines.append("  restorable: [green]yes[/]")
+                except (OSError, json.JSONDecodeError, ValueError):
+                    saves_lines.append("  restorable: [green]yes[/]")
+            else:
+                saves_lines.append("  restorable: [dim]no auto-save found[/]")
+            saves_str = "\n".join(saves_lines) + "\n"
+        except OSError:
+            pass
+
+        # Build output
+        self._update_info_content(
+            f"[bold]Session[/]\n"
+            f"  status: [yellow]{agent_status}[/]\n"
+            f"  run time: [yellow]{run_time}[/]\n"
+            f"  cwd: [yellow]{escape_markup(os.getcwd())}[/]\n"
+            f"{last_turn_str}"
+            f"{resumed_str}"
+            f"{saves_str}"
+            f"\n[bold]Provider[/]\n"
+            f"  provider: [yellow]{escape_markup(self.provider)}[/]\n"
+            f"  model: [yellow]{escape_markup(self.model)}[/]\n"
+            f"  prompt: [yellow]{escape_markup(self.prompt_manager.active_prompt)}[/]\n"
+            f"\n[bold]Context[/]\n"
+            f"  prompt tokens: [yellow]{prompt_t}[/]\n"
+            f"  completion tokens: [yellow]{completion_t}[/]\n"
+            f"  total tokens: [yellow]{total_t}[/]\n"
+            f"  queue: [yellow]{self.agent.queue.pending_count}[/]\n"
+            f"\n[bold]Connectivity[/]\n"
+            f"  mcp: [yellow]{mcp_str}[/]\n"
+            f"\n[bold]Tools[/]\n"
+            f"  success/calls: [yellow]{tools_str}[/]\n"
+            f"\n[bold]Settings[/]\n"
+            f"  sandbox: [yellow]{escape_markup(sandbox_mode.value)}[/]\n"
+            f"  pretty: [yellow]{'on' if self.pretty else 'off'}[/]\n"
+            f"  tool-response: [yellow]{escape_markup(self.tool_response_format)}[/]\n"
+            f"  spinner: [yellow]{self._spinner_speed}[/]\n"
+            f"  clipboard: [yellow]{self._clipboard_method}[/]\n"
+            f"  remove-reasoning: [yellow]{'on' if self.agent.remove_reasoning else 'off'}[/]\n"
+            f"  devel: [yellow]{'on' if self.agent.devel_mode else 'off'}[/]\n"
+            f"  skills: [yellow]{'on' if self.agent.skills_mode else 'off'}[/]\n"
+            f"  journal: [yellow]{'on' if self.agent.journal_mode else 'off'}[/]"
+        )
+        self._info_pane_mode = "status"
+
+    def _capture_resumed_stats(self, path: Path | None = None) -> None:
+        """Snapshot loaded session stats for /status display.
+
+        Called after a successful context load to capture turn count,
+        token counts, and save timestamp. Resets session timing since
+        this is effectively a new conversation.
+
+        Args:
+            path: Optional path to .ctx file (to read saved_at).
+        """
+        # Read saved_at from .ctx file if path provided
+        if path:
+            try:
+                with open(path) as f:
+                    ctx_data = json.load(f)
+                self._resumed_saved_at = ctx_data.get("saved_at")
+            except (OSError, json.JSONDecodeError):
+                pass
+        # Count user-role messages for turn count
+        self._resumed_turn_count = sum(
+            1 for m in self.agent.messages if m.get("role") == "user"
+        )
+        # Snapshot token counters
+        self._resumed_prompt_tokens = self.prompt_tokens
+        self._resumed_completion_tokens = self.completion_tokens
+        # Reset session timing (conversation effectively restarts)
+        self._session_start_time = time.time()
+        self._turn_count = 0
+        self._total_processing_time = 0.0
+        self._last_turn_duration = None
+        self._last_turn_end_time = None
 
     def _handle_prompt_command(self, args: str) -> None:
         """Handle /prompt command."""
@@ -4159,6 +4460,8 @@ class AgentTUI(App):
             )
             return
 
+        # Store path for on_context_loaded to capture resumed stats
+        self._pending_load_path = path
         # Queue the load for safe deferred processing (pass path as string)
         asyncio.create_task(self.agent.request_load(str(path)))
 
@@ -4185,6 +4488,8 @@ class AgentTUI(App):
             self.prompt_tokens = self.agent.prompt_tokens
             self.completion_tokens = self.agent.completion_tokens
             self.total_tokens = self.agent.prompt_tokens + self.agent.completion_tokens
+            # Capture resumed session stats for /status
+            self._capture_resumed_stats(path=path)
             # Note: We intentionally do NOT sync model from loaded context
             # User keeps their current provider/model settings
             self.update_status()
@@ -4198,7 +4503,6 @@ class AgentTUI(App):
             # Replay loaded messages into chat window
             asyncio.create_task(self._replay_loaded_messages())
         else:
-            self._update_info_content(f"[yellow]Could not load auto-save: {message}[/]")
             self._update_info_content(f"[yellow]Could not load auto-save: {message}[/]")
 
     def on_token_message(self, message: TokenMessage) -> None:
@@ -4532,34 +4836,39 @@ class AgentTUI(App):
             # Determine direction: Shift+Tab goes backward, Tab goes forward
             reverse = event.key == "shift+tab"
 
-            # Always check current context FIRST - this is the source of truth
-            cursor_row, cursor_col = input_field.cursor_location
-            completion_type, start_loc, end_loc = self._get_completion_context(
-                current_text, cursor_row, cursor_col
-            )
+            # If already in cycling mode and text unchanged (only our completion
+            # This prevents spaces in completed items (e.g. filenames with
+            # spaces) from invalidating the context on the next tab press.
+            if self._completion_matches and self._completion_text == current_text:
+                # Still cycling — use stored start_loc for consistency check
+                start_loc = self._completion_start
+            else:
+                # Not cycling, or text changed — re-evaluate context
+                cursor_row, cursor_col = input_field.cursor_location
+                completion_type, start_loc, end_loc = self._get_completion_context(
+                    current_text, cursor_row, cursor_col
+                )
 
-            # If in "none" context, clear any stale completion state and exit
-            # This prevents Tab from cycling with stale matches after user has moved on
-            if completion_type == "none":
-                if self._completion_matches:
+                # If in "none" context, clear any stale completion state and exit
+                # This prevents Tab from cycling with stale matches after user has moved on
+                if completion_type == "none":
+                    if self._completion_matches:
+                        self._reset_completion_state()
+                        # Only hide info-pane if completions were shown there
+                        if self._info_pane_mode is None:
+                            self._hide_info_pane()
+                    # Re-focus input and exit (Tab does nothing in "none" context)
+                    self.call_later(input_field.focus)
+                    return
+
+                # Text changed while in completion mode — reset and start fresh
+                # This is needed because TextArea stops key events from bubbling,
+                # so we don't receive space/character events to reset completion state
+                if self._completion_matches and self._completion_text != current_text:
                     self._reset_completion_state()
                     # Only hide info-pane if completions were shown there
                     if self._info_pane_mode is None:
                         self._hide_info_pane()
-                # Re-focus input and exit (Tab does nothing in "none" context)
-                self.call_later(input_field.focus)
-                return
-
-            # If we're already in completion mode, check if the text has changed
-            # (user typed something after the last completion)
-            # This is needed because TextArea stops key events from bubbling,
-            # so we don't receive space/character events to reset completion state
-            if self._completion_matches and self._completion_text != current_text:
-                # Text changed - reset and start fresh
-                self._reset_completion_state()
-                # Only hide info-pane if completions were shown there
-                if self._info_pane_mode is None:
-                    self._hide_info_pane()
 
             # If we're still in completion mode (text unchanged), cycle
             if self._completion_matches and start_loc == self._completion_start:
@@ -4703,6 +5012,10 @@ class AgentTUI(App):
             input_field.move_cursor((new_cursor_row, new_cursor_col))
             if update_state:
                 self._completion_end = (new_cursor_row, new_cursor_col)
+        else:
+            input_field.move_cursor((start_loc[0], new_cursor_col))
+            if update_state:
+                self._completion_end = (start_loc[0], new_cursor_col)
         # NOTE: action_scroll_chat_up/down removed — shift+up/down doesn't
         # survive terminal → ssh → tmux → Textual chain. Use mouse scroll.
         # def action_scroll_chat_up(self) -> None:

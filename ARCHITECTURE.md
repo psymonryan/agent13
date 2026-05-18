@@ -450,31 +450,11 @@ Operations that modify message history (`/clear`, `/load`, `/retry`) are deferre
 
 ### TUI (`ui/tui.py`)
 
-The Textual-based TUI provides the full interactive experience:
+The Textual-based TUI provides the layout and content segregation with panes:
 
-```text
-┌──────────────────────────────────────────────────────────┐
-│ Status: thinking | Queue: 3 | Tokens: 1234/5678          │
-├──────────────────────────────────────────────────────────┤
-│                                                          │
-│  User: What files are in this project?                   │
-│                                                          │
-│  Assistant: I'll check the project structure...          │
-│  [Tool: command] ls -la                                  │
-│  [Result: total 42...]                                   │
-│                                                          │
-│  The project contains:                                   │
-│  - agent13/ (core library)                               │
-│  - ui/ (interfaces)                                      │
-│  - tools/ (tool implementations)                         │
-│                                                          │
-├──────────────────────────────────────────────────────────┤
-│ ┌────────────────────────────────────────────────────┐   │
-│ │ > _                                                │   │
-│ └────────────────────────────────────────────────────┘   │
-│ [Tab] autocomplete  [Esc] interrupt  [Enter] send        │
-└──────────────────────────────────────────────────────────┘
-```
+![Textual TUI](images/Textual_TUI.png)
+
+The status bar shows agent status, queue depth, duration (`dur:` while processing, `last:` after completion), context size, MCP connection, active tools, and TPS. The `last:` duration persists after a turn completes for checking how long a task took after being away from keyboard.
 
 ### Event Handling
 
@@ -491,7 +471,8 @@ async def on_token(event: AgentEventData):
 
 | Command                        | Purpose                                           |
 | ------------------------------ | ------------------------------------------------- |
-| `/help`                        | Show available commands                           |
+| `/help`                        | Show commands and keyboard shortcuts              |
+| `/status`                      | Show session status, settings, and save info      |
 | `/quit`, `/exit`               | Exit the application                              |
 | `/clear`                       | Clear message history (deferred to safe boundary) |
 | `/model`                       | Switch model                                      |
@@ -619,10 +600,10 @@ Creates an `AsyncOpenAI` client with separate connect and read timeouts. The def
 
 Single source of truth for clipboard operations. Two methods:
 
-| Method | Implementation | Use case |
-| ------ | -------------- | -------- |
-| `osc52` | OSC 52 terminal escape sequence via Textual's `App.copy_to_clipboard` | SSH, modern terminals |
-| `system` | Subprocess: `pbcopy` / `xclip` / `wl-copy` / `clip.exe` | tmux, screen, older terminals |
+| Method   | Implementation                                                        | Use case                      |
+| -------- | --------------------------------------------------------------------- | ----------------------------- |
+| `osc52`  | OSC 52 terminal escape sequence via Textual's `App.copy_to_clipboard` | SSH, modern terminals         |
+| `system` | Subprocess: `pbcopy` / `xclip` / `wl-copy` / `clip.exe`               | tmux, screen, older terminals |
 
 ```python
 def copy_via_system(text: str) -> bool:

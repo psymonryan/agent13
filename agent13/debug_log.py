@@ -409,9 +409,9 @@ def log_tps_token_usage(
         prompt_tokens: Prompt tokens from API
         completion_tokens: Completion tokens from API
         total_tokens: Total tokens from API
-        first_token_time: Current _first_token_time value (or None)
-        last_token_time: Current _last_token_time value (or None)
-        token_count: Current _token_count value (or None)
+        first_token_time: When first token arrived (TPS elapsed start)
+        last_token_time: When last token arrived
+        token_count: Current _token_count value
     """
     log_tps_event(
         "token_usage",
@@ -440,6 +440,7 @@ def log_tps_stream_start(
     first_token_time: float = None,
     last_token_time: float = None,
     token_count: int = None,
+    stream_start_time: float = None,
 ) -> None:
     """Log stream start event.
 
@@ -448,6 +449,7 @@ def log_tps_stream_start(
         first_token_time: Current _first_token_time value
         last_token_time: Current _last_token_time value
         token_count: Current _token_count value
+        stream_start_time: Current _stream_start_time value
     """
     log_tps_event(
         "stream_start",
@@ -456,6 +458,7 @@ def log_tps_stream_start(
             "first_token_time": first_token_time,
             "last_token_time": last_token_time,
             "token_count": token_count,
+            "stream_start_time": stream_start_time,
         },
     )
 
@@ -489,7 +492,8 @@ def log_tps_stream_end(
 
 
 def log_tps_timing_reset(
-    source: str, old_first: float = None, old_last: float = None, old_count: int = None
+    source: str, old_first: float = None, old_last: float = None,
+    old_count: int = None, old_stream_start: float = None,
 ) -> None:
     """Log when timing variables are reset.
 
@@ -498,6 +502,7 @@ def log_tps_timing_reset(
         old_first: Previous _first_token_time value
         old_last: Previous _last_token_time value
         old_count: Previous _token_count value
+        old_stream_start: Previous _stream_start_time value
     """
     log_tps_event(
         "timing_reset",
@@ -506,6 +511,7 @@ def log_tps_timing_reset(
             "old_first_token_time": old_first,
             "old_last_token_time": old_last,
             "old_token_count": old_count,
+            "old_stream_start_time": old_stream_start,
         },
     )
 

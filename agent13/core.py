@@ -13,7 +13,6 @@ from agent13.events import AgentEvent, AgentEventData, EventHandler
 from agent13.prompts import DEFAULT_PROMPT, REFLECTION_PROMPT
 from agent13.queue import AgentQueue, QueueItem
 from agent13.llm import (
-    stream_response_with_tools,
     append_assistant_message,
     categorize_error,
     detect_tool_calls_in_reasoning,
@@ -782,7 +781,7 @@ class Agent:
 
         Finds the last non-interrupt user message and replaces everything after
         it with:
-        - Preserved skill messages (if any) — verbatim, at the start
+        - Preserved skill messages (if any) — as text, at the start
         - The tool summary (summarizing tool calls and results)
         - The original final assistant message (preserving the conclusion)
 
@@ -793,10 +792,11 @@ class Agent:
         Args:
             tool_summary: Summary of tool exploration.
             final_message: The original final assistant response to preserve.
-            preserved_skills: Skill call/result messages to preserve verbatim.
-                Inserted at the start of the compacted turn (before the
-                summary), since skill content was loaded before the work
-                that the summary describes.
+            preserved_skills: Skill call/result messages to preserve.
+                Converted from raw API format (assistant+tool_calls + tool
+                result) to text-only assistant messages during insertion.
+                This prevents _find_earliest_tool_turn from re-finding the
+                same turn after compaction.
         """
         if not self.messages:
             return
@@ -816,11 +816,117 @@ class Agent:
         self.messages = self.messages[: last_user_idx + 1]
 
         # Insert preserved skill messages before the summary
+        # Convert from raw API format (assistant+tool_calls + tool result)
+        # to text-only assistant messages. This prevents _find_earliest_tool_turn
+        # from re-finding the same turn after compaction (infinite loop).
         if preserved_skills:
-            self.messages.extend(preserved_skills)
+            i = 0
+            while i < len(preserved_skills):
+                msg = preserved_skills[i]
+                if msg.get("role") == "assistant" and msg.get("tool_calls"):
+                    # Extract skill name from tool_calls
+                    skill_name = ""
+                    for tc in msg["tool_calls"]:
+                        fn = tc.get("function", {})
+                        if fn.get("name") == "skill":
+                            args = fn.get("arguments", {})
+                            if isinstance(args, str):
+                                try:
+                                    args = json.loads(args)
+                                except (json.JSONDecodeError, ValueError):
+                                    args = {}
+                            skill_name = args.get("name", "")
+                            break
+
+                    # Find the matching tool result (next message)
+                    skill_content = ""
+                    if i + 1 < len(preserved_skills):
+                        next_msg = preserved_skills[i + 1]
+                        if next_msg.get("role") == "tool":
+                            skill_content = next_msg.get("content", "")
+                            i += 1  # skip tool result, consumed
+
+                    # Emit as single text-only assistant message
+                    label = f"[Skill: {skill_name}]" if skill_name else "[Skill]"
+                    self.messages.append({
+                        "role": "assistant",
+                        "content": f"{label}\n\n{skill_content}" if skill_content else label,
+                    })
+                else:
+                    # Non-skill message (shouldn't happen, but handle gracefully)
+                    content = msg.get("content", "")
+                    if content:
+                        self.messages.append({
+                            "role": "assistant",
+                            "content": content,
+                        })
+                i += 1
 
         # Then append the combined summary
         self.messages.append({"role": "assistant", "content": combined_content})
+
+    async def _stream_and_emit(
+        self,
+        messages: list[dict],
+        *,
+        source: str = "assistant",
+        tool_choice: str = "auto",
+    ):
+        """Stream an LLM response with centralized event handling.
+
+        Emits STREAM_START and TOKEN_USAGE events centrally so they can't
+        be accidentally skipped by callers. Yields all other events
+        (content, reasoning, tool_call, tool_calls_complete) for
+        caller-specific handling.
+
+        This is the DRY enforcement: both _llm_turn and
+        _reflect_on_tool_use use this, so token_usage is always
+        stored on self and emitted — it can't be forgotten.
+
+        Args:
+            messages: Messages to send to the LLM.
+            source: Source label for STREAM_START event
+                (e.g. "assistant", "reflection").
+            tool_choice: Tool choice mode ("auto", "none").
+
+        Yields:
+            (event_type, data) tuples for all non-token_usage events.
+        """
+        from agent13.llm import stream_response_with_tools
+
+        # Emit STREAM_START for TUI to reset per-stream timing
+        await self.emit(AgentEvent.STREAM_START, {"source": source})
+
+        # Get all tools including MCP tools
+        tools = await self.get_all_tools()
+
+        async for event_type, data in stream_response_with_tools(
+            self.client,
+            self.model,
+            messages,
+            self.system_prompt,
+            tools,
+            tool_choice=tool_choice,
+        ):
+            if event_type == "token_usage":
+                # Store as source of truth for context size
+                self.prompt_tokens = data.get("prompt_tokens", 0)
+                self.completion_tokens = data.get("completion_tokens", 0)
+                self.total_tokens = data.get("total_tokens", 0)
+                await self.emit(AgentEvent.TOKEN_USAGE, data)
+                if is_debug_enabled():
+                    log_tps_event(
+                        "agent_token_usage",
+                        {
+                            "prompt_tokens": data.get("prompt_tokens"),
+                            "completion_tokens": data.get("completion_tokens"),
+                            "total_tokens": data.get("total_tokens"),
+                        },
+                    )
+                # Handled centrally — don't yield to caller
+                continue
+
+            yield event_type, data
 
     async def _reflect_on_tool_use(
         self,
@@ -850,8 +956,6 @@ class Agent:
         Returns:
             The tool use summary text, or None if reflection fails.
         """
-        from agent13.llm import stream_response_with_tools
-
         # Build reflection prompt — add skill names if present
         reflection_prompt = REFLECTION_PROMPT
         if skill_names:
@@ -866,28 +970,23 @@ class Agent:
             # Set JOURNALING status so TUI shows correct spinner
             await self._set_status(AgentStatus.JOURNALING)
 
-            # Emit STREAM_START with source="reflection" so TUI shows "Reflecting" title
-            await self.emit(AgentEvent.STREAM_START, {"source": "reflection"})
-
-            # Stream the response, emitting tokens as reasoning
-            # Include tools with tool_choice="none" to preserve LCP cache
-            # matching with the main loop (which sends tools with "auto").
-            # Without tools, the serialization order diverges after the system
-            # prompt, causing massive cache misses (sim_best=0.591 vs 0.997).
-            # Note: I rolled back to tool_choice="auto" rather than "none" as I suspect this also causes issues
+            # Stream via _stream_and_emit which handles STREAM_START
+            # and TOKEN_USAGE centrally (DRY). tool_choice="auto"
+            # to preserve LCP cache matching with the main loop.
+            # Without tools, the serialization order diverges after
+            # the system prompt, causing massive cache misses
+            # (sim_best=0.591 vs 0.997).
+            # Note: I rolled back to tool_choice="auto" rather than "none"
+            # as I suspect this also causes issues.
             content_parts = []
-            tools = await self.get_all_tools()
-            async for event_type, data in stream_response_with_tools(
-                self.client,
-                self.model,
+            async for event_type, data in self._stream_and_emit(
                 temp_messages,
-                self.system_prompt,
-                tools,
+                source="reflection",
                 tool_choice="auto",
             ):
                 # Ignore tool_call events (shouldn't happen with
                 # tool_choice="none", but handle gracefully if they do)
-                if event_type in ("tool_call", "tool_calls_complete", "token_usage"):
+                if event_type in ("tool_call", "tool_calls_complete"):
                     continue
                 if data:
                     # Emit all tokens as reasoning (reflection is essentially thinking)
@@ -1035,9 +1134,11 @@ class Agent:
         )
 
         # Emit TOKEN_USAGE so the TUI can update its Ctx counter
-        # after compaction (wishlist #54). Use the LLM-reported
-        # prompt_tokens as the source of truth — this is the context
-        # size prior to compaction, not a word count estimate.
+        # after compaction (wishlist #54). The reflection API call
+        # already emitted TOKEN_USAGE with real token counts via
+        # _stream_and_emit. This supplementary emission updates the
+        # Ctx counter to the post-compaction context size.
+        # completion_tokens=0 prevents TPS miscalculation.
         await self.emit(
             AgentEvent.TOKEN_USAGE,
             {
@@ -1835,19 +1936,7 @@ class Agent:
             self.queue.complete_current()
             log_queue_complete(item.id, "error")
 
-            # Pause after error so /resume works (matches _llm_turn behavior)
-            # This handles errors that originate outside _llm_turn (e.g.
-            # retrospective journal path). _llm_turn already sets PAUSED
-            # for its own errors, so we check to avoid redundant transitions.
-            if self._pause_state != PauseState.PAUSED:
-                self._pause_state = PauseState.PAUSED
-                self._pause_event.clear()
-                await self._set_status(AgentStatus.PAUSED)
-                await self.emit(AgentEvent.PAUSED, {"reason": "error"})
-        # Preserve PAUSED status from error (set by either _llm_turn or
-        # the except block above)
-        if self._pause_state != PauseState.PAUSED:
-            await self._set_status(AgentStatus.IDLE)
+        await self._set_status(AgentStatus.IDLE)
 
     async def _llm_turn(self) -> None:
         """Execute one LLM turn (may include multiple tool call rounds).
@@ -1867,25 +1956,18 @@ class Agent:
                 if is_debug_enabled():
                     log_tps_event(
                         "agent_stream_start",
-                        {"note": "Starting stream_response_with_tools"},
+                        {"note": "Starting _stream_and_emit"},
                     )
-
-                # Emit STREAM_START for TUI to reset per-stream timing
-                await self.emit(AgentEvent.STREAM_START, {})
-
-                # Get all tools including MCP tools
-                tools = await self.get_all_tools()
 
                 # Track first tokens for status transitions
                 _first_reasoning = True
                 _first_content = True
 
-                async for event_type, data in stream_response_with_tools(
-                    self.client,
-                    self.model,
+                # Stream via _stream_and_emit which handles STREAM_START
+                # and TOKEN_USAGE centrally (DRY).
+                async for event_type, data in self._stream_and_emit(
                     self.messages,
-                    self.system_prompt,
-                    tools,
+                    source="assistant",
                 ):
                     if event_type == "content":
                         content += data
@@ -1911,21 +1993,6 @@ class Agent:
                                 "text": data,
                             },
                         )
-                    elif event_type == "token_usage":
-                        # Store as source of truth for context size
-                        self.prompt_tokens = data.get("prompt_tokens", 0)
-                        self.completion_tokens = data.get("completion_tokens", 0)
-                        self.total_tokens = data.get("total_tokens", 0)
-                        await self.emit(AgentEvent.TOKEN_USAGE, data)
-                        if is_debug_enabled():
-                            log_tps_event(
-                                "agent_token_usage",
-                                {
-                                    "prompt_tokens": data.get("prompt_tokens"),
-                                    "completion_tokens": data.get("completion_tokens"),
-                                    "total_tokens": data.get("total_tokens"),
-                                },
-                            )
                     elif event_type == "tool_calls_complete":
                         tool_calls = data["tool_calls"]
                         # Transition to TOOLING state when tools are about to execute
@@ -2277,12 +2344,6 @@ class Agent:
                         "exception": e,
                     },
                 )
-
-                # Pause after error so /resume works
-                self._pause_state = PauseState.PAUSED
-                self._pause_event.clear()  # Block so _wait_if_paused will actually wait
-                await self._set_status(AgentStatus.PAUSED)
-                await self.emit(AgentEvent.PAUSED, {"reason": "error"})
 
                 break
 

@@ -165,7 +165,7 @@ class TestCancelledErrorSkipsQueueComplete:
             dl._debug_enabled = True
             dl._log_file = tmp_path / "debug.log"
 
-            with patch("agent13.core.stream_response_with_tools", slow_stream):
+            with patch("agent13.llm.stream_response_with_tools", slow_stream):
                 agent = Agent(client=client, model="test-model")
 
                 events = []

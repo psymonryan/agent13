@@ -61,9 +61,9 @@ This means when you see the agent struggling with something, or you forgot to te
 
 **Devel mode.** Toggle developer tools on/off at runtime. Hidden tools (TUI viewer, testing utilities) shown with `--devel` flag or `/devel on` in TUI. agent13 also comes with 'self development' tools, so if you ask the agent to change itself, it has tests and tools that help it change itself.
 
-**No telemetry.** No tracking, no analytics, no phoning home. Built for clients that demand privacy, security, and sovereignty.
+**No telemetry.** No tracking, no analytics, no phoning home.
 
-**Mobile friendly.** Works over Termius and similar mobile SSH clients — full agent access from your phone or tablet.
+**Mobile friendly.** Works over Turmux/Termius and similar mobile SSH clients.
 
 ## Why agent13?
 
@@ -94,7 +94,7 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 **From GitHub release** (recommended — latest stable):
 
 ```bash
-uv tool install https://github.com/psymonryan/agent13/releases/download/v0.1.12/agent13-0.1.12-py3-none-any.whl
+uv tool install https://github.com/psymonryan/agent13/releases/download/v0.1.13/agent13-0.1.13-py3-none-any.whl
 ```
 
 **From source** (for development):
@@ -184,7 +184,9 @@ agent13 local --model 3 -p "Write a Python script to sum numbers 1 to 100"
 agent13 local --model qwen-3.5-27b
 ```
 
-Open `~/.agent13/debug.log` for detailed session events if something goes wrong. (you need to first run with --devel option)
+### Debugging
+
+Use: `uv run ./utils/analyse-debug.py` to explore the possibly huge debug.log (you need to first run with --devel option)
 
 ## Commands
 
@@ -285,4 +287,4 @@ Agent13 was bootstrapped using Mistral Vibe and then built by itself using local
 
 Inspired by the need for a lightweight, controllable agent that fits within VRAM constraints while remaining usable for long sessions.
 
-Built 100% by itself (after initial bootstrap) — dogfooding the event-driven, tool-adapted approach from day one.
+Built 100% by itself (after initial bootstrap) under frustrated (at times) human guidance. :sweat_smile:

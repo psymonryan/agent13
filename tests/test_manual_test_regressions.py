@@ -35,31 +35,18 @@ class MockClient:
 # ============================================================================
 
 class TestProcessItemErrorPath:
-    """Bug #1: _process_item except block should set PauseState.PAUSED.
+    """After _process_item exception, agent transitions to IDLE.
 
-    The _llm_turn error handler (line 2022-2026) correctly sets:
-        self._pause_state = PauseState.PAUSED
-        self._pause_event.clear()
-        await self._set_status(AgentStatus.PAUSED)
-        await self.emit(AgentEvent.PAUSED, {"reason": "error"})
-
-    But _process_item's except block (line 1579-1592) only emits ERROR
-    and completes the queue item. It does NOT set pause_state or status.
-    Line 1593-1595 preserves PAUSED if already set by _llm_turn, but
-    doesn't set it if the error came from elsewhere in _process_item.
-
-    This means: errors in the retrospective journal path, or any error
-    that doesn't originate from _llm_turn, leave the agent in RUNNING
-    state with status IDLE. /resume then says "Not paused".
+    The _process_item except block emits ERROR, completes the queue item,
+    and the agent returns to IDLE status. Errors do not pause the agent;
+    it remains ready to accept new input.
     """
 
     @pytest.mark.asyncio
-    async def test_process_item_exception_sets_paused(self):
+    async def test_process_item_exception_sets_idle(self):
         """When _process_item catches an exception outside _llm_turn,
-        it should set PauseState.PAUSED so /resume works.
-
-        We simulate this by making _reflect_on_tool_use raise an error
-        during the retrospective journal path in _process_item.
+        it should remain in RUNNING pause_state and IDLE status.
+        Errors do not pause the agent.
         """
         client = MockClient()
         agent = Agent(client=client, model="test-model")
@@ -104,9 +91,9 @@ class TestProcessItemErrorPath:
                 if any(e.event == AgentEvent.ERROR for e in events):
                     break
 
-            # After error in _process_item, should be PAUSED
-            assert agent.pause_state == PauseState.PAUSED, (
-                f"After error in _process_item, pause_state should be PAUSED, "
+            # After error in _process_item, should be RUNNING
+            assert agent.pause_state == PauseState.RUNNING, (
+                f"After error in _process_item, pause_state should be RUNNING, "
                 f"got {agent.pause_state}"
             )
 
@@ -117,8 +104,8 @@ class TestProcessItemErrorPath:
                 pass
 
     @pytest.mark.asyncio
-    async def test_process_item_exception_status_is_paused(self):
-        """After _process_item exception, agent status should be PAUSED not IDLE."""
+    async def test_process_item_exception_status_is_idle(self):
+        """After _process_item exception, agent status should be IDLE."""
         client = MockClient()
         agent = Agent(client=client, model="test-model")
         agent.journal_mode = True
@@ -157,9 +144,9 @@ class TestProcessItemErrorPath:
                 if any(e.event == AgentEvent.ERROR for e in events):
                     break
 
-            # Status should be PAUSED, not IDLE
-            assert agent.status == AgentStatus.PAUSED, (
-                f"After error in _process_item, status should be PAUSED, "
+            # Status should be IDLE after error
+            assert agent.status == AgentStatus.IDLE, (
+                f"After error in _process_item, status should be IDLE, "
                 f"got {agent.status}"
             )
 
@@ -170,8 +157,9 @@ class TestProcessItemErrorPath:
                 pass
 
     @pytest.mark.asyncio
-    async def test_resume_works_after_process_item_error(self):
-        """After _process_item exception, agent.resume() should return True."""
+    async def test_resume_returns_false_after_process_item_error(self):
+        """After _process_item exception, agent.resume() should return False
+        because the agent is not paused (it's in IDLE status)."""
         client = MockClient()
         agent = Agent(client=client, model="test-model")
         agent.journal_mode = True
@@ -216,12 +204,11 @@ class TestProcessItemErrorPath:
             except asyncio.CancelledError:
                 pass
 
-            # resume() should return True (currently returns False
-            # because pause_state is RUNNING, not PAUSED)
+            # resume() should return False (agent is not paused after error)
             result = agent.resume()
-            assert result is True, (
-                f"After error in _process_item, resume() should return True. "
-                f"Got False because pause_state={agent.pause_state}"
+            assert result is False, (
+                "After error in _process_item, resume() should return False "
+                f"(agent is IDLE, not PAUSED). Got {result}"
             )
 
 

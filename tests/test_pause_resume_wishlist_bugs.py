@@ -195,7 +195,7 @@ class TestResumeDuringPausing:
         agent = Agent(client=client, model="test-model")
 
         # Patch stream_response_with_tools to use our slow mock
-        with patch("agent13.core.stream_response_with_tools", slow_stream):
+        with patch("agent13.llm.stream_response_with_tools", slow_stream):
             await agent.add_message("Hello")
 
             # Start first run
@@ -346,7 +346,7 @@ class TestStatusAfterResume:
             if event.event == AgentEvent.STATUS_CHANGE:
                 status_changes.append(event.data.get("status"))
 
-        with patch("agent13.core.stream_response_with_tools", mock_stream):
+        with patch("agent13.llm.stream_response_with_tools", mock_stream):
             # Start the agent
             await agent.add_message("First message")
             task = asyncio.create_task(agent.run())
@@ -430,7 +430,7 @@ class TestStatusAfterResume:
         async def handler(event):
             event_log.append((event.event, event.data.copy() if event.data else {}))
 
-        with patch("agent13.core.stream_response_with_tools", mock_stream):
+        with patch("agent13.llm.stream_response_with_tools", mock_stream):
             # Start agent and get it processing
             await agent.add_message("Hello")
             task = asyncio.create_task(agent.run())

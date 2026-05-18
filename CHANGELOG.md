@@ -5,6 +5,23 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.13] - 2026-05-19
+
+### Changed
+
+- added Textual screen shot to doco
+- reverted the code that pauses after error
+- added previous turn count to /status for loaded sessions
+- changes to dur: in status bar to remain as last: when turn ends
+- added /status command
+- tps calculation finetune to avoid inaccurate assessment for short messages
+- updated AGENTS.md with information about ./utils/analyse-debug.py
+- fixed reasoning widget collapse to only trigger on header click
+- fixed journal loop issue when skills loaded
+- Readme fixes and tweak to release script
+- fix tab completion for names with spaces
+- fix for tab completion regression
+
 ## [0.1.12] - 2026-05-13
 
 ### Changed

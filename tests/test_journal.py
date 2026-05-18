@@ -1538,3 +1538,135 @@ class TestJournalAllIterative:
         # user1 + asst1 + user2 + asst2 = 4 messages
         assert len(agent.messages) == 4
         assert not agent._has_tool_calls()
+
+
+class TestSkillJournalCompaction:
+    """Tests for skill tool call compaction in journal mode.
+
+    After compacting a turn that contained skill calls, the preserved
+    skill messages must be converted to text-only format (no tool_calls,
+    no tool role) to prevent _find_earliest_tool_turn from re-finding
+    the same turn and causing an infinite compaction loop.
+    """
+
+    def _make_skill_turn_messages(self) -> list[dict]:
+        """Create messages for a turn with a skill call + regular tool call."""
+        return [
+            {"role": "user", "content": "Review the auth module"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_skill",
+                        "type": "function",
+                        "function": {
+                            "name": "skill",
+                            "arguments": '{"name": "code-review"}',
+                        },
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call_skill",
+                "content": "Skill code-review loaded: Follow these guidelines...",
+            },
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_read",
+                        "type": "function",
+                        "function": {"name": "read_file", "arguments": "{}"},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call_read", "content": "auth.py contents"},
+            {"role": "assistant", "content": "Here's my review of auth.py"},
+        ]
+
+    @pytest.mark.asyncio
+    async def test_compacted_skill_turn_has_no_tool_calls(self):
+        """After compacting a skill turn, messages must have no tool_calls
+        or tool-role messages. Otherwise _find_earliest_tool_turn re-finds
+        the same turn, causing an infinite compaction loop."""
+        client = MockClient()
+        agent = Agent(client, model="test-model")
+        agent.messages = self._make_skill_turn_messages()
+
+        async def mock_reflect(self=None, skill_names=None, messages=None):
+            return "Used code-review skill and read_file"
+
+        agent._reflect_on_tool_use = mock_reflect
+
+        success, message = await agent.journal_last_turn()
+        assert success is True
+
+        # The critical assertion: no tool_calls or tool-role messages remain
+        assert not agent._has_tool_calls(), (
+            f"Compacted turn still has tool_calls/tool messages: "
+            f"{[m.get('tool_calls', m.get('role')) for m in agent.messages]}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_journal_all_skill_turn_no_re_compaction(self):
+        """journal_all with a skill turn should reflect exactly once per turn,
+        not loop infinitely. If preserved skill messages still have
+        tool_calls, _find_earliest_tool_turn re-finds the same turn."""
+        client = MockClient()
+        agent = Agent(client, model="test-model")
+        agent.messages = self._make_skill_turn_messages()
+
+        reflect_count = 0
+
+        async def mock_reflect(self=None, skill_names=None, messages=None):
+            nonlocal reflect_count
+            reflect_count += 1
+            if reflect_count > 2:
+                raise AssertionError(
+                    f"Too many reflections ({reflect_count}) — "
+                    f"likely infinite compaction loop"
+                )
+            return f"Summary of tool use round {reflect_count}"
+
+        agent._reflect_on_tool_use = mock_reflect
+
+        success, message = await agent.journal_all()
+        assert success is True
+        # Should reflect exactly once for the single turn
+        assert reflect_count == 1, (
+            f"Expected 1 reflection, got {reflect_count} — "
+            f"compaction loop detected"
+        )
+
+    @pytest.mark.asyncio
+    async def test_compacted_skill_turn_preserves_content(self):
+        """After compacting a skill turn, the skill content must still be
+        present in the messages (as text, not as tool_calls). The LLM
+        needs the skill guidelines to remain in context."""
+        client = MockClient()
+        agent = Agent(client, model="test-model")
+        agent.messages = self._make_skill_turn_messages()
+
+        async def mock_reflect(self=None, skill_names=None, messages=None):
+            return "Used code-review skill and read_file"
+
+        agent._reflect_on_tool_use = mock_reflect
+
+        success, message = await agent.journal_last_turn()
+        assert success is True
+
+        # The skill content must still be present somewhere
+        all_content = " ".join(
+            m.get("content", "") for m in agent.messages if m.get("content")
+        )
+        assert "code-review" in all_content, (
+            f"Skill name missing from compacted messages. "
+            f"Content: {all_content[:200]}"
+        )
+        assert "guidelines" in all_content.lower(), (
+            f"Skill content missing from compacted messages. "
+            f"Content: {all_content[:200]}"
+        )

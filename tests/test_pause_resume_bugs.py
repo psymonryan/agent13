@@ -2,9 +2,9 @@
 
 Bug #1 (wishlist line 29): /pause says "paused" but a bash tool keeps running.
 Bug #2 (wishlist line 28): After an error, /resume says "not paused".
-
-These tests verify the state machine behaves correctly at the agent (core) level.
-TUI-level bugs are consequences of the agent-level state being wrong.
+    Resolution: We no longer pause after errors. /resume is for
+    user-initiated pauses; after an error the agent returns to IDLE
+    and the user should /retry directly.
 """
 
 import asyncio
@@ -35,19 +35,21 @@ def _make_tool_call(name: str, args: dict, call_id: str = "call_1") -> dict:
 
 
 class TestPauseResumeAfterError:
-    """Bug #2: After an error, the agent should be in a state where resume works.
+    """After an error, the agent returns to IDLE (not PAUSED).
 
-    Currently: after an API error, agent._paused is False and agent status is IDLE.
-    /resume checks agent._paused and says "Not paused" because it's False.
-    Expected: after an error, the agent should be paused so /resume can continue.
+    Previously we paused after error so /resume would work, but /resume
+    alone doesn't re-attempt the failed turn — the user needs /retry
+    anyway. Pausing just adds a useless intermediate step.
+    Now: error → IDLE, user can /retry directly.
     """
 
     @pytest.mark.asyncio
-    async def test_agent_is_paused_after_api_error(self):
-        """After an API error during processing, agent should be paused (not just idle).
+    async def test_agent_is_idle_after_api_error(self):
+        """After an API error, agent should be idle (not paused).
 
-        This allows /resume to work. Currently the agent transitions to IDLE
-        with _paused=False, making /resume fail with "Not paused".
+        Pausing after error doesn't help — /resume alone doesn't
+        re-attempt the turn. The user needs /retry which works from
+        IDLE state.
         """
         client = MockClient()
         # Make the API fail
@@ -85,19 +87,18 @@ class TestPauseResumeAfterError:
         error_events = [e for e in events if e.event == AgentEvent.ERROR]
         assert len(error_events) > 0, "Should have received an ERROR event"
 
-        # The bug: after error, agent is not paused, so /resume says "Not paused"
-        # Expected: agent should be paused so user can resume
-        assert agent.is_paused, (
-            "After an API error, agent should be paused so /resume works. "
+        # After error, agent should be IDLE (not paused)
+        assert not agent.is_paused, (
+            "After an API error, agent should be IDLE so /retry works directly. "
             f"Got is_paused={agent.is_paused}, status={agent.status}"
         )
 
     @pytest.mark.asyncio
-    async def test_agent_status_is_paused_after_api_error(self):
-        """After an API error, agent status should be PAUSED, not IDLE.
+    async def test_agent_status_is_idle_after_api_error(self):
+        """After an API error, agent status should be IDLE, not PAUSED.
 
-        If status is IDLE, the user has no visual indication that the agent
-        is in a recoverable state. PAUSED signals "you can /resume".
+        PAUSED is for user-initiated pauses. After an error the agent
+        should return to IDLE so the user can /retry immediately.
         """
         client = MockClient()
         client.chat.completions.create = AsyncMock(
@@ -124,8 +125,8 @@ class TestPauseResumeAfterError:
         error_events = [e for e in events if e.event == AgentEvent.ERROR]
         assert len(error_events) > 0
 
-        assert agent.status == AgentStatus.PAUSED, (
-            f"After API error, status should be PAUSED, got {agent.status}"
+        assert agent.status == AgentStatus.IDLE, (
+            f"After API error, status should be IDLE, got {agent.status}"
         )
 
         agent.stop()
@@ -135,11 +136,10 @@ class TestPauseResumeAfterError:
             pass
 
     @pytest.mark.asyncio
-    async def test_resume_works_after_api_error(self):
-        """After an API error, agent.resume() should return True (not False).
+    async def test_resume_returns_false_after_api_error(self):
+        """After an API error, resume() should return False (agent is not paused).
 
-        Currently resume() checks `if not self._paused: return False`.
-        After an error, _paused is False so resume returns False.
+        The user should use /retry instead, which works from IDLE state.
         """
         client = MockClient()
         client.chat.completions.create = AsyncMock(
@@ -168,11 +168,11 @@ class TestPauseResumeAfterError:
         except asyncio.CancelledError:
             pass
 
-        # Bug: resume() returns False because _paused is False
+        # After error, agent is IDLE so resume() returns False
         result = agent.resume()
-        assert result is True, (
-            "After API error, resume() should return True. "
-            "Currently returns False because _paused is not set."
+        assert result is False, (
+            "After API error, resume() should return False (agent is IDLE, not paused). "
+            "Use /retry instead."
         )
 
 

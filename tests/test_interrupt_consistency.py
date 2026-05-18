@@ -77,7 +77,7 @@ class TestInterruptMessageConsistency:
             await asyncio.sleep(10)  # Give us time to interrupt
             yield "content", "the tables"  # Won't reach this
 
-        with patch("agent13.core.stream_response_with_tools", slow_stream):
+        with patch("agent13.llm.stream_response_with_tools", slow_stream):
             agent = Agent(client=client, model="test-model")
 
             events = []
@@ -167,7 +167,7 @@ class TestInterruptMessageConsistency:
             await asyncio.sleep(10)
             return "done"
 
-        with patch("agent13.core.stream_response_with_tools", stream_with_tool_calls):
+        with patch("agent13.llm.stream_response_with_tools", stream_with_tool_calls):
             with patch.object(Agent, "_execute_tool_async", slow_tool_exec):
                 agent = Agent(client=client, model="test-model")
 
@@ -226,7 +226,7 @@ class TestInterruptMessageConsistency:
             yield "content", "I will "
             await asyncio.sleep(10)
 
-        with patch("agent13.core.stream_response_with_tools", slow_stream):
+        with patch("agent13.llm.stream_response_with_tools", slow_stream):
             agent = Agent(client=client, model="test-model")
 
             events = []
@@ -290,7 +290,7 @@ class TestInterruptStateConsistency:
             yield "content", "Working"
             await asyncio.sleep(10)
 
-        with patch("agent13.core.stream_response_with_tools", slow_stream):
+        with patch("agent13.llm.stream_response_with_tools", slow_stream):
             agent = Agent(client=client, model="test-model")
 
             events = []
@@ -331,7 +331,7 @@ class TestInterruptStateConsistency:
             yield "content", "Working"
             await asyncio.sleep(10)
 
-        with patch("agent13.core.stream_response_with_tools", slow_stream):
+        with patch("agent13.llm.stream_response_with_tools", slow_stream):
             agent = Agent(client=client, model="test-model")
 
             events = []

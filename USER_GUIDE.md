@@ -55,7 +55,7 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 Install package directly from github:
 
 ```
-uv tool install https://github.com/psymonryan/agent13/releases/download/v0.1.12/agent13-0.1.12-py3-none-any.whl
+uv tool install https://github.com/psymonryan/agent13/releases/download/v0.1.13/agent13-0.1.13-py3-none-any.whl
 ```
 
 Or install from source (for hacking on the agent itself):
@@ -148,6 +148,8 @@ The TUI provides:
 - **Auto-save on exit** - Conversations saved to `~/.agent13/saves/`
 - Manual save of entire session (-y to force over an old one)
 
+![Textual TUI](images/Textual_TUI.png)
+
 ### Batch Mode
 
 One-shot processing for scripting and automation:
@@ -231,9 +233,9 @@ The `Agent` constructor accepts:
 | `--model`                   | Select model by name or number; with no value, lists models | prompts interactively |
 | `--system-prompt`           | System prompt to use                                        | default               |
 | `--sandbox`                 | Sandbox mode (permissive-open, permissive-closed, etc.)     | permissive-open       |
-| `--pretty on\|off`          | Enable/disable markdown rendering                          | on                    |
+| `--pretty on\|off`          | Enable/disable markdown rendering                           | on                    |
 | `--debug`                   | Enable debug logging                                        | off                   |
-| `--tool-response raw\|json` | Tool response format                                       | raw                   |
+| `--tool-response raw\|json` | Tool response format                                        | raw                   |
 | `--mcp`                     | Connect to MCP servers on startup (TUI only)                | off                   |
 | `--skills`                  | Include discovered skills in the system prompt              | off                   |
 | `--journal`                 | Enable journal mode (context compaction)                    | off                   |
@@ -241,7 +243,7 @@ The `Agent` constructor accepts:
 | `--remove-reasoning`        | Strip reasoning tokens between turns                        | off                   |
 | `-c`, `--continue`          | Continue from last auto-saved session                       | —                     |
 | `--devel`                   | Enable devel mode (show devel-group tools)                  | off                   |
-| `--spinner fast\|slow\|off` | Spinner style                                              | fast                  |
+| `--spinner fast\|slow\|off` | Spinner style                                               | fast                  |
 | `--upgrade`                 | Check for updates and apply, then exit                      | —                     |
 | `--clipboard osc52\|system` | Clipboard method for this session                           | osc52                 |
 
@@ -270,7 +272,8 @@ Commands are typed in the input field with a `/` prefix:
 
 | Command             | Description                                            |
 | ------------------- | ------------------------------------------------------ |
-| `/help`             | Show available commands                                |
+| `/help`             | Show commands and keyboard shortcuts                   |
+| `/status`           | Show session status, settings, and save info           |
 | `/quit` `/exit`     | Exit the application                                   |
 | `/clear`            | Clear conversation context                             |
 | `/clear all`        | Clear conversation and reset UI widgets                |
@@ -387,12 +390,12 @@ agent13 http://localhost:8012/v1 --model devstral2
 - Default `connect_timeout` is 30 seconds — increase to `60` for remote servers with cold starts
 - If you see `ReadTimeout` errors, increase `read_timeout`
 
-| Model type | Recommended `read_timeout` |
-|---|---|
-| Fast local (7B–14B) | `600` |
-| Fast cloud (OpenRouter, OpenAI) | `300` |
-| Slower models (DeepSeek-R1, GLM-5.1) | `2400` |
-| Slow local server | `2400` |
+| Model type                           | Recommended `read_timeout` |
+| ------------------------------------ | -------------------------- |
+| Fast local (7B–14B)                  | `600`                      |
+| Fast cloud (OpenRouter, OpenAI)      | `300`                      |
+| Slower models (DeepSeek-R1, GLM-5.1) | `2400`                     |
+| Slow local server                    | `2400`                     |
 
 ### MCP Server Configuration
 
@@ -593,7 +596,8 @@ Agent13 ships with these skills (copied to `~/.agent13/skills/` on first run):
   1. Project directory: `.agent13/skills/`
   2. Global directory: `~/.agent13/skills/`
   3. Bundled defaults: `agent13/default_skills/` (auto-copied to global on first run)
-## Queue and Priority
+     
+     ## Queue and Priority
 
 Agent13 uses a message queue to manage multiple prompts:
 
@@ -654,7 +658,7 @@ Manual save/load: (this saves in current working directory. ie: ./agent13/saves)
 /load my-session     # Load a saved context
 ```
 
-Saves are stored in `~/.agent13/saves/`.
+Saves are stored in `~/.agent13/saves/`. Use `/status` to check session state, turn stats, and whether a restorable auto-save is available.
 
 ## Journal Mode
 

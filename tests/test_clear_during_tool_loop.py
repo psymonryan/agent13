@@ -61,7 +61,7 @@ class TestDeferredClearDuringToolLoop:
         # Build mock stream that produces tool calls then a final response.
         call_count = 0
 
-        async def mock_stream(client_arg, model, messages, system_prompt, tools):
+        async def mock_stream(client_arg, model, messages, system_prompt, tools, **kwargs):
             nonlocal call_count
             call_count += 1
             # Capture what messages the API would receive
@@ -103,7 +103,7 @@ class TestDeferredClearDuringToolLoop:
 
         agent._set_status = hooked_set_status
 
-        with patch("agent13.core.stream_response_with_tools", side_effect=mock_stream):
+        with patch("agent13.llm.stream_response_with_tools", side_effect=mock_stream):
             # Run the LLM turn
             await agent._llm_turn()
 

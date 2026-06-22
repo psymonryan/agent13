@@ -1,6 +1,6 @@
 [project]
 name = "agent13"
-version = "0.1.13"
+version = "0.2.0"
 description = "Context-lean AI agent - minimal VRAM fits in a small cupboard, a postbox or even a clock"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -24,10 +24,11 @@ dev = [
     "pytest",
     "pytest-asyncio",
     "responses",
-    "prompt_toolkit",
     "pexpect",
     "ruff>=0.15.12",
     "pip-audit",
+    "pytest-httpserver>=1.1.5",
+    "pyreadline3; sys_platform == 'win32'",
 ]
 
 [project.scripts]

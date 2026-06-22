@@ -15,6 +15,7 @@ These tests verify:
 """
 
 import os
+from pathlib import Path
 from tools.edit_file import (
     edit_file,
     _snapshots,
@@ -22,6 +23,11 @@ from tools.edit_file import (
     MAX_SNAPSHOTS_PER_FILE,
 )
 from agent13.sandbox import get_temp_dir
+
+
+def resolved(path: str) -> str:
+    """Resolve a path the same way edit_file does — for snapshot key lookups."""
+    return str(Path(path).expanduser().resolve())
 
 
 def create_test_file(content: str, name: str = "test_snap.py") -> str:
@@ -206,7 +212,7 @@ class TestFIFOEviction:
             for i in range(MAX_SNAPSHOTS_PER_FILE + 2):
                 edit_file(fp, find=f"v{i}", content=f"v{i + 1}")
             # After 12 edits with cap=10, snapshots 0 and 1 should be evicted
-            keys = sorted(_snapshots[fp].keys())
+            keys = sorted(_snapshots[resolved(fp)].keys())
             assert 0 not in keys
             assert 1 not in keys
             assert len(keys) <= MAX_SNAPSHOTS_PER_FILE

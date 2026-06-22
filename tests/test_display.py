@@ -98,15 +98,15 @@ class TestRichDisplay:
 
     def test_add_token_plain_mode(self):
         """Should print tokens directly in plain mode."""
-        display = RichDisplay(pretty=False)
+        console = MagicMock(spec=Console)
+        display = RichDisplay(console=console, pretty=False)
 
         display.start_response()
-        with patch("builtins.print") as mock_print:
-            display.add_token("Hello")
-            display.add_token("World")
+        display.add_token("Hello")
+        display.add_token("World")
 
-            # Plain mode prints directly
-            assert mock_print.call_count >= 2
+        # Plain mode prints directly via console
+        assert console.print.call_count >= 2
 
     def test_add_reasoning_pretty(self):
         """Should print reasoning in italic in pretty mode."""
@@ -122,13 +122,13 @@ class TestRichDisplay:
 
     def test_add_reasoning_plain(self):
         """Should print reasoning without styling in plain mode."""
-        display = RichDisplay(pretty=False)
+        console = MagicMock(spec=Console)
+        display = RichDisplay(console=console, pretty=False)
 
-        with patch("builtins.print") as mock_print:
-            display.add_reasoning("thinking...")
+        display.add_reasoning("thinking...")
 
-            # Should print without styling
-            mock_print.assert_called()
+        # Should print via console (Thinking: prefix + text)
+        assert console.print.call_count >= 1
 
     def test_reasoning_to_content_transition(self):
         """Should handle transition from reasoning to content."""
@@ -142,35 +142,6 @@ class TestRichDisplay:
         display.start_response()
         assert display._in_content is True
 
-    def test_complete_response_shows_timing(self):
-        """Should show elapsed time on completion."""
-        console = MagicMock(spec=Console)
-        display = RichDisplay(console=console, pretty=True)
-
-        display._response_start_time = time.time() - 1.5  # 1.5 seconds ago
-        display._response_buffer = "Hello"
-
-        display.complete_response()
-
-        # Should have printed timing
-        console.print.assert_called()
-        # Check that timing was printed (format: (X.XXs))
-        calls_str = str(console.print.call_args_list)
-        assert "s)" in calls_str
-
-    def test_complete_response_plain_mode(self):
-        """Should show timing in plain mode."""
-        display = RichDisplay(pretty=False)
-
-        display._response_start_time = time.time() - 0.5
-        display._response_buffer = "Hello"
-
-        with patch("builtins.print") as mock_print:
-            display.complete_response()
-
-            # Should have printed timing
-            mock_print.assert_called()
-
     def test_show_tool_call_pretty(self):
         """Should show tool call in panel in pretty mode."""
         console = MagicMock(spec=Console)
@@ -183,13 +154,13 @@ class TestRichDisplay:
 
     def test_show_tool_call_plain(self):
         """Should show tool call as text in plain mode."""
-        display = RichDisplay(pretty=False)
+        console = MagicMock(spec=Console)
+        display = RichDisplay(console=console, pretty=False)
 
-        with patch("builtins.print") as mock_print:
-            display.show_tool_call("square_number", {"n": 5})
+        display.show_tool_call("square_number", {"n": 5})
 
-            # Should have printed text
-            mock_print.assert_called()
+        # Should have printed via console
+        assert console.print.call_count >= 1
 
     def test_show_tool_result(self):
         """Should show tool result."""
@@ -224,13 +195,14 @@ class TestRichDisplay:
         assert "red" in call_args.lower()
 
     def test_show_error_plain(self):
-        """Should show error to stderr in plain mode."""
-        display = RichDisplay(pretty=False)
+        """Should show error in plain mode."""
+        console = MagicMock(spec=Console)
+        display = RichDisplay(console=console, pretty=False)
 
-        with patch("builtins.print") as mock_print:
-            display.show_error("Something went wrong")
+        display.show_error("Something went wrong")
 
-            mock_print.assert_called()
+        # Should have printed via console
+        assert console.print.call_count >= 1
 
     def test_show_separator_pretty(self):
         """Should show separator in pretty mode."""
@@ -262,12 +234,12 @@ class TestRichDisplay:
 
     def test_print_without_style(self):
         """Should print without styling in plain mode."""
-        display = RichDisplay(pretty=False)
+        console = MagicMock(spec=Console)
+        display = RichDisplay(console=console, pretty=False)
 
-        with patch("builtins.print") as mock_print:
-            display._print("Hello")
+        display._print("Hello")
 
-            mock_print.assert_called_with("Hello", end="\n", flush=False)
+        console.print.assert_called_with("Hello", end="\n", highlight=False)
 
     def test_reset_state_on_start_response(self):
         """Should reset state when starting new response."""

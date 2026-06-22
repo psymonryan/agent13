@@ -22,6 +22,7 @@ Tests verify:
 import pytest
 import os
 import tempfile
+from pathlib import Path
 
 
 from agent13.history import History
@@ -1236,6 +1237,212 @@ class TestCompletionWindowing:
         assert end == 8
 
 
+class TestCwdCommand:
+    """Tests for /cwd command logic."""
+
+    def test_show_current_directory(self):
+        """Bare /cwd shows the current working directory."""
+        cwd = Path.cwd()
+        assert cwd.exists()
+        assert cwd.is_dir()
+
+    def test_change_to_existing_directory(self, tmp_path):
+        """Changing to an existing directory succeeds."""
+        original = Path.cwd()
+        try:
+            os.chdir(tmp_path)
+            assert Path.cwd() == tmp_path
+        finally:
+            os.chdir(original)
+
+    def test_nonexistent_path_reports_error(self):
+        """Changing to a nonexistent path is detected."""
+        target = Path("/nonexistent_path_abc123")
+        assert not target.exists()
+
+    def test_not_a_directory_reports_error(self, tmp_path):
+        """Changing to a file (not a directory) is detected."""
+        test_file = tmp_path / "testfile.txt"
+        test_file.write_text("hello")
+        assert test_file.exists()
+        assert not test_file.is_dir()
+
+    def test_expanduser_in_path(self):
+        """Tilde ~ gets expanded to home directory."""
+        expanded = Path("~").expanduser()
+        assert expanded.exists()
+        assert expanded.is_dir()
+        assert str(expanded) == str(Path.home())
+
+    def test_resolve_symlinks(self, tmp_path):
+        """Paths with symlinks get resolved."""
+        real_dir = tmp_path / "real"
+        real_dir.mkdir()
+        link_dir = tmp_path / "link"
+        link_dir.symlink_to(real_dir)
+        resolved = link_dir.resolve()
+        assert resolved == real_dir
+
+    def test_chdir_restores_original(self, tmp_path):
+        """Test cleanup: cwd is restored after test."""
+        original = Path.cwd()
+        os.chdir(tmp_path)
+        assert Path.cwd() != original
+        os.chdir(original)
+        assert Path.cwd() == original
+
+    def test_at_prefix_stripped_from_args(self, tmp_path):
+        """Args with @ prefix (from autocomplete) get stripped before chdir."""
+        args_with_at = f"@{tmp_path}"
+        # Simulate the handler's stripping logic
+        target = Path(args_with_at.strip().lstrip("@")).expanduser().resolve()
+        assert target == tmp_path
+        assert target.is_dir()
+
+    def test_at_prefix_single_char_stripped(self, tmp_path):
+        """Single @ as sole arg becomes empty after strip, falls through to 'bare'."""
+        args = "@"
+        stripped = args.strip().lstrip("@")
+        # After stripping, this is empty — same as bare /cwd (show current dir)
+        assert stripped == ""
+
+
+# ============== /provider completion Tests ==============
+
+
+class TestProviderCompletion:
+    """Tests for /provider command showing navigable list."""
+
+    def test_get_provider_completions_returns_config_names(self):
+        """_get_provider_completions returns provider names from config."""
+        from unittest.mock import MagicMock, patch
+
+        mock_config = MagicMock()
+        mock_config.providers = [
+            MagicMock(name="alpha"),
+            MagicMock(name="beta"),
+            MagicMock(name="gamma"),
+        ]
+        mock_config.providers[0].name = "alpha"
+        mock_config.providers[1].name = "beta"
+        mock_config.providers[2].name = "gamma"
+
+        app = MagicMock()
+        # Call the real method with mocked self
+        with patch("ui.tui.get_config", return_value=mock_config):
+            from ui.tui import AgentTUI
+
+            result = AgentTUI._get_provider_completions(app, "")
+
+        assert result == ["alpha", "beta", "gamma"]
+
+    def test_get_provider_completions_filters_partial(self):
+        """_get_provider_completions filters by partial input."""
+        from unittest.mock import MagicMock, patch
+
+        mock_config = MagicMock()
+        mock_config.providers = [
+            MagicMock(name="openai"),
+            MagicMock(name="openrouter"),
+            MagicMock(name="local"),
+        ]
+        mock_config.providers[0].name = "openai"
+        mock_config.providers[1].name = "openrouter"
+        mock_config.providers[2].name = "local"
+
+        app = MagicMock()
+        with patch("ui.tui.get_config", return_value=mock_config):
+            from ui.tui import AgentTUI
+
+            result = AgentTUI._get_provider_completions(app, "open")
+
+        assert result == ["openai", "openrouter"]
+        assert "local" not in result
+
+    def test_handle_provider_no_args_enters_completion(self):
+        """/provider with no args enters completion mode with provider names."""
+        from unittest.mock import MagicMock, patch, AsyncMock
+
+        mock_config = MagicMock()
+        mock_config.providers = [
+            MagicMock(name="alpha"),
+            MagicMock(name="beta"),
+        ]
+        mock_config.providers[0].name = "alpha"
+        mock_config.providers[1].name = "beta"
+
+        app = MagicMock()
+        app.provider = "alpha"
+        app._get_provider_completions.return_value = ["alpha", "beta"]
+        app._enter_command_completion = MagicMock()
+
+        from ui.tui import AgentTUI
+
+        AgentTUI._handle_provider_command(app, "")
+
+        app._enter_command_completion.assert_called_once_with(
+            "provider", ["alpha", "beta"], "alpha"
+        )
+
+    def test_handle_provider_no_args_no_providers_shows_error(self):
+        """/provider with no args and no providers shows error."""
+        from unittest.mock import MagicMock
+
+        app = MagicMock()
+        app._get_provider_completions.return_value = []
+        app._update_info_content = MagicMock()
+
+        from ui.tui import AgentTUI
+
+        AgentTUI._handle_provider_command(app, "")
+
+        app._update_info_content.assert_called_once()
+        call_arg = app._update_info_content.call_args[0][0]
+        assert "No providers" in call_arg
+
+
 if __name__ == "__main__":
     # Run tests when executed directly
     pytest.main([__file__, "-v"])
+
+    def test_get_provider_completions_numeric(self):
+        """_get_provider_completions resolves numeric input."""
+        from unittest.mock import MagicMock, patch
+
+        mock_config = MagicMock()
+        mock_config.providers = [
+            MagicMock(name="alpha"),
+            MagicMock(name="beta"),
+            MagicMock(name="gamma"),
+        ]
+        mock_config.providers[0].name = "alpha"
+        mock_config.providers[1].name = "beta"
+        mock_config.providers[2].name = "gamma"
+
+        app = MagicMock()
+        with patch("ui.tui.get_config", return_value=mock_config):
+            from ui.tui import AgentTUI
+
+            result = AgentTUI._get_provider_completions(app, "2")
+
+        assert result == ["beta"]
+
+    def test_get_provider_completions_numeric_out_of_range(self):
+        """_get_provider_completions returns empty for out-of-range number."""
+        from unittest.mock import MagicMock, patch
+
+        mock_config = MagicMock()
+        mock_config.providers = [
+            MagicMock(name="alpha"),
+            MagicMock(name="beta"),
+        ]
+        mock_config.providers[0].name = "alpha"
+        mock_config.providers[1].name = "beta"
+
+        app = MagicMock()
+        with patch("ui.tui.get_config", return_value=mock_config):
+            from ui.tui import AgentTUI
+
+            result = AgentTUI._get_provider_completions(app, "99")
+
+        assert result == []

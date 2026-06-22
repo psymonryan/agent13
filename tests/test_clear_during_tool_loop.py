@@ -1,16 +1,20 @@
-"""Tests for deferred /clear, /load, /retry commands (L34 bug fix).
+"""Tests for deferred /clear and /load commands, and sync /retry command.
 
-Bug: clear_messages(), load_context(), and retry message deletion all
-mutate self.messages synchronously from the TUI while _llm_turn() may
-be mid-loop. After tool results are appended, the loop continues to the
-next LLM call with a corrupted message list (no user message, just
-orphaned assistant+tool messages), causing a 500 "No user query found
-in messages" error.
+Bug (L34): clear_messages() and load_context() mutate self.messages
+synchronously from the TUI while _llm_turn() may be mid-loop. After tool
+results are appended, the loop continues to the next LLM call with a
+corrupted message list (no user message, just orphaned assistant+tool
+messages), causing a 500 "No user query found in messages" error.
 
-Fix: All three commands now use queue items (kind="clear"/"load"/"retry")
-that are processed at safe boundaries between items in _process_item,
-never mid-loop. The TUI calls request_clear()/request_load()/request_retry()
-which add queue items, and the agent processes them when idle.
+Fix: /clear and /load use queue items (kind="clear"/"load") that are
+processed at safe boundaries between items in _process_item, never
+mid-loop. The TUI calls request_clear()/request_load() which add queue
+items, and the agent processes them when idle.
+
+/retry was previously deferred too (kind="retry") but is now synchronous:
+execute_retry() checks agent.is_idle and deletes the last message group
+directly, returning user_text for the caller to re-queue. This is safe
+because /retry is only used when the agent is idle after an error.
 """
 
 import pytest
@@ -18,6 +22,7 @@ import asyncio
 import json
 from unittest.mock import MagicMock, patch
 from agent13 import Agent, AgentEvent, AgentStatus
+from agent13.commands import execute_retry, execute_prioritise, execute_deprioritise
 
 
 def _make_tool_call(call_id, name, args):
@@ -235,49 +240,14 @@ class TestDeferredLoadDuringToolLoop:
         assert load_items[0].id == item_id
 
 
-class TestDeferredRetryDuringToolLoop:
-    """Test that request_retry() defers the retry to a safe boundary."""
+class TestExecuteRetry:
+    """Test the sync execute_retry shared command."""
 
-    @pytest.mark.asyncio
-    async def test_request_retry_defers_to_queue(self):
-        """request_retry() adds a queue item instead of deleting messages
-        immediately.
-
-        When /retry deleted messages by index directly from the TUI, it
-        could corrupt self.messages while _llm_turn was mid-loop. With
-        request_retry(), the deletion is deferred to a queue item.
-        """
+    def test_retry_deletes_last_group_and_returns_text(self):
+        """execute_retry deletes the last message group and returns user text."""
         client = MagicMock()
         agent = Agent(client, model="test-model")
-
-        # Set up some messages
-        agent.messages = [
-            {"role": "user", "content": "Hello"},
-            {"role": "assistant", "content": "Hi"},
-        ]
-
-        # request_retry() should add a queue item, not delete messages
-        item_id = await agent.request_retry()
-
-        # Messages should still be intact (not deleted)
-        assert len(agent.messages) == 2
-
-        # The retry should be pending in the queue
-        retry_items = [i for i in agent.queue.list_items() if i.kind == "retry"]
-        assert len(retry_items) == 1, (
-            "Retry should be pending in queue as kind='retry' item"
-        )
-        assert retry_items[0].id == item_id
-
-    @pytest.mark.asyncio
-    async def test_retry_via_process_item_deletes_group(self):
-        """A kind='retry' queue item processed by _process_item deletes
-        the last message group and emits RETRY_STARTED with the user text.
-        """
-        client = MagicMock()
-        agent = Agent(client, model="test-model")
-
-        # Set up messages with two groups
+        agent._status = AgentStatus.IDLE  # Agent must be idle
         agent.messages = [
             {"role": "user", "content": "First question"},
             {"role": "assistant", "content": "First answer"},
@@ -285,61 +255,124 @@ class TestDeferredRetryDuringToolLoop:
             {"role": "assistant", "content": "Second answer"},
         ]
 
-        # Capture events
-        events_received = []
+        result = execute_retry(agent)
 
-        async def on_event(event_data):
-            events_received.append(event_data)
-
-        agent.on_event(on_event)
-
-        # Add a retry item to the queue
-        agent.queue.add("", kind="retry")
-
-        # Process it
-        item = agent.queue.get_next()
-        await agent._process_item(item)
-
-        # Last group should be deleted (second question + answer)
+        assert result.success
+        assert result.data["user_text"] == "Second question"
         assert len(agent.messages) == 2
         assert agent.messages[0]["content"] == "First question"
         assert agent.messages[1]["content"] == "First answer"
 
-        # RETRY_STARTED event should have been emitted with user_text
-        retry_events = [
-            e for e in events_received if e.event == AgentEvent.RETRY_STARTED
-        ]
-        assert len(retry_events) == 1
-        assert retry_events[0].data.get("user_text") == "Second question"
-
-    @pytest.mark.asyncio
-    async def test_retry_with_no_messages(self):
-        """A kind='retry' queue item with no messages emits RETRY_STARTED
-        with empty user_text (no crash).
-        """
+    def test_retry_no_messages(self):
+        """execute_retry returns failure when no messages exist."""
         client = MagicMock()
         agent = Agent(client, model="test-model")
+        agent._status = AgentStatus.IDLE
+        agent.messages = []
 
-        # No messages
-        assert agent.messages == []
+        result = execute_retry(agent)
 
-        # Capture events
-        events_received = []
+        assert not result.success
+        assert "No messages" in result.message
 
-        async def on_event(event_data):
-            events_received.append(event_data)
-
-        agent.on_event(on_event)
-
-        # Add a retry item
-        agent.queue.add("", kind="retry")
-
-        item = agent.queue.get_next()
-        await agent._process_item(item)
-
-        # Should not crash, just emit with empty user_text
-        retry_events = [
-            e for e in events_received if e.event == AgentEvent.RETRY_STARTED
+    def test_retry_single_group(self):
+        """execute_retry with one group leaves messages empty."""
+        client = MagicMock()
+        agent = Agent(client, model="test-model")
+        agent._status = AgentStatus.IDLE
+        agent.messages = [
+            {"role": "user", "content": "Hello"},
+            {"role": "assistant", "content": "Hi"},
         ]
-        assert len(retry_events) == 1
-        assert retry_events[0].data.get("user_text") == ""
+
+        result = execute_retry(agent)
+
+        assert result.success
+        assert result.data["user_text"] == "Hello"
+        assert len(agent.messages) == 0
+
+    def test_retry_busy_agent(self):
+        """execute_retry returns failure when agent is not idle."""
+        client = MagicMock()
+        agent = Agent(client, model="test-model")
+        agent.messages = [
+            {"role": "user", "content": "Hello"},
+            {"role": "assistant", "content": "Hi"},
+        ]
+        # Simulate a busy agent (INITIALISING is the default, not IDLE)
+        agent._status = AgentStatus.INITIALISING
+
+        result = execute_retry(agent)
+
+        assert not result.success
+        assert "busy" in result.message.lower()
+
+
+class TestExecutePrioritise:
+    """Test the execute_prioritise shared command."""
+
+    def test_prioritise_success(self):
+        """execute_prioritise marks a queue item as priority."""
+        client = MagicMock()
+        agent = Agent(client, model="test-model")
+        agent.queue.add("first")
+        agent.queue.add("second")
+
+        result = execute_prioritise(agent, "1")  # 1-based index
+
+        assert result.success
+        assert "priority" in result.message.lower()
+        assert result.data.get("kind") == "queue"
+
+    def test_prioritise_no_args(self):
+        """execute_prioritise returns usage message with no args."""
+        result = execute_prioritise(Agent(MagicMock(), model="test"), "")
+        assert not result.success
+        assert "Usage" in result.message
+
+    def test_prioritise_invalid_index(self):
+        """execute_prioritise returns error for out-of-range index."""
+        result = execute_prioritise(Agent(MagicMock(), model="test"), "99")
+        assert not result.success
+        assert "Invalid" in result.message
+
+    def test_prioritise_bad_format(self):
+        """execute_prioritise returns error for non-integer index."""
+        result = execute_prioritise(Agent(MagicMock(), model="test"), "abc")
+        assert not result.success
+        assert "Invalid" in result.message
+
+
+class TestExecuteDeprioritise:
+    """Test the execute_deprioritise shared command."""
+
+    def test_deprioritise_success(self):
+        """execute_deprioritise removes priority from a queue item."""
+        client = MagicMock()
+        agent = Agent(client, model="test-model")
+        agent.queue.add("first", priority=True)
+        agent.queue.add("second")
+
+        result = execute_deprioritise(agent, "1")  # 1-based index
+
+        assert result.success
+        assert "priority" in result.message.lower()
+        assert result.data.get("kind") == "queue"
+
+    def test_deprioritise_no_args(self):
+        """execute_deprioritise returns usage message with no args."""
+        result = execute_deprioritise(Agent(MagicMock(), model="test"), "")
+        assert not result.success
+        assert "Usage" in result.message
+
+    def test_deprioritise_invalid_index(self):
+        """execute_deprioritise returns error for out-of-range index."""
+        result = execute_deprioritise(Agent(MagicMock(), model="test"), "99")
+        assert not result.success
+        assert "Invalid" in result.message
+
+    def test_deprioritise_bad_format(self):
+        """execute_deprioritise returns error for non-integer index."""
+        result = execute_deprioritise(Agent(MagicMock(), model="test"), "abc")
+        assert not result.success
+        assert "Invalid" in result.message

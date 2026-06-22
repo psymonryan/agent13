@@ -13,7 +13,15 @@
 
 > Named after the agent from Get Smart who always seemed to end up in the tightest places — a mailbox, a fridge, a grandfather clock, and now a GPU?
 
-## How is this Agent Harness any different?
+**What makes agent13 different:**
+
+- **2x effective speed** with local models — tool-use success goes from ~50% to 95% through AI-native tool design
+- **Runs on 24 GB VRAM** — works with any OpenAI-compatible API: llama-server, Ollama, vLLM, LM Studio, OpenRouter
+- **Incremental compaction** — no auto-compaction amnesia; journals tool responses so context stays small without losing information
+- **Zero telemetry** — privacy focussed, no tracking, no analytics, no phoning home
+- **Screen Reader Friendly** - Has both a REPL mode and the option to also to split output to a separate file which can then be tailed into a text to speech engine such as Linux-Speakup
+
+## How is this different?
 
 ### AI preferred Tools
 
@@ -39,6 +47,22 @@ This approach means that the context stays small and the agent doesnt lose infor
 
 Also, and perhaps more critically, this approach keeps the kv-cache snapshots valid, since we are only ever modifying the 'end' of the context being sent to the api.
 
+### Is agent13 for you?
+
+**agent13 is for you if:**
+
+- You run local models and need an agent that keeps VRAM context low
+- You want to switch models/providers without restarting (mid session)
+- You care about privacy
+- You're comfortable with terminal interfaces
+- You use a 'screen reader' and don't want cursor commands messing up your text to speech engine.
+
+**Consider alternatives if:**
+
+- You need a more polished GUI (but hey, this one's not bad!)
+- You're all-in on Anthropic's ecosystem (Claude Code)
+- You want managed infrastructure (cloud agents)
+
 ## Features
 
 **Reconfigurable mid-flight.** While the agent is processing, you can: change models, switch providers, pause/resume, save session for later, or inject interrupt prompts with the `!!`  prefix. Eg:
@@ -49,7 +73,7 @@ Also, and perhaps more critically, this approach keeps the kv-cache snapshots va
 > !!Oh, and I forgot to mention that the doco you need lives in ~/mydocs
 ```
 
-This means when you see the agent struggling with something, or you forgot to tell it something, you can provide this information without breaking/cancelling the current turn and experiencing loss of work or worse, another round of prompt processing.
+This means when you see the agent struggling with something, or you forgot to tell it something, you can provide this information without breaking/cancelling the current turn and experiencing loss of work or worse, another round of full prompt processing.
 
 **TUI interface.** Full-featured Textual-based terminal UI: streaming responses, queue management (multiple prompts in flight), priority commands, info pane with context stats, session auto-save, and markdown rendering. Non-blocking input throughout.
 
@@ -59,27 +83,13 @@ This means when you see the agent struggling with something, or you forgot to te
 
 **Sandbox mode.** Five security profiles from unrestricted to macOS Seatbelt sandboxing. Tools run isolated by default; escalate only when needed. Configurable per-session (`--sandbox`) or per-tool. (Note: command tool sandboxing currently macOS-only via Seatbelt.)
 
-**Devel mode.** Toggle developer tools on/off at runtime. Hidden tools (TUI viewer, testing utilities) shown with `--devel` flag or `/devel on` in TUI. agent13 also comes with 'self development' tools, so if you ask the agent to change itself, it has tests and tools that help it change itself.
+**Devel mode.** Toggle developer tools on/off at runtime. Hidden tools (TUI viewer, testing utilities) shown with `--devel` flag or `/devel on` in TUI. agent13 also comes with 'self development' tools, so if you ask the agent to change itself, it has tests and tools that help it change itself. So if you want to make your own mods, turn this on and let it self-modify.
 
 **No telemetry.** No tracking, no analytics, no phoning home.
 
-**Mobile friendly.** Works over Turmux/Termius and similar mobile SSH clients.
+**Mobile friendly.** Works over Turmux/Termius and similar mobile SSH clients. (you can slow down the activity spinner or turn it off)
 
-## Why agent13?
-
-**agent13 is for you if:**
-
-- You run local models and need an agent that respects VRAM constraints
-- You want to switch models/providers without restarting
-- You need zero telemetry for client work
-- You want to add custom tools as simple Python functions
-- You're comfortable with terminal interfaces
-
-**Consider alternatives if:**
-
-- You need a polished GUI (try Cursor)
-- You're all-in on Anthropic's ecosystem (Claude Code)
-- You want managed infrastructure (cloud agents)
+**Tools that work WITH the Agent.** Automatically correcting for known LLM shortcomings with feedback, rollback and hinting on errors to help the agents next try.
 
 ## Quick start
 
@@ -94,7 +104,7 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 **From GitHub release** (recommended — latest stable):
 
 ```bash
-uv tool install https://github.com/psymonryan/agent13/releases/download/v0.1.13/agent13-0.1.13-py3-none-any.whl
+uv tool install https://github.com/psymonryan/agent13/releases/download/v0.2.0/agent13-0.2.0-py3-none-any.whl
 ```
 
 **From source** (for development):

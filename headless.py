@@ -46,6 +46,7 @@ from agent13.debug_log import init_debug
 from agent13.models import fetch_models, select_model
 from agent13.skills import SkillManager
 from agent13.context import skill_manager_ctx
+from agent13.file_injection import expand_file_mentions
 from tools import get_tools, execute_tool
 
 
@@ -111,7 +112,7 @@ async def run_headless(
         from agent13.persistence import find_latest_auto_save, load_context
         latest = find_latest_auto_save()
         if latest:
-            success, msg = load_context(agent, str(latest))
+            success, msg, _incomplete = load_context(agent, str(latest))
             if success:
                 print(f"CONTINUED: {latest} ({msg})", flush=True)
             else:
@@ -432,7 +433,7 @@ async def run_headless(
                     print(f"UNKNOWN_COMMAND: {line}", flush=True)
             else:
                 # Send message to agent
-                await agent.add_message(line)
+                await agent.add_message(expand_file_mentions(line))
 
     finally:
         # Auto-save on exit if there are messages
@@ -472,7 +473,10 @@ Commands: /pause, /resume, /status, /quit
     parser.add_argument(
         "--model",
         type=str,
-        help="Model to use (number or name)"
+        help=(
+            "Model to use (number or name). "
+            "Append :alias for a backend alias, e.g. 'GLM:nothink' or '3:nothink'"
+        ),
     )
     parser.add_argument(
         "--debug",

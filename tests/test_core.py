@@ -271,7 +271,7 @@ class TestAgent:
             },
         ]
 
-        agent._strip_reasoning_from_messages()
+        agent.history.strip_reasoning()
 
         assert "reasoning_content" not in agent.messages[1]
         assert "reasoning_content" not in agent.messages[3]
@@ -289,7 +289,7 @@ class TestAgent:
             {"role": "assistant", "content": "4", "reasoning_content": "Math!"},
         ]
 
-        agent._strip_reasoning_from_messages()
+        agent.history.strip_reasoning()
 
         assert agent.messages[0] == {"role": "user", "content": "Hello"}
         assert agent.messages[1] == {"role": "assistant", "content": "Hi"}
@@ -647,35 +647,35 @@ class TestSkillJournalProtection:
     def test_has_skill_call_in_last_turn_true(self):
         """Should detect a skill tool call in the last turn."""
         agent = self._make_agent_with_turn(["skill", "read_file"])
-        assert agent._has_skill_call_in_last_turn() is True
+        assert agent.history.has_skill_call_in_last_turn() is True
 
     def test_has_skill_call_in_last_turn_false(self):
         """Should not detect a skill tool call when none present."""
         agent = self._make_agent_with_turn(["read_file", "edit_file"])
-        assert agent._has_skill_call_in_last_turn() is False
+        assert agent.history.has_skill_call_in_last_turn() is False
 
     def test_has_skill_call_in_last_turn_empty(self):
         """Should return False when no messages exist."""
         client = MockClient()
         agent = Agent(client, model="test-model")
-        assert agent._has_skill_call_in_last_turn() is False
+        assert agent.history.has_skill_call_in_last_turn() is False
 
     def test_has_skill_call_in_range_true(self):
         """Should detect skill call within a message range."""
         agent = self._make_agent_with_turn(["skill"])
         # user=0, assistant=1, tool=2, tool=3, assistant=4
-        assert agent._has_skill_call_in_range(0, 4) is True
+        assert agent.history.has_skill_call_in_range(0, 4) is True
 
     def test_has_skill_call_in_range_false(self):
         """Should not detect skill call when none in range."""
         agent = self._make_agent_with_turn(["read_file"])
-        assert agent._has_skill_call_in_range(0, 4) is False
+        assert agent.history.has_skill_call_in_range(0, 4) is False
 
     def test_find_skill_call_ranges(self):
         """Should find skill call ranges correctly."""
         agent = self._make_agent_with_turn(["skill", "read_file"])
         # user=0, assistant=1 (skill+read_file), tool=2 (skill), tool=3 (read_file), assistant=4
-        ranges = agent._find_skill_call_ranges(0, 4)
+        ranges = agent.history.find_skill_call_ranges(0, 4)
         # The assistant message has a skill call, so range includes
         # the assistant message and all following tool results
         assert len(ranges) == 1
@@ -685,7 +685,7 @@ class TestSkillJournalProtection:
         """Should return empty ranges when no skill calls present."""
         agent = self._make_agent_with_turn(["read_file"])
         # user=0, assistant=1, tool=2, assistant=3
-        ranges = agent._find_skill_call_ranges(0, 3)
+        ranges = agent.history.find_skill_call_ranges(0, 3)
         assert ranges == []
 
     def test_maybe_reflect_compacts_skill_turn(self):
@@ -701,11 +701,11 @@ class TestSkillJournalProtection:
             assert isinstance(skill_names, list)
             return "Summary of tool use"
 
-        agent._reflect_on_tool_use = mock_reflect
+        agent.journal.reflect_on_tool_use = mock_reflect
 
         import asyncio
-        asyncio.get_event_loop().run_until_complete(
-            agent._maybe_reflect_after_turn()
+        asyncio.run(
+            agent.journal.maybe_reflect_after_turn()
         )
 
     def test_journal_last_turn_compacts_skill_turn(self):
@@ -718,10 +718,10 @@ class TestSkillJournalProtection:
         async def mock_reflect(self=None, skill_names=None, messages=None):
             return "Summary of tool use"
 
-        agent._reflect_on_tool_use = mock_reflect
+        agent.journal.reflect_on_tool_use = mock_reflect
 
-        success, message = asyncio.get_event_loop().run_until_complete(
-            agent.journal_last_turn()
+        success, message = asyncio.run(
+            agent.journal.journal_last_turn()
         )
         assert success is True
 
@@ -770,5 +770,61 @@ class TestSkillJournalProtection:
             {"role": "assistant", "content": "Here's the file."},
         ]
         # Verify skill detection still works
-        assert agent._has_skill_call_in_range(0, 3) is True
-        assert agent._has_skill_call_in_range(4, 7) is False
+        assert agent.history.has_skill_call_in_range(0, 3) is True
+        assert agent.history.has_skill_call_in_range(4, 7) is False
+
+
+class TestAgentAvailableModels:
+    """Tests for Agent.available_models and set_client(models=)."""
+
+    def test_available_models_default_empty(self):
+        """Should initialise available_models as empty list."""
+        client = MockClient()
+        agent = Agent(client, model="test-model")
+
+        assert agent.available_models == []
+
+    def test_set_client_stores_models(self):
+        """set_client with models kwarg stores them on agent."""
+        client = MockClient()
+        agent = Agent(client, model="test-model")
+        new_client = MockClient()
+        models = ["model-a", "model-b", "model-c"]
+
+        agent.set_client(new_client, models=models)
+
+        assert agent.client is new_client
+        assert agent.available_models == models
+
+    def test_set_client_without_models_preserves_existing(self):
+        """set_client without models kwarg does not clear available_models."""
+        client = MockClient()
+        agent = Agent(client, model="test-model")
+        agent.available_models = ["model-a", "model-b"]
+        new_client = MockClient()
+
+        agent.set_client(new_client)
+
+        assert agent.client is new_client
+        assert agent.available_models == ["model-a", "model-b"]
+
+    def test_set_client_with_none_models_preserves(self):
+        """set_client with models=None does not overwrite existing list."""
+        client = MockClient()
+        agent = Agent(client, model="test-model")
+        agent.available_models = ["old-model"]
+
+        agent.set_client(MockClient(), models=None)
+
+        # None means "don't change" — existing list preserved
+        assert agent.available_models == ["old-model"]
+
+    def test_set_client_with_empty_list_clears(self):
+        """set_client with models=[] clears available_models."""
+        client = MockClient()
+        agent = Agent(client, model="test-model")
+        agent.available_models = ["old-model"]
+
+        agent.set_client(MockClient(), models=[])
+
+        assert agent.available_models == []

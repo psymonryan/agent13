@@ -68,7 +68,8 @@ def validate_path_for_read(filepath: str, cwd: Path = None) -> Tuple[bool, str]:
 
     path = Path(filepath)
 
-    # Always block path traversal
+    # Cheap early-exit for path traversal. Redundant now that callers .resolve()
+    # before calling this, eliminating '..' before we see it. Safe to remove later.
     if ".." in filepath:
         return False, "Path traversal not allowed: '..' in path"
 
@@ -140,7 +141,8 @@ def validate_path_for_write(filepath: str, cwd: Path = None) -> Tuple[bool, str]
 
     path = Path(filepath)
 
-    # Always block path traversal
+    # Cheap early-exit for path traversal. Redundant now that callers .resolve()
+    # before calling this, eliminating '..' before we see it. Safe to remove later.
     if ".." in filepath:
         return False, "Path traversal not allowed: '..' in path"
 

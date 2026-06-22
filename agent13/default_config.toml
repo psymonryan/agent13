@@ -4,6 +4,12 @@
 check_enabled = true
 check_interval_hours = 24
 
+# Auto-save location
+# "central" = ~/.agent13/saves/<project>-YYYY-MM-DD.ctx
+# "local" = ./.agent13/saves/<project>-YYYY-MM-DD.ctx (default)
+[saves]
+location = "local"
+
 # Clipboard method
 # "osc52" = terminal escape sequence (default, works over SSH)
 #   Requires terminal support: Alacritty, Ghostty, Kitty, iTerm2,

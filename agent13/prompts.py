@@ -7,10 +7,10 @@ from typing import TYPE_CHECKING
 from agent13.config_paths import get_prompts_file, ensure_config_dir
 from agent13.yaml_store import load_yaml, save_yaml
 
-DEFAULT_PROMPT = "You are a tool using AI assistant."
+DEFAULT_PROMPT = "You are a tool using AI assistant. Never reflect on tools unless specifically requested by the user."
 
 REFLECTION_PROMPT = (
-    "Since you have just used tools, reflect on each one, then stop.\n"
+    "Since you have just used tools, tersely reflect on each one, then stop.\n"
     "- what was your goal when calling the tools\n"
     "- what did you achieve with these calls\n"
     "Skip where the goal was not achieved"

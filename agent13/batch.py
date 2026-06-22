@@ -10,11 +10,13 @@ All output is handled via callbacks, making it suitable for:
 import asyncio
 from typing import Callable, Awaitable, Optional
 from agent13 import Agent, AgentEvent, AgentEventData
+from agent13.file_injection import build_read_message
 
 
 async def run_batch(
     agent: Agent,
     prompt: str,
+    read_files: list[str] | None = None,
     *,
     on_token: Optional[Callable[[str], Awaitable[None]]] = None,
     on_reasoning: Optional[Callable[[str], Awaitable[None]]] = None,
@@ -115,6 +117,15 @@ async def run_batch(
     try:
         # Wait for agent to start
         await asyncio.sleep(0.1)
+
+        # If read_files provided, send file injection message first
+        if read_files:
+            read_msg = build_read_message(read_files)
+            await agent.add_message(read_msg)
+            # Wait for the acknowledgement turn to complete
+            await processing_done.wait()
+            processing_done.clear()
+            work_started = False
 
         # Add the prompt
         await agent.add_message(prompt)

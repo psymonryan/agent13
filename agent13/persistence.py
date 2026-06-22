@@ -7,6 +7,8 @@ Provides save/load functionality for agent message history, enabling:
 """
 
 import json
+import os
+import re
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -16,6 +18,52 @@ from agent13.config_paths import get_saves_dir as _get_global_saves_dir
 if TYPE_CHECKING:
     from agent13.core import Agent
 
+_AUTO_SAVE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+def _ensure_ctx_stem(name: str) -> str:
+    """Strip .ctx suffix if present, for safe path construction.
+
+    Prevents double-extension when user types e.g. ``/load foo.ctx``.
+    """
+    if name.endswith(".ctx"):
+        return name[:-4]
+    return name
+
+
+def resolve_save_path(name: str) -> Path:
+    """Resolve a user-supplied save name to a .ctx file path.
+
+    Handles three cases:
+    - Absolute path (starts with /): use as-is (strip .ctx if present, re-add it)
+    - Tilde path (starts with ~): expand user, use as-is
+    - Bare name: join with the saves directory
+
+    This prevents the bugs where /save and /load split on spaces
+    (dropping the rest of the name) and where ~ is not expanded.
+
+    Args:
+        name: The raw user argument (may contain spaces, ~, or be absolute).
+
+    Returns:
+        Path to the .ctx file (with .ctx extension ensured).
+    """
+    name = name.strip()
+    if not name:
+        raise ValueError("Save name cannot be empty")
+
+    # Absolute path or tilde path — use directly
+    if name.startswith("/") or name.startswith("~"):
+        path = Path(name).expanduser()
+        if path.suffix == ".ctx":
+            return path
+        # Preserve any other existing extension (e.g. foo.backup -> foo.backup.ctx)
+        return path.with_name(f"{path.name}.ctx")
+
+    # Bare name — join with saves directory
+    return get_saves_dir() / f"{_ensure_ctx_stem(name)}.ctx"
+
+
 # Context file format version
 CONTEXT_VERSION = 1
 
@@ -23,31 +71,51 @@ CONTEXT_VERSION = 1
 def get_saves_dir() -> Path:
     """Get the manual saves directory (project-local).
 
+    Respects AGENT13_SAVES_DIR env var (used by tests for isolation).
+    Falls back to ./.agent13/saves/.
+
     Returns:
-        Path to ./.agent13/saves/, created if needed.
+        Path to the saves directory, created if needed.
     """
-    saves_dir = Path.cwd() / ".agent13" / "saves"
+    env_dir = os.environ.get("AGENT13_SAVES_DIR")
+    if env_dir:
+        saves_dir = Path(env_dir)
+    else:
+        saves_dir = Path.cwd() / ".agent13" / "saves"
     saves_dir.mkdir(parents=True, exist_ok=True)
     return saves_dir
 
 
 def get_auto_save_dir() -> Path:
-    """Get the auto-save directory (global).
+    """Get the auto-save directory.
+
+    Respects config: [saves] location = "central" (default) or "local".
+    - central: ~/.agent13/saves/
+    - local: ./.agent13/saves/
 
     Returns:
-        Path to ~/.agent13/saves/, created if needed.
+        Path to the auto-save directory, created if needed.
     """
-    return _get_global_saves_dir()
+    from agent13.config import get_config
+
+    cfg = get_config()
+    if cfg.saves_location == "local":
+        return get_saves_dir()  # project-local
+    return _get_global_saves_dir()  # central (default)
 
 
 def get_auto_save_path(project_name: str | None = None) -> Path:
     """Get the auto-save path for the current session.
 
+    Respects config: [saves] location = "central" (default) or "local".
+    Always uses dashed date format: <project>-YYYY-MM-DD.ctx
+
     Args:
         project_name: Optional project name. If not provided, uses cwd name.
 
     Returns:
-        Path like ~/.agent13/saves/myproject-2026-04-01.ctx
+        Path like ~/.agent13/saves/myproject-2026-04-01.ctx (central)
+        or ./.agent13/saves/myproject-2026-04-01.ctx (local)
     """
     if project_name is None:
         project_name = Path.cwd().name
@@ -59,25 +127,48 @@ def get_auto_save_path(project_name: str | None = None) -> Path:
 def find_latest_auto_save(project_name: str | None = None) -> Path | None:
     """Find the most recent auto-save file.
 
+    Searches the configured save location first, then falls back to the
+    other location if nothing is found. This handles the case where the
+    user changed their saves_location config or moved to a different
+    project directory.
+
     Args:
-        project_name: Optional project name to filter. If not provided, uses cwd name.
+        project_name: Optional project name to filter. If not provided,
+            uses cwd name.
 
     Returns:
-        Path to the most recent .ctx file, or None if none exist.
+        Path to the most recent .ctx file, or None if none exist in
+        either location.
     """
     if project_name is None:
         project_name = Path.cwd().name
 
-    auto_dir = get_auto_save_dir()
     pattern = f"{project_name}-*.ctx"
 
+    # Try the configured location first
+    auto_dir = get_auto_save_dir()
     matches = list(auto_dir.glob(pattern))
-    if not matches:
-        return None
+    if matches:
+        matches.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+        return matches[0]
 
-    # Sort by modification time, most recent first
-    matches.sort(key=lambda p: p.stat().st_mtime, reverse=True)
-    return matches[0]
+    # Fallback: try the other location
+    from agent13.config import get_config
+
+    cfg = get_config()
+    if cfg.saves_location == "central":
+        # Configured for central; try local (project dir)
+        fallback_dir = get_saves_dir()
+    else:
+        # Configured for local; try central (~/.agent13/saves/)
+        fallback_dir = _get_global_saves_dir()
+
+    fallback_matches = list(fallback_dir.glob(pattern))
+    if fallback_matches:
+        fallback_matches.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+        return fallback_matches[0]
+
+    return None
 
 
 def _is_incomplete_turn(messages: list) -> bool:
@@ -209,7 +300,59 @@ def list_saves() -> list[Path]:
     """List available manual save files.
 
     Returns:
-        List of paths to .ctx files in the saves directory.
+        List of paths to .ctx files in the manual saves directory.
     """
     saves_dir = get_saves_dir()
     return sorted(saves_dir.glob("*.ctx"))
+
+
+def _is_auto_save_name(stem: str) -> bool:
+    """Check if a filename stem looks like an auto-save (project-YYYY-MM-DD).
+
+    Auto-saves end with a YYYY-MM-DD date suffix after the last '-'.
+    e.g. "myproject-2026-05-25" → True
+         "mycontext" → False
+    """
+    # Split from the right to get the last three segments
+    # stem="myproject-2026-05-25" → parts=["myproject", "2026", "05", "25"]
+    parts = stem.split("-")
+    if len(parts) < 4:
+        return False
+    # Last 3 parts should be YYYY, MM, DD
+    yyyy, mm, dd = parts[-3], parts[-2], parts[-1]
+    date_candidate = f"{yyyy}-{mm}-{dd}"
+    return bool(_AUTO_SAVE_RE.match(date_candidate))
+
+
+def list_all_saves() -> list[Path]:
+    """List all save files (manual + auto) sorted by mtime, newest first.
+
+    Manual saves appear first, auto-saves (YYYY-MM-DD suffix) last.
+    Used for /load tab completion.
+
+    Returns:
+        List of paths sorted: manual (mtime desc), then auto-saves (mtime desc).
+    """
+    manual = list_saves()
+    auto_dir = get_auto_save_dir()
+    saves_dir = get_saves_dir()
+
+    auto_saves: list[Path] = []
+    if auto_dir == saves_dir:
+        # Local mode: auto-saves are in same dir, filter by name pattern
+        for f in saves_dir.glob("*.ctx"):
+            if _is_auto_save_name(f.stem):
+                auto_saves.append(f)
+    else:
+        # Central mode: list all from global dir
+        auto_saves = list(auto_dir.glob("*.ctx"))
+
+    # Deduplicate (if local mode and same file somehow)
+    manual_set = set(manual)
+    auto_saves = [f for f in auto_saves if f not in manual_set]
+
+    # Sort each group by mtime descending
+    manual.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    auto_saves.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+
+    return manual + auto_saves

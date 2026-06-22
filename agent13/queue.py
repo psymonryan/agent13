@@ -122,15 +122,41 @@ class AgentQueue:
             return self.items.pop(index - 1)
         return None
 
+    def _insert_at_position(self, item: QueueItem) -> None:
+        """Insert item at correct position based on its priority/interrupt flags.
+        Preserves existing item (no new ID)."""
+        if item.interrupt:
+            # Insert at front, after other interrupt items
+            insert_at = 0
+            for i, existing in enumerate(self.items):
+                if existing.interrupt:
+                    insert_at = i + 1
+                else:
+                    break
+            self.items.insert(insert_at, item)
+        elif item.priority:
+            # Insert after all interrupt items, after existing priority items
+            insert_at = 0
+            for i, existing in enumerate(self.items):
+                if existing.interrupt or existing.priority:
+                    insert_at = i + 1
+                else:
+                    break
+            self.items.insert(insert_at, item)
+        else:
+            self.items.append(item)
+
     def set_priority(self, item_id: int, priority: bool) -> bool:
         """Change item priority. Returns True if item was found."""
         for i, item in enumerate(self.items):
             if item.id == item_id:
                 if item.priority != priority:
-                    # Remove and re-add with new priority (preserve interrupt flag)
+                    # Remove from current position
                     del self.items[i]
+                    # Update priority flag
                     item.priority = priority
-                    self.add(item.text, priority=priority, interrupt=item.interrupt)
+                    # Re-insert at correct position (preserves item ID)
+                    self._insert_at_position(item)
                 return True
         return False
 
@@ -139,9 +165,12 @@ class AgentQueue:
         if 1 <= index <= len(self.items):
             item = self.items[index - 1]
             if item.priority != priority:
+                # Remove from current position
                 del self.items[index - 1]
+                # Update priority flag
                 item.priority = priority
-                self.add(item.text, priority=priority, interrupt=item.interrupt)
+                # Re-insert at correct position (preserves item ID)
+                self._insert_at_position(item)
             return True
         return False
 

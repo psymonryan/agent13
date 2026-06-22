@@ -3,7 +3,7 @@ name: deep-researcher
 description: |
   What: Perform comprehensive, in-depth research with rigorous source attribution and evidence-based findings.
   When: Use when creating well-sourced research documents that require credible citations, balanced analysis, and authoritative references.
-license: Commercial
+license: MIT
 compatibility: Requires access to web_search and fetch tools
 metadata:
   version: 1.0.0

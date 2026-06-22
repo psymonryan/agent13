@@ -4,6 +4,8 @@ Usage:
   agent13 studio                    # Interactive TUI mode
   agent13 openrouter --model devstral   # TUI with model selection
   agent13 test -p "Hello"          # Batch mode
+  agent13 test --repl              # Interactive REPL mode (no TUI)
+  agent13 test --repl --output out.log  # REPL + file output for tail -f
   agent13 --list-providers         # List providers
   agent13 test --model             # List models for provider
 """
@@ -66,6 +68,7 @@ async def run_batch_with_display(
     client: AsyncOpenAI,
     model: str,
     prompt: str,
+    read_files: list[str] | None = None,
     pretty: bool = True,
     debug: bool = False,
     tool_response_format: str = "raw",
@@ -168,6 +171,7 @@ async def run_batch_with_display(
     await run_batch(
         agent,
         prompt,
+        read_files=read_files,
         on_token=on_token,
         on_reasoning=on_reasoning,
         on_tool_call=on_tool_call,
@@ -196,6 +200,9 @@ async def async_main():
   agent13 studio                      # Interactive TUI mode
   agent13 openrouter --model devstral # TUI with model selection
   agent13 test -p "What is 5^2?"      # Batch mode
+  agent13 test --repl                 # Interactive REPL (no TUI)
+  agent13 test --output out.log       # REPL + file (--output implies --repl)
+  agent13 test --repl --output out.log # Same, explicit
   agent13 --list-providers            # List providers
   agent13 test --model                # List models for provider
 
@@ -227,7 +234,11 @@ Provider names are read from ~/.agent13/config.toml
         nargs="?",
         const="",
         default=None,
-        help="Model to select: number (1, 2, ...) or name. With no value, lists models",
+        help=(
+            "Model to select: number (1, 2, ...) or name. "
+            "Append :alias for a backend alias, e.g. 'GLM:nothink' or '3:nothink'. "
+            "With no value, lists models"
+        ),
     )
     parser.add_argument(
         "--system-prompt",
@@ -290,6 +301,18 @@ Provider names are read from ~/.agent13/config.toml
         help="Enable devel mode (show devel-group tools like TUI viewer to the AI)",
     )
     parser.add_argument(
+        "--repl",
+        action="store_true",
+        help="Run in interactive REPL mode (readline-based, no TUI)",
+    )
+    parser.add_argument(
+        "--output",
+        type=str,
+        default=None,
+        metavar="FILE",
+        help="Redirect chat output to FILE and enable REPL mode (view with tail -f)",
+    )
+    parser.add_argument(
         "--spinner",
         choices=["fast", "slow", "off"],
         default="fast",
@@ -306,10 +329,35 @@ Provider names are read from ~/.agent13/config.toml
         default="osc52",
         help="Clipboard method: osc52 (terminal escape sequence) or system (OS clipboard command)",
     )
+    parser.add_argument(
+        "--read",
+        nargs="+",
+        action="append",
+        metavar="FILE",
+        default=None,
+        help=(
+            "Read files into context before the prompt. Files are injected as "
+            'a separate first message; the model acknowledges with "files read". '
+            "Can be used multiple times: --read file1.py --read file2.md"
+        ),
+    )
 
     args = parser.parse_args()
     # Track whether --clipboard was explicitly passed (vs default)
     args._clipboard_explicit = "--clipboard" in sys.argv
+
+    # Flatten --read files (action="append" creates list of lists)
+    if args.read:
+        args.read = [f for group in args.read for f in group]
+
+    # --output implies --repl
+    if args.output:
+        if args.prompt:
+            print("Error: --output cannot be used with -p/--prompt (batch mode)", file=sys.stderr)
+            print("Hint: Use shell redirect instead: agent13 provider -p \"prompt\" > file", file=sys.stderr)
+            sys.exit(1)
+        args.repl = True
+
 
     # Ensure default skills are available for new users
     ensure_default_skills()
@@ -480,6 +528,7 @@ Provider names are read from ~/.agent13/config.toml
             client=client,
             model=model,
             prompt=args.prompt,
+            read_files=args.read,
             pretty=args.pretty == "on",
             debug=args.debug,
             tool_response_format=args.tool_response,
@@ -489,6 +538,34 @@ Provider names are read from ~/.agent13/config.toml
             remove_reasoning=args.remove_reasoning,
             devel_mode=args.devel,
             skills_mode=include_skills and bool(skill_manager.skills),
+        )
+        log_session_end()
+        sys.exit(0)
+
+    # REPL mode (--repl or --output implies --repl)
+    if args.repl:
+        from agent13.repl import run_repl
+
+        if include_skills and skill_manager.skills:
+            skill_manager_ctx.set(skill_manager)
+        await run_repl(
+            client=client,
+            model=model,
+            provider=provider_name,
+            pretty=args.pretty == "on",
+            debug=args.debug,
+            prompt_manager=prompt_manager,
+            system_prompt=system_prompt,
+            journal_mode=args.journal,
+            send_reasoning=args.send_reasoning,
+            remove_reasoning=args.remove_reasoning,
+            devel_mode=args.devel,
+            skills_mode=include_skills and bool(skill_manager.skills),
+            skill_manager=skill_manager,
+            continue_session=args.continue_session,
+            output_path=args.output,
+            model_names=model_names,
+            read_files=args.read,
         )
         log_session_end()
         sys.exit(0)
@@ -516,15 +593,18 @@ Provider names are read from ~/.agent13/config.toml
         devel_mode=args.devel,
         spinner_speed=args.spinner,
         clipboard_method=args.clipboard if args._clipboard_explicit else cfg.clipboard_method,
+        read_files=args.read,
     )
 
 
 def main():
     """Main entry point."""
-    # Check if running in batch mode (has -p or --prompt)
+    # Check if running in batch, REPL, or output mode
     is_batch = "-p" in sys.argv or "--prompt" in sys.argv
+    is_repl = "--repl" in sys.argv
+    is_output = "--output" in sys.argv
 
-    if is_batch:
+    if is_batch or is_repl or is_output:
         # Batch mode - run async directly
         try:
             asyncio.run(async_main())

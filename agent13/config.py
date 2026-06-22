@@ -167,6 +167,7 @@ class Config:
         update_check_enabled: Whether to check for updates on startup
         update_check_interval_hours: Minimum hours between update checks
         clipboard_method: Clipboard method - "osc52" or "system"
+        saves_location: Auto-save location - "central" (global) or "local" (project dir)
     """
 
     providers: list[ProviderConfig] = field(default_factory=list)
@@ -178,6 +179,7 @@ class Config:
     update_check_enabled: bool = True
     update_check_interval_hours: float = 24
     clipboard_method: str = "osc52"
+    saves_location: str = "local"
 
     @classmethod
     def from_file(cls, path: Optional[Path] = None) -> "Config":
@@ -318,6 +320,13 @@ class Config:
             method = clipboard_data.get("method", "osc52")
             if isinstance(method, str) and method in ("osc52", "system"):
                 config.clipboard_method = method
+
+        # Parse [saves] section
+        saves_data = data.get("saves", {})
+        if isinstance(saves_data, dict):
+            loc = saves_data.get("location", "local")
+            if isinstance(loc, str) and loc in ("central", "local"):
+                config.saves_location = loc
 
         config.validate()
         return config
@@ -545,3 +554,55 @@ def create_client(
             pool=600.0,
         ),
     )
+
+
+def resolve_provider_selection(
+    choice: str, use_stderr: bool = False
+) -> str | None:
+    """Resolve a provider selection by number, name, or URL.
+
+    Args:
+        choice: User's choice (number like "1", name/partial name, or URL)
+        use_stderr: If True, print errors to stderr instead of stdout
+
+    Returns:
+        Resolved provider name/URL, or None if ambiguous/not found
+    """
+    # URLs pass through directly (resolve_provider_arg handles them)
+    if choice.startswith("http://") or choice.startswith("https://"):
+        return choice
+
+    from agent13.models import resolve_from_list
+
+    import sys
+
+    output = sys.stderr if use_stderr else sys.stdout
+    names = get_provider_names()
+    return resolve_from_list(names, choice, label="provider", output=output)
+
+
+def get_provider_names() -> list[str]:
+    """Get list of configured provider names.
+
+    Returns:
+        Sorted list of provider names from config.
+    """
+    return sorted(p.name for p in get_config().providers)
+
+
+def print_provider_list(current: str = "") -> None:
+    """Print a numbered list of configured providers.
+
+    Args:
+        current: Currently active provider name (shown with *).
+    """
+    names = get_provider_names()
+    if not names:
+        print("  No providers configured in ~/.agent13/config.toml")
+        return
+    print("\nAvailable providers:")
+    for i, name in enumerate(names, 1):
+        marker = " *" if name == current else ""
+        print(f"  {i}. {name}{marker}")
+    print()
+    print("  Use /provider <name> to switch")

@@ -882,6 +882,11 @@ def edit_file(
         Dict with success status and details. Every edit result includes
         snapshot_id for potential rollback.
     """
+    # Expand ~ and resolve to absolute path (shell-like behavior)
+    # Done early so snapshot keys and rollback use the same path regardless
+    # of whether the caller passes a relative or absolute path.
+    filepath = str(Path(filepath).expanduser().resolve())
+
     # Validate mode
     valid_modes = (
         "replace",
@@ -923,7 +928,13 @@ def edit_file(
             del snapshots[oldest]
         # Write restored content
         path = Path(filepath)
-        path.write_text(restored, "utf-8")
+        try:
+            path.write_text(restored, "utf-8")
+        except Exception as e:
+            # Write failed — undo the snapshot we just took so state is consistent
+            del _snapshots[filepath][new_snapshot_id]
+            _snapshot_counter[filepath] = counter
+            return {"success": False, "error": f"Failed to write during rollback: {e}"}
         return {
             "success": True,
             "message": f"Restored {filepath} to snapshot {target_id}",
@@ -1385,18 +1396,6 @@ def edit_file(
         tail_match += 1
     edit_end = len(modified_lines) - tail_match
 
-    # Snapshot before write — enables rollback
-    if filepath not in _snapshots:
-        _snapshots[filepath] = {}
-        _snapshot_counter[filepath] = 0
-    _snapshots[filepath][_snapshot_counter[filepath]] = original_content
-    current_snapshot_id = _snapshot_counter[filepath]
-    _snapshot_counter[filepath] += 1
-    # Evict oldest snapshots if over cap
-    while len(_snapshots[filepath]) > MAX_SNAPSHOTS_PER_FILE:
-        oldest = min(_snapshots[filepath].keys())
-        del _snapshots[filepath][oldest]
-
     # Write back to file
     new_content = "\n".join(modified_lines)
     if has_trailing_newline:
@@ -1407,6 +1406,21 @@ def edit_file(
         syntax_error = _validate_python_syntax(new_content, filepath)
         if syntax_error:
             return {"success": False, "error": syntax_error}
+
+    # Snapshot before write — enables rollback
+    # NOTE: Snapshot is saved AFTER syntax validation to avoid phantom snapshots
+    # when edits fail validation. This ensures only actually-applied edits are
+    # in the snapshot history.
+    if filepath not in _snapshots:
+        _snapshots[filepath] = {}
+        _snapshot_counter[filepath] = 0
+    _snapshots[filepath][_snapshot_counter[filepath]] = original_content
+    current_snapshot_id = _snapshot_counter[filepath]
+    _snapshot_counter[filepath] += 1
+    # Evict oldest snapshots if over cap
+    while len(_snapshots[filepath]) > MAX_SNAPSHOTS_PER_FILE:
+        oldest = min(_snapshots[filepath].keys())
+        del _snapshots[filepath][oldest]
 
     try:
         path.write_text(new_content, "utf-8")

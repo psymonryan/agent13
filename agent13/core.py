@@ -10,7 +10,9 @@ from typing import Callable, Awaitable, Optional, TYPE_CHECKING
 from openai import AsyncOpenAI
 
 from agent13.events import AgentEvent, AgentEventData, EventHandler
-from agent13.prompts import DEFAULT_PROMPT, REFLECTION_PROMPT
+from agent13.journal import JournalManager
+from agent13.message_history import MessageHistory
+from agent13.prompts import DEFAULT_PROMPT
 from agent13.queue import AgentQueue, QueueItem
 from agent13.llm import (
     append_assistant_message,
@@ -27,7 +29,6 @@ from agent13.debug_log import (
     log_assistant_response,
     log_tool_call,
     log_tool_result,
-    log_journal_reflection,
     log_journal_debug,
     # TPS debug logging
     is_debug_enabled,
@@ -40,6 +41,28 @@ if TYPE_CHECKING:
 
 # Configuration constants
 REASONING_TOOL_CALL_NOTIFICATION_DURATION = 30.0  # seconds
+
+
+def _sanitize_json_args(tool_name: str, raw: str) -> str:
+    """Validate and re-serialise tool call arguments for message history.
+
+    Streaming may accumulate malformed JSON (truncated responses, bad escapes,
+    unterminated strings).  Storing raw corrupts every subsequent API call —
+    the backend re-parses the full message history and 500s on bad JSON.
+
+    Round-trip through json.loads/dumps to guarantee valid JSON in storage.
+    Falls back to '{}' on any parse failure so the message sequence is
+    always API-safe, independent of tool execution error handling.
+    """
+    try:
+        return json.dumps(json.loads(raw)) if raw else "{}"
+    except (json.JSONDecodeError, TypeError):
+        log_error(
+            Exception("malformed tool call arguments"),
+            {"context": "sanitize_json_args", "name": tool_name,
+             "arguments": raw[:200] if raw else ""},
+        )
+        return "{}"
 
 
 @dataclass
@@ -229,7 +252,7 @@ class Agent:
         self.model = model
         self.queue = queue or AgentQueue()
         self.system_prompt = system_prompt or DEFAULT_PROMPT
-        self.messages = messages or []
+        self.history = MessageHistory(messages)
         self.tools = tools or []
         self.execute_tool = execute_tool
         self.response_format = response_format
@@ -239,6 +262,8 @@ class Agent:
         self._devel_mode = devel_mode
         self._skills_mode = skills_mode
         self.execute_tool = execute_tool
+        # Available models list (populated by caller or set_client)
+        self.available_models: list[str] = []
         self.response_format = response_format
         self.journal_mode = journal_mode
         self.send_reasoning = send_reasoning
@@ -247,6 +272,7 @@ class Agent:
         self._handlers: list[EventHandler] = []
         self._running = False
         self._stop_event = asyncio.Event()
+        self._cancel_requested = False  # Set by _process_item on CancelledError
         self._status = AgentStatus.INITIALISING
 
         # Pause/resume state (single source of truth — PauseState enum)
@@ -268,6 +294,29 @@ class Agent:
 
         # Incomplete turn tracking (set when loading a saved incomplete context)
         self._incomplete_turn_loaded: bool = False
+
+        # Journal manager for context compaction
+        self.journal = JournalManager(
+            history=self.history,
+            stream_fn=self._stream_and_emit,
+            emit_fn=self.emit,
+            set_status_fn=self._set_status,
+            get_status_fn=lambda: self._status,
+            get_prompt_tokens_fn=lambda: self.prompt_tokens,
+            is_interrupted_fn=lambda: self.queue.has_interrupt,
+            journal_mode_fn=lambda: self.journal_mode,
+            status_journaling=AgentStatus.JOURNALING,
+            status_idle=AgentStatus.IDLE,
+        )
+
+    @property
+    def messages(self) -> list[dict]:
+        """Message history — delegates to MessageHistory."""
+        return self.history.messages
+
+    @messages.setter
+    def messages(self, value: list[dict]):
+        self.history.messages = value
 
     def on_event(self, handler: EventHandler) -> EventHandler:
         """Register an event handler.
@@ -303,567 +352,14 @@ class Agent:
                 result = handler(event_data)
                 if asyncio.iscoroutine(result):
                     await result
-            except Exception as e:
-                # Don't let handler errors crash the agent
+            except BaseException as e:
+                # Don't let handler errors (including CancelledError from
+                # UI framework) crash the agent loop.  CancelledError is a
+                # BaseException in Python 3.9+, so catching Exception alone
+                # lets it escape and kill run().
                 print(
                     f"Error in event handler: {e}, event_data: {event_data}, result: {result}"
                 )
-
-    def _strip_reasoning_from_messages(self) -> None:
-        """Remove reasoning_content from all assistant messages.
-
-        Called between turns when remove_reasoning is enabled (non-journal mode)
-        to reduce context usage. When remove_reasoning is off (default),
-        reasoning is preserved for better multi-step continuity.
-        """
-        for msg in self.messages:
-            if msg.get("role") == "assistant" and "reasoning_content" in msg:
-                del msg["reasoning_content"]
-
-    def _has_tool_calls(self) -> bool:
-        """Check if any message in the history contains tool calls.
-
-        Returns:
-            True if any assistant message has tool_calls or any message
-            has role 'tool'.
-        """
-        assistant_tc = sum(
-            1 for m in self.messages
-            if m.get("role") == "assistant" and m.get("tool_calls")
-        )
-        tool_msgs = sum(
-            1 for m in self.messages if m.get("role") == "tool"
-        )
-        result = assistant_tc > 0 or tool_msgs > 0
-        log_journal_debug("has_tool_calls", {
-            "messages_count": len(self.messages),
-            "assistant_with_tool_calls": assistant_tc,
-            "tool_messages": tool_msgs,
-            "result": result,
-        })
-        return result
-
-    def _find_last_user_idx(self, start: int | None = None) -> int | None:
-        """Return index of the last non-interrupt user message.
-
-        Walks backward from ``start`` (default: end of messages).
-        Returns None if no non-interrupt user message is found.
-        """
-        begin = start if start is not None else len(self.messages) - 1
-        for i in range(begin, -1, -1):
-            if self.messages[i].get("role") == "user" and not self.messages[i].get(
-                "interrupt"
-            ):
-                return i
-        return None
-
-    def _find_earliest_tool_turn(self) -> tuple[int, int] | None:
-        """Find the boundary of the earliest tool-using turn.
-
-        A tool-using turn consists of:
-        - A non-interrupt user message (turn start)
-        - One or more assistant messages with tool_calls + tool results
-        - A final assistant message (turn conclusion)
-
-        Returns:
-            Tuple of (user_idx, end_idx) where:
-            - user_idx: index of the non-interrupt user message starting the turn
-            - end_idx: index of the final assistant message concluding the turn,
-              or the last message if the turn lacks a concluding assistant message
-            Returns None if no tool-using turn is found.
-        """
-        if not self.messages:
-            log_journal_debug("find_earliest_tool_turn", {
-                "messages_count": 0,
-                "result": None,
-                "reason": "no_messages",
-            })
-            return None
-
-        # Step 1: Find the first assistant message with tool_calls
-        first_tool_idx = None
-        for i, msg in enumerate(self.messages):
-            if msg.get("role") == "assistant" and msg.get("tool_calls"):
-                first_tool_idx = i
-                break
-
-        if first_tool_idx is None:
-            log_journal_debug("find_earliest_tool_turn", {
-                "messages_count": len(self.messages),
-                "result": None,
-                "reason": "no_tool_calls_found",
-            })
-            return None
-
-        # Step 2: Find the non-interrupt user message that starts this turn
-        user_idx = self._find_last_user_idx(start=first_tool_idx - 1)
-        if user_idx is None:
-            # No user message before tool calls — unusual but handle it
-            # Use the start of messages as the boundary
-            user_idx = 0
-
-        # Step 3: Walk forward from the tool_calls to find the end of the turn.
-        # The turn ends when we reach a non-interrupt user message or a final
-        # assistant message without tool_calls that isn't followed by more tools.
-        # We need to handle multi-round tool use within a single turn:
-        #   assistant(tool_calls) → tool → assistant(tool_calls) → tool → assistant(text)
-        end_idx = None
-        i = first_tool_idx
-        while i < len(self.messages):
-            msg = self.messages[i]
-
-            if msg.get("role") == "user" and not msg.get("interrupt"):
-                # We've hit the next turn — back up one
-                end_idx = i - 1
-                break
-
-            if msg.get("role") == "assistant" and not msg.get("tool_calls"):
-                # Final assistant message in this turn
-                end_idx = i
-                # Keep going to check if there's more tool use after this
-                # (shouldn't happen without a user message, but be safe)
-                i += 1
-                continue
-
-            i += 1
-
-        if end_idx is None:
-            # Turn doesn't have a clean end — use end of messages as boundary
-            # This handles the case where the last turn has tool calls but no
-            # concluding assistant text (e.g. after --continue or interrupted runs)
-            end_idx = len(self.messages) - 1
-
-        log_journal_debug("find_earliest_tool_turn", {
-            "messages_count": len(self.messages),
-            "result": (user_idx, end_idx),
-            "first_tool_idx": first_tool_idx,
-        })
-        return (user_idx, end_idx)
-
-    def _count_tool_turns(self) -> int:
-        """Count the number of tool-using turns in the message history.
-
-        A tool-using turn is a group (non-interrupt user msg through to next
-        non-interrupt user msg or end) that contains at least one assistant
-        message with tool_calls.
-
-        Returns:
-            Number of tool-using turn groups.
-        """
-        if not self.messages:
-            log_journal_debug("count_tool_turns", {
-                "messages_count": 0,
-                "result": 0,
-            })
-            return 0
-
-        count = 0
-        in_tool_turn = False
-        for msg in self.messages:
-            if msg.get("role") == "user" and not msg.get("interrupt"):
-                # Start of a new group
-                in_tool_turn = False
-            elif msg.get("role") == "assistant" and msg.get("tool_calls"):
-                if not in_tool_turn:
-                    count += 1
-                    in_tool_turn = True
-
-        log_journal_debug("count_tool_turns", {
-            "messages_count": len(self.messages),
-            "result": count,
-        })
-        return count
-
-    def _has_tool_calls_in_last_turn(self) -> bool:
-        """Check if the last turn contained any tool calls.
-
-        Looks from the last non-interrupt user message forward, so that
-        tool calls before a mid-turn interrupt are still detected.
-
-        Returns:
-            True if any assistant message after the last non-interrupt
-            user message has tool_calls.
-        """
-        if not self.messages:
-            return False
-
-        # Find the last non-interrupt user message
-        last_user_idx = self._find_last_user_idx()
-        if last_user_idx is None:
-            return False
-
-        # Check for tool_calls in any assistant message after the last non-interrupt user message
-        for msg in self.messages[last_user_idx + 1 :]:
-            if msg.get("role") == "assistant" and msg.get("tool_calls"):
-                return True
-
-        return False
-
-    def _has_skill_call_in_last_turn(self) -> bool:
-        """Check if the last turn contained a 'skill' tool call.
-
-        Skill tool calls load instructions that must remain in context —
-        journalling would destroy them by replacing the tool result with
-        a summary. This method detects such calls so journalling can be
-        skipped.
-
-        Returns:
-            True if any assistant message after the last non-interrupt
-            user message has a tool_call with function name 'skill'.
-        """
-        if not self.messages:
-            return False
-
-        last_user_idx = self._find_last_user_idx()
-        if last_user_idx is None:
-            return False
-
-        for msg in self.messages[last_user_idx + 1 :]:
-            if msg.get("role") == "assistant" and msg.get("tool_calls"):
-                for tc in msg["tool_calls"]:
-                    if tc.get("function", {}).get("name") == "skill":
-                        return True
-
-        return False
-
-    def _has_skill_call_in_range(self, start: int, end: int) -> bool:
-        """Check if a range of messages contains a 'skill' tool call.
-
-        Used by journal_all to skip individual turns that contain skill
-        calls while still journalling other turns.
-
-        Args:
-            start: Start index (inclusive).
-            end: End index (inclusive).
-
-        Returns:
-            True if any assistant message in [start, end] has a
-            tool_call with function name 'skill'.
-        """
-        for msg in self.messages[start : end + 1]:
-            if msg.get("role") == "assistant" and msg.get("tool_calls"):
-                for tc in msg["tool_calls"]:
-                    if tc.get("function", {}).get("name") == "skill":
-                        return True
-
-        return False
-
-    def _find_skill_call_ranges(self, start: int, end: int) -> list[tuple[int, int]]:
-        """Find sub-ranges within [start, end] that contain skill calls.
-
-        Each skill call range includes the assistant message with the skill
-        tool_call and the corresponding tool result messages that follow it.
-        These ranges must be preserved verbatim during journalling.
-
-        Args:
-            start: Start index (inclusive).
-            end: End index (inclusive).
-
-        Returns:
-            List of (skill_start, skill_end) tuples, sorted by index.
-        """
-        skill_ranges = []
-        i = start
-        while i <= end:
-            msg = self.messages[i]
-            if msg.get("role") == "assistant" and msg.get("tool_calls"):
-                has_skill = any(
-                    tc.get("function", {}).get("name") == "skill"
-                    for tc in msg["tool_calls"]
-                )
-                if has_skill:
-                    skill_start = i
-                    # Include this assistant message and all following
-                    # tool result messages
-                    skill_end = i
-                    j = i + 1
-                    while j <= end and self.messages[j].get("role") == "tool":
-                        skill_end = j
-                        j += 1
-                    skill_ranges.append((skill_start, skill_end))
-                    i = skill_end + 1
-                    continue
-            i += 1
-        return skill_ranges
-
-    def _repair_interrupted_messages(self) -> None:
-        """Repair message history after an interrupt (task cancellation).
-
-        When the agent is interrupted mid-turn via Escape (task.cancel()),
-        the message history can be left in an inconsistent state:
-        - Last message is 'user' (streaming was interrupted before the
-          assistant response was appended) → next user message breaks
-          role alternation.
-        - Last message is 'assistant' with tool_calls but missing tool
-          results → API requires every tool_call to have a matching result.
-
-        This method looks at the last message and closes the turn:
-        - user → append [Interrupted] assistant message
-        - assistant with tool_calls → append missing tool results with
-          [Interrupted] error, then append [Interrupted] assistant message
-        - tool (results sent but LLM hasn't responded) → append
-          [Interrupted] assistant message
-        - assistant without tool_calls → already complete, do nothing
-        """
-        if not self.messages:
-            return
-
-        last = self.messages[-1]
-
-        if last["role"] == "user":
-            # Streaming was interrupted before assistant response was appended.
-            # Close the turn so the next user message alternates correctly.
-            self.messages.append(
-                {
-                    "role": "assistant",
-                    "content": "[Interrupted]",
-                    "interrupt": True,
-                }
-            )
-
-        elif last["role"] == "assistant" and last.get("tool_calls"):
-            # Tool calls were issued but not all results came back.
-            # Append missing tool results so every tool_call has a match.
-            tool_call_ids = {tc["id"] for tc in last["tool_calls"]}
-            result_ids = set()
-            for msg in self.messages[self.messages.index(last) + 1 :]:
-                if msg.get("role") == "tool":
-                    result_ids.add(msg.get("tool_call_id"))
-            for tc_id in tool_call_ids - result_ids:
-                self.messages.append(
-                    {
-                        "role": "tool",
-                        "tool_call_id": tc_id,
-                        "content": "[Interrupted]",
-                    }
-                )
-            # Close the turn
-            self.messages.append(
-                {
-                    "role": "assistant",
-                    "content": "[Interrupted]",
-                    "interrupt": True,
-                }
-            )
-
-        elif last["role"] == "tool":
-            # Tool results sent but LLM hasn't responded yet.
-            # Close the turn.
-            self.messages.append(
-                {
-                    "role": "assistant",
-                    "content": "[Interrupted]",
-                    "interrupt": True,
-                }
-            )
-
-        # assistant without tool_calls → already complete, nothing to do
-
-    def _has_incomplete_turn(self) -> bool:
-        """Check if the conversation has an incomplete turn.
-
-        A turn is incomplete if:
-        - Last message is assistant with tool_calls (tools not yet executed)
-        - Last message is tool (results not yet processed by LLM)
-
-        Returns:
-            True if the turn is incomplete and needs to be resumed.
-        """
-        if not self.messages:
-            return False
-
-        last_msg = self.messages[-1]
-
-        # Case 1: Assistant with pending tool calls
-        if last_msg.get("role") == "assistant" and last_msg.get("tool_calls"):
-            return True
-
-        # Case 2: Tool result waiting for LLM to process
-        if last_msg.get("role") == "tool":
-            return True
-
-        return False
-
-    def _get_pending_tool_calls(self) -> list[dict] | None:
-        """Get pending tool calls that need to be executed.
-
-        Returns the tool_calls from the last assistant message if:
-        - Last message is assistant with tool_calls
-        - Not all tools have been executed (fewer tool results than tool_calls)
-
-        Returns:
-            List of pending tool call dicts, or None if no pending tools.
-        """
-        if not self.messages:
-            return None
-
-        last_msg = self.messages[-1]
-
-        # Must be assistant with tool_calls
-        if last_msg.get("role") != "assistant":
-            return None
-
-        tool_calls = last_msg.get("tool_calls")
-        if not tool_calls:
-            return None
-
-        # Count how many tool results we have after this assistant message
-        # (they would be right after it if any)
-        tool_results = 0
-        for i in range(len(self.messages) - 2, -1, -1):  # Start from second-to-last
-            if self.messages[i].get("role") == "tool":
-                tool_results += 1
-            else:
-                break  # Stop at first non-tool message
-
-        # If we have fewer results than tool_calls, return the pending ones
-        if tool_results < len(tool_calls):
-            return tool_calls[tool_results:]  # Return unexecuted tools
-        return None
-
-    def _get_final_assistant_message(self) -> str | None:
-        """Get the content of the final assistant message in the last turn.
-
-        Returns:
-            The content of the last assistant message, or None if not found.
-        """
-        if not self.messages:
-            return None
-
-        # The last message should be the final assistant response
-        last_msg = self.messages[-1]
-        if last_msg.get("role") == "assistant":
-            return last_msg.get("content", "")
-        return None
-
-    def _get_message_groups(self) -> list[list[int]]:
-        """Group messages for atomic deletion.
-
-        Each group starts with a non-interrupt user message and includes all
-        subsequent messages (interrupt user messages, tool calls, tool results,
-        assistant responses) until the next non-interrupt user message.
-
-        Interrupt user messages (marked with "interrupt": True) are kept in
-        the same group as the turn they interrupted, so they are deleted
-        together when retrying or compacting.
-
-        Returns:
-            List of groups, where each group is a list of message indices.
-        """
-        groups = []
-        current_group = []
-
-        for i, msg in enumerate(self.messages):
-            role = msg.get("role", "unknown")
-
-            if role == "user" and not msg.get("interrupt"):
-                # Start a new group (non-interrupt user message)
-                if current_group:
-                    groups.append(current_group)
-                current_group = [i]
-            else:
-                # Add to current group (interrupt user msgs, tools, assistants)
-                current_group.append(i)
-
-        # Don't forget the last group
-        if current_group:
-            groups.append(current_group)
-
-        return groups
-
-    def _compact_previous_turn(
-        self,
-        tool_summary: str,
-        final_message: str = "",
-        preserved_skills: list[dict] | None = None,
-    ) -> None:
-        """Compact the previous turn by replacing tool exploration with a summary.
-
-        Finds the last non-interrupt user message and replaces everything after
-        it with:
-        - Preserved skill messages (if any) — as text, at the start
-        - The tool summary (summarizing tool calls and results)
-        - The original final assistant message (preserving the conclusion)
-
-        Interrupt user messages are skipped so that the entire turn (including
-        any mid-turn injected interrupts and their responses) is compacted as
-        one unit.
-
-        Args:
-            tool_summary: Summary of tool exploration.
-            final_message: The original final assistant response to preserve.
-            preserved_skills: Skill call/result messages to preserve.
-                Converted from raw API format (assistant+tool_calls + tool
-                result) to text-only assistant messages during insertion.
-                This prevents _find_earliest_tool_turn from re-finding the
-                same turn after compaction.
-        """
-        if not self.messages:
-            return
-
-        # Find the index of the last non-interrupt user message
-        last_user_idx = self._find_last_user_idx()
-        if last_user_idx is None:
-            # No non-interrupt user message found, nothing to compact
-            return
-
-        # Combine tool summary with final message
-        combined_content = (
-            f"{tool_summary}\n\n{final_message}" if final_message else tool_summary
-        )
-
-        # Keep messages up to and including the last non-interrupt user message
-        self.messages = self.messages[: last_user_idx + 1]
-
-        # Insert preserved skill messages before the summary
-        # Convert from raw API format (assistant+tool_calls + tool result)
-        # to text-only assistant messages. This prevents _find_earliest_tool_turn
-        # from re-finding the same turn after compaction (infinite loop).
-        if preserved_skills:
-            i = 0
-            while i < len(preserved_skills):
-                msg = preserved_skills[i]
-                if msg.get("role") == "assistant" and msg.get("tool_calls"):
-                    # Extract skill name from tool_calls
-                    skill_name = ""
-                    for tc in msg["tool_calls"]:
-                        fn = tc.get("function", {})
-                        if fn.get("name") == "skill":
-                            args = fn.get("arguments", {})
-                            if isinstance(args, str):
-                                try:
-                                    args = json.loads(args)
-                                except (json.JSONDecodeError, ValueError):
-                                    args = {}
-                            skill_name = args.get("name", "")
-                            break
-
-                    # Find the matching tool result (next message)
-                    skill_content = ""
-                    if i + 1 < len(preserved_skills):
-                        next_msg = preserved_skills[i + 1]
-                        if next_msg.get("role") == "tool":
-                            skill_content = next_msg.get("content", "")
-                            i += 1  # skip tool result, consumed
-
-                    # Emit as single text-only assistant message
-                    label = f"[Skill: {skill_name}]" if skill_name else "[Skill]"
-                    self.messages.append({
-                        "role": "assistant",
-                        "content": f"{label}\n\n{skill_content}" if skill_content else label,
-                    })
-                else:
-                    # Non-skill message (shouldn't happen, but handle gracefully)
-                    content = msg.get("content", "")
-                    if content:
-                        self.messages.append({
-                            "role": "assistant",
-                            "content": content,
-                        })
-                i += 1
-
-        # Then append the combined summary
-        self.messages.append({"role": "assistant", "content": combined_content})
 
     async def _stream_and_emit(
         self,
@@ -927,445 +423,6 @@ class Agent:
                 continue
 
             yield event_type, data
-
-    async def _reflect_on_tool_use(
-        self,
-        skill_names: list[str] | None = None,
-        messages: list[dict] | None = None,
-    ) -> str | None:
-        """Ask the LLM to summarize its tool use for context compaction.
-
-        Makes a separate API call with a reflection prompt focused on tool calls.
-        The response summarizes what tools were used and what was found.
-
-        Sends tools with tool_choice="none" to preserve LCP cache matching
-        with the main loop. Without this, omitting tools from the request
-        causes the serialization order to diverge after the system prompt,
-        resulting in massive KV cache misses (sim_best drops from ~0.997
-        to ~0.591, adding 20+ minutes of reprocessing).
-
-        Emits streaming events so the TUI can display "Reflecting:" feedback.
-
-        Args:
-            skill_names: Names of skills loaded this turn. If provided,
-                a brief note is prepended to the reflection prompt so the
-                LLM can reference skills in its summary without seeing the
-                full skill content.
-            messages: Messages to reflect on. Defaults to self.messages.copy().
-
-        Returns:
-            The tool use summary text, or None if reflection fails.
-        """
-        # Build reflection prompt — add skill names if present
-        reflection_prompt = REFLECTION_PROMPT
-        if skill_names:
-            skill_note = f"[Skills loaded this turn: {', '.join(skill_names)}]"
-            reflection_prompt = f"{skill_note}\n\n{reflection_prompt}"
-
-        # Build temporary messages for reflection API call
-        temp_messages = (messages or self.messages).copy()
-        temp_messages.append({"role": "user", "content": reflection_prompt})
-
-        try:
-            # Set JOURNALING status so TUI shows correct spinner
-            await self._set_status(AgentStatus.JOURNALING)
-
-            # Stream via _stream_and_emit which handles STREAM_START
-            # and TOKEN_USAGE centrally (DRY). tool_choice="auto"
-            # to preserve LCP cache matching with the main loop.
-            # Without tools, the serialization order diverges after
-            # the system prompt, causing massive cache misses
-            # (sim_best=0.591 vs 0.997).
-            # Note: I rolled back to tool_choice="auto" rather than "none"
-            # as I suspect this also causes issues.
-            content_parts = []
-            async for event_type, data in self._stream_and_emit(
-                temp_messages,
-                source="reflection",
-                tool_choice="auto",
-            ):
-                # Ignore tool_call events (shouldn't happen with
-                # tool_choice="none", but handle gracefully if they do)
-                if event_type in ("tool_call", "tool_calls_complete"):
-                    continue
-                if data:
-                    # Emit all tokens as reasoning (reflection is essentially thinking)
-                    await self.emit(
-                        AgentEvent.ASSISTANT_REASONING,
-                        {
-                            "text": data,
-                            "source": "reflection",
-                        },
-                    )
-                    if event_type == "content":
-                        content_parts.append(data)
-
-            # Emit final token to signal stream end
-            await self.emit(AgentEvent.ASSISTANT_COMPLETE, {})
-
-            content = "".join(content_parts)
-            if not content or not content.strip():
-                # Restore status from JOURNALING (caller may not expect it)
-                if self._status == AgentStatus.JOURNALING:
-                    await self._set_status(AgentStatus.IDLE)
-                return None
-
-            # Log the reflection for debugging
-            log_journal_reflection("", content.strip(), len(self.messages))
-
-            return content.strip()
-
-        except Exception as e:
-            log_error(e, {"context": "journal_reflection"})
-            # Emit the error to the UI so user can see what went wrong
-            llm_error = categorize_error(e) if not isinstance(e, LLMError) else e
-            await self.emit(
-                AgentEvent.ERROR,
-                {
-                    "message": str(llm_error),
-                    "error_type": llm_error.error_type,
-                    "exception": e,
-                },
-            )
-            # Restore status from JOURNALING
-            if self._status == AgentStatus.JOURNALING:
-                await self._set_status(AgentStatus.IDLE)
-            return None
-
-    async def _journal_one_turn(
-        self,
-        token_count_messages: list | None = None,
-        skill_ranges: list[tuple[int, int]] | None = None,
-        **event_extras,
-    ) -> tuple[bool, str | None, int, int]:
-        """Reflect on tool use, compact the turn, and emit a journal event.
-
-        This is the shared core of all journal paths: auto-journal,
-        journal_last_turn, and journal_all. It performs the 5-step sequence:
-        reflect → get final message → count tokens → compact → emit.
-
-        When skill_ranges are provided, skill messages are extracted before
-        reflection (so the LLM doesn't waste tokens on content that will
-        be preserved verbatim), a skill-names note is added to the
-        reflection prompt, and the full skill messages are reinserted at
-        the start of the compacted turn.
-
-        Args:
-            token_count_messages: Messages to count tokens from.
-                Defaults to self.messages[-4:] (approximate last turn).
-            skill_ranges: Ranges of (skill_start, skill_end) indices
-                within self.messages that contain skill calls and results.
-                These are extracted before reflection and reinserted
-                verbatim at the start of the compacted turn.
-            **event_extras: Additional fields merged into the JOURNAL_COMPACT event
-                (e.g. retrospective=True, mode="all", iteration, total_turns).
-
-        Returns:
-            Tuple of (success, summary_or_None, tokens_before, tokens_after).
-        """
-        # Extract skill messages and build reflection input without them
-        preserved_skills: list[dict] | None = None
-        skill_names: list[str] | None = None
-        reflect_messages: list[dict] | None = None
-
-        if skill_ranges:
-            # Collect skill message dicts for later reinsertion
-            preserved_skills = []
-            skill_names = []
-            for sr_start, sr_end in skill_ranges:
-                for idx in range(sr_start, sr_end + 1):
-                    preserved_skills.append(self.messages[idx])
-                # Extract skill name from the assistant message's tool_calls
-                for idx in range(sr_start, sr_end + 1):
-                    msg = self.messages[idx]
-                    if msg.get("role") == "assistant" and msg.get("tool_calls"):
-                        for tc in msg["tool_calls"]:
-                            fn_name = tc.get("function", {}).get("name", "")
-                            if fn_name == "skill":
-                                args = tc.get("function", {}).get("arguments", {})
-                                # arguments may be a JSON string or dict
-                                if isinstance(args, str):
-                                    try:
-                                        args = json.loads(args)
-                                    except (json.JSONDecodeError, ValueError):
-                                        args = {}
-                                skill_name = args.get("name", "")
-                                if skill_name and skill_name not in skill_names:
-                                    skill_names.append(skill_name)
-
-            # Build reflection messages with skill ranges removed
-            reflect_messages = []
-            skip_indices = set()
-            for sr_start, sr_end in skill_ranges:
-                for idx in range(sr_start, sr_end + 1):
-                    skip_indices.add(idx)
-            for idx, msg in enumerate(self.messages):
-                if idx not in skip_indices:
-                    reflect_messages.append(msg)
-
-        tool_summary = await self._reflect_on_tool_use(
-            skill_names=skill_names,
-            messages=reflect_messages,
-        )
-        if not tool_summary:
-            return False, None, 0, 0
-
-        final_message = self._get_final_assistant_message() or ""
-
-        if token_count_messages is None:
-            token_count_messages = self.messages[-4:]
-        tokens_before = sum(
-            len(m.get("content", "").split()) for m in token_count_messages
-        )
-        tokens_after = len(tool_summary.split()) + len(final_message.split())
-
-        self._compact_previous_turn(
-            tool_summary, final_message, preserved_skills=preserved_skills
-        )
-
-        await self.emit(
-            AgentEvent.JOURNAL_COMPACT,
-            {
-                "summary": tool_summary,
-                "tokens_before": tokens_before,
-                "tokens_after": tokens_after,
-                **event_extras,
-            },
-        )
-
-        # Emit TOKEN_USAGE so the TUI can update its Ctx counter
-        # after compaction (wishlist #54). The reflection API call
-        # already emitted TOKEN_USAGE with real token counts via
-        # _stream_and_emit. This supplementary emission updates the
-        # Ctx counter to the post-compaction context size.
-        # completion_tokens=0 prevents TPS miscalculation.
-        await self.emit(
-            AgentEvent.TOKEN_USAGE,
-            {
-                "prompt_tokens": self.prompt_tokens,
-                "completion_tokens": 0,
-                "total_tokens": self.prompt_tokens,
-                "source": "journal_compact",
-            },
-        )
-
-        return True, tool_summary, tokens_before, tokens_after
-
-    async def _maybe_reflect_after_turn(self) -> None:
-        """Run reflection after turn completes and apply compaction immediately.
-
-        This is Stage 12 of journal mode: proactive reflection trigger.
-        Reflection, compaction, and event emission all happen immediately
-        after the agent finishes its turn, via _journal_one_turn(), so the
-        message history is always compacted before the user sees it.
-
-        Skill calls in the turn are handled gracefully: skill messages are
-        extracted before reflection (so the LLM doesn't process content
-        that will be preserved verbatim), a skill-names note is added to
-        the reflection prompt, and the full skill messages are reinserted
-        at the start of the compacted turn.
-
-        Conditions for reflection:
-        - journal_mode is True
-        - There are messages to compact
-        - Last turn had tool calls
-        - No interrupt is in progress
-        """
-        if not self.journal_mode:
-            return
-        if not self.messages:
-            return
-        if not self._has_tool_calls_in_last_turn():
-            return
-        if self.queue.has_interrupt:
-            return
-
-        # Find skill call ranges in the last turn (if any)
-        last_user_idx = self._find_last_user_idx()
-        skill_ranges = None
-        if last_user_idx is not None:
-            end_idx = len(self.messages) - 1
-            ranges = self._find_skill_call_ranges(last_user_idx, end_idx)
-            if ranges:
-                skill_ranges = ranges
-
-        # Reflect, compact, and emit
-        await self._journal_one_turn(skill_ranges=skill_ranges)
-
-    async def journal_last_turn(self) -> tuple[bool, str]:
-        """Journal the most recent tool-using turn immediately.
-
-        This performs retrospective compaction on the last turn, similar to
-        what happens when journal_mode is enabled and a new message arrives.
-
-        Skill calls in the turn are handled gracefully: skill messages are
-        extracted before reflection and reinserted verbatim at the start
-        of the compacted turn.
-
-        Called from _process_item when a journal_last queue item is processed.
-        Status management is handled by _process_item.
-
-        Returns:
-            Tuple of (success: bool, message: str) describing the outcome.
-        """
-        if not self.messages:
-            return False, "No messages in context"
-
-        if not self._has_tool_calls_in_last_turn():
-            return False, "No tool calls in the most recent turn"
-
-        # Find skill call ranges in the last turn (if any)
-        last_user_idx = self._find_last_user_idx()
-        skill_ranges = None
-        if last_user_idx is not None:
-            end_idx = len(self.messages) - 1
-            ranges = self._find_skill_call_ranges(last_user_idx, end_idx)
-            if ranges:
-                skill_ranges = ranges
-
-        # Reflect, compact, and emit
-        success, _, tokens_before, tokens_after = await self._journal_one_turn(
-            retrospective=True, skill_ranges=skill_ranges
-        )
-        if not success:
-            return False, "Reflection produced no summary"
-
-        return True, f"Compacted {tokens_before}\u2192{tokens_after} words"
-
-    async def journal_all(self) -> tuple[bool, str]:
-        """Iteratively journal all tool-using turns from earliest to latest.
-
-        Unlike journal_last_turn which compacts only the most recent turn,
-        this method finds every tool-using turn in the history and applies
-        the existing per-turn reflection and compaction, one at a time,
-        starting from the earliest.
-
-        Called from _process_item when a journal_all queue item is processed.
-        Status management is handled by _process_item.
-
-        Each iteration:
-        1. Finds the earliest tool-using turn boundary
-        2. Temporarily truncates messages to end at that turn
-        3. Runs _journal_one_turn() to reflect, compact, and emit
-        4. Restores messages after the compacted turn
-        5. Repeats until no tool-using turns remain
-
-        Skill calls within a turn are handled by _journal_one_turn():
-        skill messages are extracted before reflection and reinserted
-        verbatim at the start of the compacted turn.
-
-        This preserves user messages and non-tool assistant messages verbatim
-        — only the tool-calling machinery gets compacted.
-
-        Returns:
-            Tuple of (success: bool, message: str) describing the outcome.
-        """
-        log_journal_debug("journal_all", {
-            "step": "start",
-            "messages_count": len(self.messages),
-            "journal_mode": self.journal_mode,
-            "first_3_roles": [m.get("role") for m in self.messages[:3]] if self.messages else [],
-        })
-        if not self.messages:
-            log_journal_debug("journal_all", {
-                "step": "early_return",
-                "reason": "no_messages",
-                "messages_count": 0,
-            })
-            return False, "No messages in context"
-
-        if not self._has_tool_calls():
-            log_journal_debug("journal_all", {
-                "step": "early_return",
-                "reason": "no_tool_calls",
-                "messages_count": len(self.messages),
-            })
-            return False, "No tool-using turns to journal"
-
-        total_turns = self._count_tool_turns()
-        if total_turns == 0:
-            log_journal_debug("journal_all", {
-                "step": "early_return",
-                "reason": "zero_tool_turns",
-                "messages_count": len(self.messages),
-            })
-            return False, "No tool-using turns to journal"
-
-        total_tokens_before = 0
-        total_tokens_after = 0
-        iteration = 0
-
-        while True:
-            # Find the earliest tool-using turn
-            boundary = self._find_earliest_tool_turn()
-            if boundary is None:
-                break
-
-            user_idx, end_idx = boundary
-
-            # Find skill call ranges within this turn
-            skill_ranges = self._find_skill_call_ranges(user_idx, end_idx)
-
-            if skill_ranges:
-                log_journal_debug("journal_all_skill_ranges", {
-                    "user_idx": user_idx,
-                    "end_idx": end_idx,
-                    "skill_ranges": skill_ranges,
-                })
-
-            # Save messages after this turn (they'll be restored after compaction)
-            tail = self.messages[end_idx + 1 :]
-
-            # Temporarily truncate to just the turn + preceding context
-            self.messages = self.messages[: end_idx + 1]
-
-            # Messages in the turn being compacted (for token counting)
-            turn_msgs = self.messages[user_idx:]
-
-            # Reflect, compact, and emit
-            # skill_ranges is passed so _journal_one_turn can extract
-            # skill messages before reflection and reinsert them at the
-            # start of the compacted turn.
-            success, _, tokens_before, tokens_after = await self._journal_one_turn(
-                token_count_messages=turn_msgs,
-                retrospective=True,
-                mode="all",
-                iteration=iteration + 1,
-                total_turns=total_turns,
-                skill_ranges=skill_ranges or None,
-            )
-
-            # Restore the tail
-            self.messages.extend(tail)
-
-            if not success:
-                # Reflection failed — stop iterating
-                log_error(
-                    RuntimeError("Reflection returned None"),
-                    {
-                        "context": "journal_all_iteration",
-                        "iteration": iteration + 1,
-                        "total_turns": total_turns,
-                        "messages_count": len(self.messages),
-                    },
-                )
-                if iteration == 0:
-                    return False, "Reflection produced no summary"
-                # Partial success — stop iterating but report what we did
-                break
-
-            iteration += 1
-            total_tokens_before += tokens_before
-            total_tokens_after += tokens_after
-
-        if iteration == 0:
-            return False, "No tool-using turns to journal"
-
-        savings = total_tokens_before - total_tokens_after
-        return True, (
-            f"Journalled {iteration} turn(s): "
-            f"{total_tokens_before}→{total_tokens_after} words (saved {savings})"
-        )
 
     async def add_message(
         self,
@@ -1440,14 +497,23 @@ class Agent:
 
                 if current:
                     await self._process_item(current)
+
+                    # If a CancelledError was absorbed in _process_item,
+                    # exit the loop cleanly so the ESC handler can restart
+                    # with a fresh task.
+                    if self._cancel_requested:
+                        self._cancel_requested = False
+                        break
                 else:
                     # Nothing to do, wait briefly
                     await asyncio.sleep(0.05)
         except asyncio.CancelledError:
-            # User interrupted - repair message history and emit event
+            # CancelledError hit between items (not inside _process_item).
+            # Repair message history and emit event, then re-raise so
+            # finally block can clean up.
             current_id = self.queue.current.id if self.queue.current else None
             log_queue_interrupt(current_id)
-            self._repair_interrupted_messages()
+            self.history.repair_interrupted()
             if self.queue.current:
                 self.queue.complete_current()
                 log_queue_complete(current_id, "interrupted")
@@ -1459,6 +525,9 @@ class Agent:
             # be restarted, so we keep MCP connections alive.
             if not self._running and self._mcp:
                 await self._mcp.cleanup()
+            # Reset status to IDLE so is_idle reflects reality after stop/interrupt.
+            # Without this, status stays as e.g. TOOLING after a cancel.
+            self._status = AgentStatus.IDLE
             await self.emit(AgentEvent.STOPPED, {})
 
     def stop(self) -> None:
@@ -1509,6 +578,17 @@ class Agent:
         return self._pause_state == PauseState.PAUSING
 
     @property
+    def is_idle(self) -> bool:
+        """Check if the agent is fully idle (not processing, not paused).
+
+        Single source of truth for both REPL and TUI.
+        """
+        return (
+            self._pause_state == PauseState.RUNNING
+            and self._status == AgentStatus.IDLE
+        )
+
+    @property
     def has_incomplete_turn(self) -> bool:
         """Check if the agent has an incomplete turn from a loaded context."""
         return self._incomplete_turn_loaded
@@ -1535,7 +615,7 @@ class Agent:
         self._incomplete_turn_loaded = False
 
         # Check the state of messages
-        pending_tools = self._get_pending_tool_calls()
+        pending_tools = self.history.get_pending_tool_calls()
 
         if pending_tools:
             # Case 1: We have pending tool calls to execute
@@ -1593,7 +673,7 @@ class Agent:
             await self._llm_turn()
             return True
 
-        elif self._has_incomplete_turn():
+        elif self.history.has_incomplete_turn():
             # Case 2: Last message is tool result, call LLM to process
             await self._llm_turn()
             return True
@@ -1770,7 +850,7 @@ class Agent:
             # Handle journal queue items — these run reflection/compaction
             # instead of a normal LLM turn
             if item.kind == "journal_last":
-                success, message = await self.journal_last_turn()
+                success, message = await self.journal.journal_last_turn()
                 if success:
                     await self.emit(
                         AgentEvent.JOURNAL_RESULT,
@@ -1791,7 +871,7 @@ class Agent:
                 log_queue_complete(item.id, "complete")
                 await self._emit_queue_update()
             elif item.kind == "journal_all":
-                success, message = await self.journal_all()
+                success, message = await self.journal.journal_all()
                 if success:
                     await self.emit(
                         AgentEvent.JOURNAL_RESULT,
@@ -1834,7 +914,7 @@ class Agent:
                     "success": success,
                     "message": message,
                     "messages_count": len(self.messages),
-                    "has_tool_calls": self._has_tool_calls(),
+                    "has_tool_calls": self.history.has_tool_calls(),
                     "first_3_roles": [m.get("role") for m in self.messages[:3]] if self.messages else [],
                 })
                 self.queue.complete_current()
@@ -1848,64 +928,18 @@ class Agent:
                         "incomplete": incomplete,
                     },
                 )
-            elif item.kind == "retry":
-                # Deferred /retry — safe at this boundary between items
-                groups = self._get_message_groups()
-                user_text = ""
-                if groups:
-                    last_group = groups[-1]
-                    first_msg_idx = last_group[0]
-                    user_text = self.messages[first_msg_idx].get("content", "")
-                    for idx in sorted(last_group, reverse=True):
-                        del self.messages[idx]
-                self.queue.complete_current()
-                log_queue_complete(item.id, "complete")
-                await self._emit_queue_update()
-                await self.emit(
-                    AgentEvent.RETRY_STARTED,
-                    {
-                        "user_text": user_text,
-                    },
-                )
             else:
                 # Normal prompt processing
                 # Retrospective compaction: journal was off during the previous
                 # turn, but user has now turned it on. Apply compaction now so
                 # the tool calls get summarized before the new turn starts.
-                if (
-                    self.journal_mode
-                    and self.messages
-                    and self._has_tool_calls_in_last_turn()
-                    and not item.interrupt
-                    and not self._has_skill_call_in_last_turn()
-                ):
-                    tool_summary = await self._reflect_on_tool_use()
-                    if tool_summary:
-                        final_message = self._get_final_assistant_message() or ""
-                        # Count tokens before compaction
-                        tokens_before = sum(
-                            len(m.get("content", "").split())
-                            for m in self.messages[-4:]  # Approximate last turn
-                        )
-                        tokens_after = len(tool_summary.split()) + len(
-                            final_message.split()
-                        )
-                        self._compact_previous_turn(tool_summary, final_message)
-                        await self.emit(
-                            AgentEvent.JOURNAL_COMPACT,
-                            {
-                                "summary": tool_summary,
-                                "tokens_before": tokens_before,
-                                "tokens_after": tokens_after,
-                                "retrospective": True,
-                            },
-                        )
+                await self.journal.retrospective_compact(is_interrupt=item.interrupt)
                 # Strip reasoning from previous turns when remove_reasoning is enabled.
                 # In journal mode, the turn gets replaced with a summary anyway.
                 # When remove_reasoning is off (default), reasoning is preserved between
                 # turns for better multi-step continuity and user visibility.
                 if not self.journal_mode and self.remove_reasoning:
-                    self._strip_reasoning_from_messages()
+                    self.history.strip_reasoning()
 
                 # Add user message to history
                 self.messages.append({"role": "user", "content": item.text})
@@ -1913,28 +947,62 @@ class Agent:
                 # Process with LLM (may include multiple tool call rounds)
                 await self._llm_turn()
 
-                # Stage 12: Run reflection after turn completes (stores pending compaction)
-                await self._maybe_reflect_after_turn()
+                # Stage 12: Run reflection after turn completes
+                await self.journal.maybe_reflect_after_turn()
 
                 # Mark item as complete
                 self.queue.complete_current()
                 log_queue_complete(item.id, "complete")
                 await self._emit_queue_update()
 
-        except Exception as e:
-            # Categorize the error for better user feedback
-            llm_error = categorize_error(e) if not isinstance(e, LLMError) else e
-            log_error(e, {"context": "process_item", "item_id": item.id})
-            await self.emit(
-                AgentEvent.ERROR,
-                {
-                    "message": str(llm_error),
-                    "error_type": llm_error.error_type,
-                    "exception": e,
-                },
-            )
-            self.queue.complete_current()
-            log_queue_complete(item.id, "error")
+        except BaseException as e:
+            # Categorize the error for better user feedback.
+            # Catch BaseException (not just Exception) so that
+            # CancelledError (Python 3.9+ BaseException subclass) is
+            # handled here instead of escaping to run() and killing
+            # the loop.
+            #
+            # We do NOT re-raise CancelledError because:
+            #   - The ESC interrupt handler (_interrupt_agent_loop)
+            #     does its own cleanup (queue.complete_current,
+            #     widget finalization) and restarts the agent loop.
+            #   - If we re-raise, run()'s finally emits STOPPED which
+            #     races with the restarted loop and resets agent status
+            #     on the NEW task — causing "stopped" mode.
+            #   - Absorbing lets the loop survive spurious cancellations
+            #     (framework glitches, executor issues) transparently.
+            if isinstance(e, asyncio.CancelledError):
+                log_error(e, {"context": "process_item_cancelled",
+                              "item_id": item.id})
+                # Repair message history (add [Interrupted] assistant
+                # message if needed) so role alternation is preserved.
+                self.history.repair_interrupted()
+                await self.emit(
+                    AgentEvent.ERROR,
+                    {
+                        "message": "Processing cancelled",
+                        "error_type": "cancelled",
+                        "exception": e,
+                    },
+                )
+                self.queue.complete_current()
+                log_queue_complete(item.id, "interrupted")
+                self._cancel_requested = True
+            else:
+                llm_error = (
+                    categorize_error(e) if not isinstance(e, LLMError) else e
+                )
+                log_error(e, {"context": "process_item", "item_id": item.id})
+                await self.emit(
+                    AgentEvent.ERROR,
+                    {
+                        "message": str(llm_error),
+                        "error_type": llm_error.error_type,
+                        "exception": e,
+                    },
+                )
+                self.queue.complete_current()
+                log_queue_complete(item.id, "error")
 
         await self._set_status(AgentStatus.IDLE)
 
@@ -2020,6 +1088,9 @@ class Agent:
                         )
                     # Add assistant message with tool calls to history
                     # Include reasoning for within-turn continuity
+                    # Sanitize tool call arguments before storage — streaming
+                    # may accumulate malformed JSON (truncated, bad escapes)
+                    # which poisons every subsequent API call with 500s.
                     msg = {
                         "role": "assistant",
                         "content": content,
@@ -2029,7 +1100,9 @@ class Agent:
                                 "type": "function",
                                 "function": {
                                     "name": tc["name"],
-                                    "arguments": tc["arguments"],
+                                    "arguments": _sanitize_json_args(
+                                        tc["name"], tc["arguments"]
+                                    ),
                                 },
                             }
                             for tc in tool_calls
@@ -2377,13 +1450,18 @@ class Agent:
         self.model = model
         self.tool_stats.reset()  # Reset stats on model change
 
-    def set_client(self, client: AsyncOpenAI) -> None:
+    def set_client(
+        self, client: AsyncOpenAI, models: list[str] | None = None
+    ) -> None:
         """Set the OpenAI client.
 
         Args:
             client: The AsyncOpenAI client to use
+            models: Optional list of available model names to store
         """
         self.client = client
+        if models is not None:
+            self.available_models = models
 
     def set_system_prompt(self, prompt: str) -> None:
         """Set the system prompt.
@@ -2492,20 +1570,6 @@ class Agent:
             The queue item ID
         """
         item_id = self.queue.add(path, kind="load")
-        await self._emit_queue_update()
-        return item_id
-
-    async def request_retry(self) -> int:
-        """Request a retry of the last message via the queue.
-
-        Adds a kind="retry" item with interrupt=True so it breaks into
-        the current turn (if any), then deletes the last message group
-        and re-adds the user message at a safe boundary.
-
-        Returns:
-            The queue item ID
-        """
-        item_id = self.queue.add("", interrupt=True, kind="retry")
         await self._emit_queue_update()
         return item_id
 

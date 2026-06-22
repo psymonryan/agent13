@@ -27,7 +27,7 @@ class TestCompactPreviousTurn:
             {"role": "assistant", "content": "Second answer with lots of tokens"},
         ]
 
-        agent._compact_previous_turn("Summary of previous turn")
+        agent.history.compact("Summary of previous turn")
 
         # Should keep messages up to last user, then append summary
         # Result: user, assistant, user, summary
@@ -55,7 +55,7 @@ class TestCompactPreviousTurn:
             {"role": "assistant", "content": "Response 2"},
         ]
 
-        agent._compact_previous_turn("Summary")
+        agent.history.compact("Summary")
 
         # First user message should still be there
         assert agent.messages[0]["role"] == "user"
@@ -67,7 +67,7 @@ class TestCompactPreviousTurn:
         agent = Agent(client, model="test-model")
 
         agent.messages = []
-        agent._compact_previous_turn("Summary")
+        agent.history.compact("Summary")
 
         assert agent.messages == []
 
@@ -82,7 +82,7 @@ class TestCompactPreviousTurn:
             {"role": "assistant", "content": "World"},
         ]
 
-        agent._compact_previous_turn("Summary")
+        agent.history.compact("Summary")
 
         # Should remain unchanged (no user message to find)
         assert len(agent.messages) == 2
@@ -97,7 +97,7 @@ class TestCompactPreviousTurn:
             {"role": "assistant", "content": "Answer"},
         ]
 
-        agent._compact_previous_turn("Summary")
+        agent.history.compact("Summary")
 
         assert len(agent.messages) == 2
         assert agent.messages[0]["content"] == "Question"
@@ -125,7 +125,7 @@ class TestReflectOnToolUse:
         with patch("agent13.llm.stream_response_with_tools") as mock_reflect:
             mock_reflect.return_value = mock_stream()
 
-            result = await agent._reflect_on_tool_use()
+            result = await agent.journal.reflect_on_tool_use()
 
             assert result == "Attempted: math. Found: 4."
             # Verify tool_choice="auto" was passed (possible LCP cache fix)
@@ -156,7 +156,7 @@ class TestReflectOnToolUse:
         with patch("agent13.llm.stream_response_with_tools") as mock_reflect:
             mock_reflect.return_value = mock_stream()
 
-            result = await agent._reflect_on_tool_use()
+            result = await agent.journal.reflect_on_tool_use()
 
             assert result is None
 
@@ -178,7 +178,7 @@ class TestReflectOnToolUse:
         with patch("agent13.llm.stream_response_with_tools") as mock_reflect:
             mock_reflect.return_value = mock_stream()
 
-            result = await agent._reflect_on_tool_use()
+            result = await agent.journal.reflect_on_tool_use()
 
             assert result is None
 
@@ -199,7 +199,7 @@ class TestReflectOnToolUse:
 
         with patch("agent13.llm.stream_response_with_tools") as mock_reflect:
             mock_reflect.return_value = mock_stream()
-            result = await agent._reflect_on_tool_use()
+            result = await agent.journal.reflect_on_tool_use()
 
             assert result is None
 
@@ -227,7 +227,7 @@ class TestJournalModeIntegration:
             reflect_called = True
             return None
 
-        agent._reflect_on_tool_use = track_reflect
+        agent.journal.reflect_on_tool_use = track_reflect
 
         # Process an item (we need to mock the LLM turn to avoid actual API calls)
         with patch.object(agent, "_llm_turn", new_callable=AsyncMock):
@@ -267,7 +267,7 @@ class TestJournalModeIntegration:
             reflect_called = True
             return None
 
-        agent._reflect_on_tool_use = track_reflect
+        agent.journal.reflect_on_tool_use = track_reflect
 
         with patch.object(agent, "_llm_turn", new_callable=AsyncMock):
             await agent._process_item(
@@ -308,7 +308,7 @@ class TestJournalModeIntegration:
             reflect_called = True
             return None
 
-        agent._reflect_on_tool_use = track_reflect
+        agent.journal.reflect_on_tool_use = track_reflect
 
         with patch.object(agent, "_llm_turn", new_callable=AsyncMock):
             await agent._process_item(
@@ -346,7 +346,7 @@ class TestJournalModeIntegration:
         async def failing_reflect(self=None, skill_names=None, messages=None):
             return None  # Simulates failure
 
-        agent._reflect_on_tool_use = failing_reflect
+        agent.journal.reflect_on_tool_use = failing_reflect
 
         with patch.object(agent, "_llm_turn", new_callable=AsyncMock):
             await agent._process_item(
@@ -385,7 +385,7 @@ class TestJournalModeIntegration:
         async def mock_reflect(self=None, skill_names=None, messages=None):
             return "Summary of tool use"
 
-        agent._reflect_on_tool_use = mock_reflect
+        agent.journal.reflect_on_tool_use = mock_reflect
 
         # Capture events
         events = []
@@ -438,7 +438,7 @@ class TestJournalModeIntegration:
         async def mock_reflect(self=None, skill_names=None, messages=None):
             return "Brief summary"
 
-        agent._reflect_on_tool_use = mock_reflect
+        agent.journal.reflect_on_tool_use = mock_reflect
 
         with patch.object(agent, "_llm_turn", new_callable=AsyncMock):
             await agent._process_item(
@@ -495,7 +495,7 @@ class TestImmediateCompaction:
         ]
 
         # Should not raise and messages should be unchanged
-        await agent._maybe_reflect_after_turn()
+        await agent.journal.maybe_reflect_after_turn()
         assert len(agent.messages) == 2
 
     @pytest.mark.asyncio
@@ -505,7 +505,7 @@ class TestImmediateCompaction:
         agent = Agent(client, model="test-model", journal_mode=True)
         agent.messages = []
 
-        await agent._maybe_reflect_after_turn()
+        await agent.journal.maybe_reflect_after_turn()
         assert len(agent.messages) == 0
 
     @pytest.mark.asyncio
@@ -518,7 +518,7 @@ class TestImmediateCompaction:
             {"role": "assistant", "content": "Hi"},  # No tool_calls
         ]
 
-        await agent._maybe_reflect_after_turn()
+        await agent.journal.maybe_reflect_after_turn()
         # Messages unchanged
         assert len(agent.messages) == 2
 
@@ -539,7 +539,7 @@ class TestImmediateCompaction:
         agent.queue.add("interrupt message", interrupt=True)
 
         # Should skip reflection due to interrupt
-        await agent._maybe_reflect_after_turn()
+        await agent.journal.maybe_reflect_after_turn()
         # Messages unchanged
         assert len(agent.messages) == 2
 
@@ -561,7 +561,7 @@ class TestImmediateCompaction:
         async def mock_reflect(self=None, skill_names=None, messages=None):
             return "Reflected summary"
 
-        agent._reflect_on_tool_use = mock_reflect
+        agent.journal.reflect_on_tool_use = mock_reflect
 
         # Capture events
         events = []
@@ -570,7 +570,7 @@ class TestImmediateCompaction:
         async def handler(event):
             events.append(event)
 
-        await agent._maybe_reflect_after_turn()
+        await agent.journal.maybe_reflect_after_turn()
 
         # Messages should be compacted immediately (not deferred)
         assert len(agent.messages) == 2
@@ -600,9 +600,9 @@ class TestImmediateCompaction:
         async def mock_reflect(self=None, skill_names=None, messages=None):
             return None
 
-        agent._reflect_on_tool_use = mock_reflect
+        agent.journal.reflect_on_tool_use = mock_reflect
 
-        await agent._maybe_reflect_after_turn()
+        await agent.journal.maybe_reflect_after_turn()
 
         # Messages should be unchanged
         assert len(agent.messages) == 2
@@ -629,9 +629,9 @@ class TestImmediateCompaction:
         async def mock_reflect(self=None, skill_names=None, messages=None):
             return "Summary of tools"
 
-        agent._reflect_on_tool_use = mock_reflect
+        agent.journal.reflect_on_tool_use = mock_reflect
 
-        success, message = await agent.journal_last_turn()
+        success, message = await agent.journal.journal_last_turn()
 
         assert success is True
         # Messages should be compacted
@@ -671,7 +671,7 @@ class TestImmediateCompaction:
                 agent, "get_all_tools", new_callable=AsyncMock, return_value=[]
             ):
                 agent.journal_mode = True
-                await agent._maybe_reflect_after_turn()
+                await agent.journal.maybe_reflect_after_turn()
 
         # JOURNALING status should have been emitted
         assert "journaling" in statuses_seen
@@ -688,7 +688,7 @@ class TestHasToolCalls:
             {"role": "user", "content": "Hello"},
             {"role": "assistant", "content": "Hi"},
         ]
-        assert agent._has_tool_calls() is False
+        assert agent.history.has_tool_calls() is False
 
     def test_with_tool_calls(self):
         """Returns True when an assistant message has tool_calls."""
@@ -702,7 +702,7 @@ class TestHasToolCalls:
                 "tool_calls": [{"id": "1", "name": "test"}],
             },
         ]
-        assert agent._has_tool_calls() is True
+        assert agent.history.has_tool_calls() is True
 
     def test_with_tool_role(self):
         """Returns True when a message has role 'tool'."""
@@ -717,14 +717,14 @@ class TestHasToolCalls:
             },
             {"role": "tool", "tool_call_id": "1", "content": "result"},
         ]
-        assert agent._has_tool_calls() is True
+        assert agent.history.has_tool_calls() is True
 
     def test_empty_messages(self):
         """Returns False when messages list is empty."""
         client = MockClient()
         agent = Agent(client, model="test-model")
         agent.messages = []
-        assert agent._has_tool_calls() is False
+        assert agent.history.has_tool_calls() is False
 
     def test_after_compaction_no_tool_calls(self):
         """Returns False after compaction has removed tool messages."""
@@ -734,7 +734,7 @@ class TestHasToolCalls:
             {"role": "user", "content": "Hello"},
             {"role": "assistant", "content": "Summary of what I did"},
         ]
-        assert agent._has_tool_calls() is False
+        assert agent.history.has_tool_calls() is False
 
 
 class TestFindEarliestToolTurn:
@@ -748,7 +748,7 @@ class TestFindEarliestToolTurn:
             {"role": "user", "content": "Hello"},
             {"role": "assistant", "content": "Hi"},
         ]
-        assert agent._find_earliest_tool_turn() is None
+        assert agent.history.find_earliest_tool_turn() is None
 
     def test_single_tool_turn(self):
         """Finds the boundary of a single tool-using turn."""
@@ -764,7 +764,7 @@ class TestFindEarliestToolTurn:
             {"role": "tool", "tool_call_id": "1", "content": "file contents"},
             {"role": "assistant", "content": "Here is the file"},
         ]
-        result = agent._find_earliest_tool_turn()
+        result = agent.history.find_earliest_tool_turn()
         assert result is not None
         user_idx, end_idx = result
         assert user_idx == 0  # The user message
@@ -792,7 +792,7 @@ class TestFindEarliestToolTurn:
             {"role": "tool", "tool_call_id": "2", "content": "B contents"},
             {"role": "assistant", "content": "Here is B"},
         ]
-        result = agent._find_earliest_tool_turn()
+        result = agent.history.find_earliest_tool_turn()
         assert result is not None
         user_idx, end_idx = result
         assert user_idx == 0  # First user message
@@ -818,7 +818,7 @@ class TestFindEarliestToolTurn:
             {"role": "tool", "tool_call_id": "2", "content": "edited"},
             {"role": "assistant", "content": "Done editing"},
         ]
-        result = agent._find_earliest_tool_turn()
+        result = agent.history.find_earliest_tool_turn()
         assert result is not None
         user_idx, end_idx = result
         assert user_idx == 0
@@ -840,7 +840,7 @@ class TestFindEarliestToolTurn:
             {"role": "assistant", "content": "ok, continuing"},
             {"role": "assistant", "content": "Here is the file"},
         ]
-        result = agent._find_earliest_tool_turn()
+        result = agent.history.find_earliest_tool_turn()
         assert result is not None
         user_idx, end_idx = result
         assert user_idx == 0  # Non-interrupt user message
@@ -860,7 +860,7 @@ class TestFindEarliestToolTurn:
             {"role": "tool", "tool_call_id": "1", "content": "contents"},
             # No final assistant message — turn is incomplete
         ]
-        result = agent._find_earliest_tool_turn()
+        result = agent.history.find_earliest_tool_turn()
         assert result is not None
         user_idx, end_idx = result
         assert user_idx == 0  # "Read the file" user message
@@ -882,7 +882,7 @@ class TestFindEarliestToolTurn:
             {"role": "tool", "tool_call_id": "1", "content": "contents"},
             {"role": "assistant", "content": "Here is the file"},
         ]
-        result = agent._find_earliest_tool_turn()
+        result = agent.history.find_earliest_tool_turn()
         assert result is not None
         user_idx, end_idx = result
         assert user_idx == 2  # "Read the file" user message
@@ -893,7 +893,7 @@ class TestFindEarliestToolTurn:
         client = MockClient()
         agent = Agent(client, model="test-model")
         agent.messages = []
-        assert agent._find_earliest_tool_turn() is None
+        assert agent.history.find_earliest_tool_turn() is None
 
 
 class TestCountToolTurns:
@@ -907,7 +907,7 @@ class TestCountToolTurns:
             {"role": "user", "content": "Hello"},
             {"role": "assistant", "content": "Hi"},
         ]
-        assert agent._count_tool_turns() == 0
+        assert agent.history.count_tool_turns() == 0
 
     def test_single_tool_turn(self):
         """Counts a single tool-using turn."""
@@ -923,7 +923,7 @@ class TestCountToolTurns:
             {"role": "tool", "tool_call_id": "1", "content": "contents"},
             {"role": "assistant", "content": "Here is the file"},
         ]
-        assert agent._count_tool_turns() == 1
+        assert agent.history.count_tool_turns() == 1
 
     def test_multiple_tool_turns(self):
         """Counts multiple distinct tool-using turns."""
@@ -947,7 +947,7 @@ class TestCountToolTurns:
             {"role": "tool", "tool_call_id": "2", "content": "B contents"},
             {"role": "assistant", "content": "Here is B"},
         ]
-        assert agent._count_tool_turns() == 2
+        assert agent.history.count_tool_turns() == 2
 
     def test_multi_round_counts_as_one(self):
         """Multi-round tool use within one turn counts as one turn."""
@@ -969,14 +969,14 @@ class TestCountToolTurns:
             {"role": "tool", "tool_call_id": "2", "content": "edited"},
             {"role": "assistant", "content": "Done editing"},
         ]
-        assert agent._count_tool_turns() == 1
+        assert agent.history.count_tool_turns() == 1
 
     def test_empty_messages(self):
         """Returns 0 for empty message list."""
         client = MockClient()
         agent = Agent(client, model="test-model")
         agent.messages = []
-        assert agent._count_tool_turns() == 0
+        assert agent.history.count_tool_turns() == 0
 
 
 class TestJournalAll:
@@ -989,7 +989,7 @@ class TestJournalAll:
         agent = Agent(client, model="test-model")
         agent.messages = []
 
-        success, message = await agent.journal_all()
+        success, message = await agent.journal.journal_all()
         assert success is False
         assert "No messages" in message
 
@@ -1003,7 +1003,7 @@ class TestJournalAll:
             {"role": "assistant", "content": "Hi"},
         ]
 
-        success, message = await agent.journal_all()
+        success, message = await agent.journal.journal_all()
         assert success is False
         assert "No tool-using turns" in message
 
@@ -1026,9 +1026,9 @@ class TestJournalAll:
         async def mock_reflect(self=None, skill_names=None, messages=None):
             return "Used read_file to read the file"
 
-        agent._reflect_on_tool_use = mock_reflect
+        agent.journal.reflect_on_tool_use = mock_reflect
 
-        success, message = await agent.journal_all()
+        success, message = await agent.journal.journal_all()
         assert success is True
         assert "1 turn" in message
         # After compaction: user message + compacted assistant
@@ -1037,7 +1037,7 @@ class TestJournalAll:
         assert agent.messages[1]["role"] == "assistant"
         assert "read_file" in agent.messages[1]["content"]
         # No tool_calls or tool role messages remain
-        assert not agent._has_tool_calls()
+        assert not agent.history.has_tool_calls()
 
     @pytest.mark.asyncio
     async def test_multiple_turns(self):
@@ -1070,15 +1070,15 @@ class TestJournalAll:
             reflect_count += 1
             return f"Summary of tool use round {reflect_count}"
 
-        agent._reflect_on_tool_use = mock_reflect
+        agent.journal.reflect_on_tool_use = mock_reflect
 
-        success, message = await agent.journal_all()
+        success, message = await agent.journal.journal_all()
         assert success is True
         assert "2 turn" in message
         assert reflect_count == 2
         # After compacting both turns: user1 + assistant1 + user2 + assistant2
         assert len(agent.messages) == 4
-        assert not agent._has_tool_calls()
+        assert not agent.history.has_tool_calls()
 
     @pytest.mark.asyncio
     async def test_mixed_tool_and_non_tool_turns(self):
@@ -1101,9 +1101,9 @@ class TestJournalAll:
         async def mock_reflect(self=None, skill_names=None, messages=None):
             return "Used read_file"
 
-        agent._reflect_on_tool_use = mock_reflect
+        agent.journal.reflect_on_tool_use = mock_reflect
 
-        success, message = await agent.journal_all()
+        success, message = await agent.journal.journal_all()
         assert success is True
         assert "1 turn" in message
         # Non-tool turn preserved: user + assistant (2 msgs)
@@ -1111,7 +1111,7 @@ class TestJournalAll:
         assert len(agent.messages) == 4
         assert agent.messages[0]["content"] == "Hello"
         assert agent.messages[1]["content"] == "Hi there"
-        assert not agent._has_tool_calls()
+        assert not agent.history.has_tool_calls()
 
     @pytest.mark.asyncio
     async def test_reflection_failure_stops_iteration(self):
@@ -1146,13 +1146,13 @@ class TestJournalAll:
                 return "Summary of first turn"
             return None  # Second reflection fails
 
-        agent._reflect_on_tool_use = mock_reflect
+        agent.journal.reflect_on_tool_use = mock_reflect
 
-        success, message = await agent.journal_all()
+        success, message = await agent.journal.journal_all()
         assert success is True
         assert "1 turn" in message
         # First turn compacted, second turn still has tool calls
-        assert agent._has_tool_calls() is True
+        assert agent.history.has_tool_calls() is True
 
     @pytest.mark.asyncio
     async def test_first_reflection_failure(self):
@@ -1173,9 +1173,9 @@ class TestJournalAll:
         async def mock_reflect(self=None, skill_names=None, messages=None):
             return None
 
-        agent._reflect_on_tool_use = mock_reflect
+        agent.journal.reflect_on_tool_use = mock_reflect
 
-        success, message = await agent.journal_all()
+        success, message = await agent.journal.journal_all()
         assert success is False
         assert "no summary" in message.lower()
 
@@ -1198,7 +1198,7 @@ class TestJournalAll:
         async def mock_reflect(self=None, skill_names=None, messages=None):
             return "Used read_file"
 
-        agent._reflect_on_tool_use = mock_reflect
+        agent.journal.reflect_on_tool_use = mock_reflect
 
         events = []
 
@@ -1207,7 +1207,7 @@ class TestJournalAll:
             if event.event == AgentEvent.JOURNAL_COMPACT:
                 events.append(event)
 
-        await agent.journal_all()
+        await agent.journal.journal_all()
 
         assert len(events) == 1
         assert events[0].data.get("mode") == "all"
@@ -1235,9 +1235,9 @@ class TestJournalAll:
         async def mock_reflect(self=None, skill_names=None, messages=None):
             return "Used read_file"
 
-        agent._reflect_on_tool_use = mock_reflect
+        agent.journal.reflect_on_tool_use = mock_reflect
 
-        await agent.journal_all()
+        await agent.journal.journal_all()
 
         # The non-tool turn at the end should be preserved
         # Find the "Thanks" user message
@@ -1257,7 +1257,7 @@ class TestJournalAll:
             },
         ]
 
-        success, message = await agent.journal_all()
+        success, message = await agent.journal.journal_all()
         assert success is False
         assert "No tool-using turns" in message
 
@@ -1288,7 +1288,7 @@ class TestJournalingViaQueue:
             reflected = True
             return "Used read_file"
 
-        agent._reflect_on_tool_use = mock_reflect
+        agent.journal.reflect_on_tool_use = mock_reflect
 
         # Add journal item to queue
         await agent.add_message("/journal last", kind="journal_last")
@@ -1338,9 +1338,9 @@ class TestJournalingViaQueue:
         async def mock_reflect(self=None, skill_names=None, messages=None):
             return None  # Simulate failure
 
-        agent._reflect_on_tool_use = mock_reflect
+        agent.journal.reflect_on_tool_use = mock_reflect
 
-        success, message = await agent.journal_last_turn()
+        success, message = await agent.journal.journal_last_turn()
         assert success is False
         assert "Reflection produced no summary" in message
 
@@ -1363,10 +1363,10 @@ class TestJournalingViaQueue:
         async def mock_reflect(self=None, skill_names=None, messages=None):
             raise RuntimeError("API error")
 
-        agent._reflect_on_tool_use = mock_reflect
+        agent.journal.reflect_on_tool_use = mock_reflect
 
         with pytest.raises(RuntimeError):
-            await agent.journal_all()
+            await agent.journal.journal_all()
 
 
 class TestJournalAllIterative:
@@ -1408,14 +1408,14 @@ class TestJournalAllIterative:
                     "call": call_count,
                     "msg_count": len(agent.messages),
                     "roles": [m["role"] for m in agent.messages],
-                    "has_tool_calls": agent._has_tool_calls(),
+                    "has_tool_calls": agent.history.has_tool_calls(),
                 }
             )
             return f"Summary of tool use round {call_count}"
 
-        agent._reflect_on_tool_use = mock_reflect
+        agent.journal.reflect_on_tool_use = mock_reflect
 
-        success, message = await agent.journal_all()
+        success, message = await agent.journal.journal_all()
         assert success is True
         assert call_count == 2
 
@@ -1441,7 +1441,7 @@ class TestJournalAllIterative:
 
         # Final state: both turns compacted
         assert len(agent.messages) == 4
-        assert not agent._has_tool_calls()
+        assert not agent.history.has_tool_calls()
 
     @pytest.mark.asyncio
     async def test_three_turns_all_compacted(self):
@@ -1482,15 +1482,15 @@ class TestJournalAllIterative:
             reflect_count += 1
             return f"Round {reflect_count} summary"
 
-        agent._reflect_on_tool_use = mock_reflect
+        agent.journal.reflect_on_tool_use = mock_reflect
 
-        success, message = await agent.journal_all()
+        success, message = await agent.journal.journal_all()
         assert success is True
         assert reflect_count == 3
         assert "3 turn" in message
         # user1 + asst1 + user2 + asst2 + user3 + asst3 = 6 messages
         assert len(agent.messages) == 6
-        assert not agent._has_tool_calls()
+        assert not agent.history.has_tool_calls()
 
     @pytest.mark.asyncio
     async def test_multi_round_tool_use_in_first_turn(self):
@@ -1529,15 +1529,15 @@ class TestJournalAllIterative:
             reflect_count += 1
             return f"Round {reflect_count} summary"
 
-        agent._reflect_on_tool_use = mock_reflect
+        agent.journal.reflect_on_tool_use = mock_reflect
 
-        success, message = await agent.journal_all()
+        success, message = await agent.journal.journal_all()
         assert success is True
         assert reflect_count == 2  # Multi-round counts as one turn
         assert "2 turn" in message
         # user1 + asst1 + user2 + asst2 = 4 messages
         assert len(agent.messages) == 4
-        assert not agent._has_tool_calls()
+        assert not agent.history.has_tool_calls()
 
 
 class TestSkillJournalCompaction:
@@ -1599,13 +1599,13 @@ class TestSkillJournalCompaction:
         async def mock_reflect(self=None, skill_names=None, messages=None):
             return "Used code-review skill and read_file"
 
-        agent._reflect_on_tool_use = mock_reflect
+        agent.journal.reflect_on_tool_use = mock_reflect
 
-        success, message = await agent.journal_last_turn()
+        success, message = await agent.journal.journal_last_turn()
         assert success is True
 
         # The critical assertion: no tool_calls or tool-role messages remain
-        assert not agent._has_tool_calls(), (
+        assert not agent.history.has_tool_calls(), (
             f"Compacted turn still has tool_calls/tool messages: "
             f"{[m.get('tool_calls', m.get('role')) for m in agent.messages]}"
         )
@@ -1631,9 +1631,9 @@ class TestSkillJournalCompaction:
                 )
             return f"Summary of tool use round {reflect_count}"
 
-        agent._reflect_on_tool_use = mock_reflect
+        agent.journal.reflect_on_tool_use = mock_reflect
 
-        success, message = await agent.journal_all()
+        success, message = await agent.journal.journal_all()
         assert success is True
         # Should reflect exactly once for the single turn
         assert reflect_count == 1, (
@@ -1653,9 +1653,9 @@ class TestSkillJournalCompaction:
         async def mock_reflect(self=None, skill_names=None, messages=None):
             return "Used code-review skill and read_file"
 
-        agent._reflect_on_tool_use = mock_reflect
+        agent.journal.reflect_on_tool_use = mock_reflect
 
-        success, message = await agent.journal_last_turn()
+        success, message = await agent.journal.journal_last_turn()
         assert success is True
 
         # The skill content must still be present somewhere
@@ -1670,3 +1670,75 @@ class TestSkillJournalCompaction:
             f"Skill content missing from compacted messages. "
             f"Content: {all_content[:200]}"
         )
+
+
+class TestCountMessageWords:
+    """Tests for _count_message_words — includes tool-call arguments."""
+
+    def test_plain_content(self):
+        from agent13.journal import _count_message_words
+        msgs = [{"role": "user", "content": "hello world foo"}]
+        assert _count_message_words(msgs) == 3
+
+    def test_none_content(self):
+        from agent13.journal import _count_message_words
+        msgs = [{"role": "assistant", "content": None}]
+        assert _count_message_words(msgs) == 0
+
+    def test_tool_call_arguments_counted(self):
+        """Tool-call arguments must be counted — this is the bug fix."""
+        from agent13.journal import _count_message_words
+        msgs = [
+            {"role": "user", "content": "read the file"},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "function": {
+                            "name": "read_file",
+                            "arguments": '{"filepath": "/very/long/path/to/some/file.py"}',
+                        }
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "content": "file contents here with many words",
+            },
+        ]
+        # Must be > 3 (the tool-call args add words beyond user + tool content)
+        assert _count_message_words(msgs) > 5
+
+    def test_dict_arguments(self):
+        """Arguments may be a dict, not just a JSON string."""
+        from agent13.journal import _count_message_words
+        msgs = [
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "function": {
+                            "name": "command",
+                            "arguments": {"command": "ls -la"},
+                        }
+                    }
+                ],
+            }
+        ]
+        assert _count_message_words(msgs) > 0
+
+    def test_multiple_tool_calls(self):
+        from agent13.journal import _count_message_words
+        msgs = [
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {"function": {"name": "f", "arguments": '{"a": 1}'}},
+                    {"function": {"name": "g", "arguments": '{"b": 2}'}},
+                ],
+            }
+        ]
+        assert _count_message_words(msgs) > 1

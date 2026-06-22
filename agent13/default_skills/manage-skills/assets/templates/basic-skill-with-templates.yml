@@ -29,7 +29,7 @@ This template demonstrates how to structure a skill with reusable template files
 ## Directory Structure
 
 ```
-.vibe/skills/my-skill/
+.agent13/skills/my-skill/
 ├── SKILL.md          # Main skill documentation
 ├── README.md         # Quick reference
 ├── assets/

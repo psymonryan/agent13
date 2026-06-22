@@ -67,7 +67,7 @@ class TestReflectionTokenUsage:
             agent.emit = track_emit
 
             # Call reflection
-            await agent._reflect_on_tool_use(
+            await agent.journal.reflect_on_tool_use(
                 messages=[{"role": "user", "content": "test"}],
             )
 
@@ -103,7 +103,7 @@ class TestReflectionTokenUsage:
             agent.completion_tokens = 0
             agent.total_tokens = 0
 
-            await agent._reflect_on_tool_use(
+            await agent.journal.reflect_on_tool_use(
                 messages=[{"role": "user", "content": "test"}],
             )
 
@@ -131,7 +131,7 @@ class TestReflectionTokenUsage:
 
             agent.emit = track_emit
 
-            await agent._reflect_on_tool_use(
+            await agent.journal.reflect_on_tool_use(
                 messages=[{"role": "user", "content": "test"}],
             )
 
@@ -185,7 +185,7 @@ class TestEventParity:
             agent.emit = track_emit
 
             # Call reflection
-            await agent._reflect_on_tool_use(
+            await agent.journal.reflect_on_tool_use(
                 messages=[{"role": "user", "content": "test"}],
             )
 
@@ -242,7 +242,7 @@ class TestTPSFromReflection:
             agent.emit = track_emit
 
             # Call reflection
-            await agent._reflect_on_tool_use(
+            await agent.journal.reflect_on_tool_use(
                 messages=[{"role": "user", "content": "test"}],
             )
 
@@ -288,7 +288,7 @@ class TestTPSFromReflection:
 
             agent.emit = track_emit
 
-            await agent._reflect_on_tool_use(
+            await agent.journal.reflect_on_tool_use(
                 messages=[{"role": "user", "content": "test"}],
                 skill_names=["code-review"],
             )

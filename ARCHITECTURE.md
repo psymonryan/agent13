@@ -26,7 +26,7 @@ This document describes the architecture, design decisions, and implementation d
 
 Agent13 is an event-driven AI agent framework built on top of the OpenAI-compatible API. It provides:
 
-- **Multiple UI modes**: TUI (full-featured, Textual-based) and headless (for testing and scripting)
+- **Multiple UI modes**: TUI (full-featured, Textual-based), REPL (readline-based), and headless (for testing and scripting)
 - **Tool execution**: Both synchronous and asynchronous tools with automatic discovery and group-based visibility
 - **MCP support**: Model Context Protocol for external tool servers (stdio and HTTP transports)
 - **Queue management**: Three-level priority (normal, priority, interrupt) with safe-boundary processing
@@ -467,38 +467,18 @@ async def on_token(event: AgentEventData):
         # Update streaming display
 ```
 
-### Commands
+### REPL (`agent13/repl.py`)
 
-| Command                        | Purpose                                           |
-| ------------------------------ | ------------------------------------------------- |
-| `/help`                        | Show commands and keyboard shortcuts              |
-| `/status`                      | Show session status, settings, and save info      |
-| `/quit`, `/exit`               | Exit the application                              |
-| `/clear`                       | Clear message history (deferred to safe boundary) |
-| `/model`                       | Switch model                                      |
-| `/provider`                    | Switch provider                                   |
-| `/queue`                       | Show queue status                                 |
-| `/pause`, `/resume`            | Control processing                                |
-| `/sandbox`                     | Set sandbox mode                                  |
-| `/mcp`                         | Manage MCP servers                                |
-| `/tools`                       | List available tools                              |
-| `/prompt`                      | Manage system prompts                             |
-| `/skills`                      | List available skills                             |
-| `/journal`                     | Context compaction                                |
-| `/save`, `/load`               | Save/load conversation context                    |
-| `/retry`                       | Retry last LLM turn (deferred)                    |
-| `/devel`                       | Toggle devel mode (show/hide devel-group tools)   |
-| `/history`                     | Browse conversation history                       |
-| `/delete`                      | Delete messages from history                      |
-| `/snippet`                     | Manage text snippets                              |
-| `/spinner`                     | Control spinner animation                         |
-| `/upgrade`                     | Check for updates and apply                       |
-| `/clipboard`                   | Show or set clipboard method (osc52/system)       |
-| `/prioritise`, `/deprioritise` | Change queue item priority                        |
-| `/remove-reasoning`            | Strip reasoning tokens from last turn             |
-| `/list`                        | List providers or models                          |
-| `/tool-response`               | Control tool result display format                |
-| `/pretty`                      | Toggle pretty-printing                            |
+Readline-based interactive mode for environments where the TUI isn't suitable — SSH sessions, screen readers, minimal terminals. Activated with `--repl`; optionally paired with `--output FILE` to stream the conversation to a file for monitoring (`tail -f`).
+
+The REPL reuses the same Agent core and event system as the TUI. It subscribes to agent events and prints tokens to stdout (or the output file). It supports `@filename` expansion for inline file injection and `--read FILE` for pre-loading files into the user message.
+
+Key differences from TUI:
+
+- No Textual dependency — pure Python `readline` + stdout
+- `@filename.txt` expansion in user input (resolves to file contents)
+- `/cwd` command (REPL-only) for showing/changing working directory
+- Output file mode for screen reader accessibility
 
 ### Headless (`headless.py`)
 

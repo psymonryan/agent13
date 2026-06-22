@@ -37,6 +37,8 @@ from agent13.history import History, get_default_history_path  # noqa: E402
 from agent13.prompts import PromptManager, ensure_default_prompts  # noqa: E402
 from agent13.snippets import SnippetManager  # noqa: E402
 from agent13.core import Agent, AgentStatus, PauseState, SpinnerSpeed  # noqa: E402
+from agent13.message_history import MessageHistory  # noqa: E402
+from agent13.journal import JournalManager  # noqa: E402
 from agent13.llm import (  # noqa: E402
     stream_response,
     stream_response_complete,
@@ -64,6 +66,7 @@ from agent13.config import (  # noqa: E402
     get_config,
     get_provider,
     resolve_provider_arg,
+    resolve_provider_selection,
     reset_config,
 )
 from agent13.skills import SkillManager, SkillInfo, SkillMetadata, ensure_default_skills  # noqa: E402
@@ -149,6 +152,7 @@ __all__ = [
     "get_config",
     "get_provider",
     "resolve_provider_arg",
+    "resolve_provider_selection",
     "load_environment",
     "reset_config",
     # Debug logging

@@ -44,18 +44,60 @@ Complete reference for using Agent13 - configuration, tools, skills, TUI command
 
 ## Quick Start
 
-### Install
+### Install UV
 
 Make sure you have [uv](https://docs.astral.sh/uv/getting-started/installation/#installation-methods) installed:
+
+**macOS:**
+
+```bash
+brew install uv
+```
+
+**macOS (MacPorts):**
+
+```bash
+sudo port -b -N install uv
+```
+
+**Windows:**
+
+```cmd
+winget install --id astral-sh.uv
+```
+
+> ⚠️ **Pipe-to-shell installs** (`curl | sh`, `irm | iex`) are common but risky — a compromised URL or MITM attack can execute arbitrary code. Prefer a package manager or standalone installer. If you do use pipe-to-shell, inspect the script first and don't get comfortable making it a habit.
+
+```cmd
+powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
+```
+
+**Linux:**
+
+```bash
+pip install uv
+```
+
+Or use `pipx` if you prefer:
+
+```bash
+pipx install uv
+```
+
+**Pipe to Shell Method:**
+
+(Dangerous: see warning above)
 
 ```bash
 curl -LsSf https://astral.sh/uv/install.sh | sh
 ```
 
+### Install Agent13
+
 Install package directly from github:
 
 ```
-uv tool install https://github.com/psymonryan/agent13/releases/download/v0.1.13/agent13-0.1.13-py3-none-any.whl
+uv tool install https://github.com/psymonryan/agent13/releases/download/v0.2.0/agent13-0.2.0-py3-none-any.whl
 ```
 
 Or install from source (for hacking on the agent itself):
@@ -69,13 +111,13 @@ uv run agent13.py      # run from source
 uv tool install -e .   # install as editable tool
 ```
 
-### Uninstall
+### Uninstall Agent13
 
 ```text
 uv tool uninstall agent13
 ```
 
-### Update
+### Update Agent13
 
 ```text
 agent13 --upgrade
@@ -145,7 +187,7 @@ The TUI provides:
 - **Queue management** - Submit multiple prompts, manage queue priorities, or bypass queue with an !!interrupt command for "inflight steering"
 - **Info pane** - Context stats, model info, queue depth, token usage
 - **Tab completion** - Slash commands, model names, file paths
-- **Auto-save on exit** - Conversations saved to `~/.agent13/saves/`
+- **Auto-save on exit** - Conversations saved to `.agent13/saves/` (local working directory)
 - Manual save of entire session (-y to force over an old one)
 
 ![Textual TUI](images/Textual_TUI.png)
@@ -164,6 +206,23 @@ Batch mode processes the prompt, prints the response, and exits. Useful for:
 - Shell script integration
 - Quick one-off queries
 - Easy markdown output for copy and paste when rendering unwanted
+
+### REPL Mode
+
+For environments without a terminal UI (screen readers, SSH sessions, piping), REPL mode provides a simple readline-based prompt without the TUI:
+
+```bash
+agent13 local --repl
+```
+
+To capture the full chat transcript to a file — useful with a screen reader — add `--output` (which implies `--repl`):
+
+```bash
+agent13 local --output chat.md
+# In another terminal pane: tail -f chat.md
+```
+
+In REPL mode, all `/` slash commands work as usual. Additionally, `@filename` expansion is available to inline file contents directly into your prompt (see [Input Features](#input-features)).
 
 ### Headless Mode (for self improvement)
 
@@ -222,30 +281,38 @@ The `Agent` constructor accepts:
 - `remove_reasoning: bool` - Strip reasoning between turns
 - `devel_mode: bool` - Show devel-group tools
 
+## Input Features
+
+- **@filename expansion** (REPL mode) — Type `@path/to/file.txt` in your prompt to inline the file contents into your message. Supports `~/` home expansion and Windows drive-letter paths. Binary files are detected and skipped; text files are capped at 256 KB.
+- **--read FILE** — Read one or more files into the user message before the prompt is processed. Works in any mode (TUI, batch, REPL). Useful for injecting context files without manual copy-paste.
+
 ## Command-Line Options
 
-| Option                      | Description                                                 | Default               |
-| --------------------------- | ----------------------------------------------------------- | --------------------- |
-| `provider`                  | Provider name from config or OpenAI-compatible URL          | —                     |
-| `--list-providers`          | List available providers and exit                           | —                     |
-| `--version`                 | Show version and exit                                       | —                     |
-| `-p`, `--prompt`            | Run in batch mode with this prompt                          | —                     |
-| `--model`                   | Select model by name or number; with no value, lists models | prompts interactively |
-| `--system-prompt`           | System prompt to use                                        | default               |
-| `--sandbox`                 | Sandbox mode (permissive-open, permissive-closed, etc.)     | permissive-open       |
-| `--pretty on\|off`          | Enable/disable markdown rendering                           | on                    |
-| `--debug`                   | Enable debug logging                                        | off                   |
-| `--tool-response raw\|json` | Tool response format                                        | raw                   |
-| `--mcp`                     | Connect to MCP servers on startup (TUI only)                | off                   |
-| `--skills`                  | Include discovered skills in the system prompt              | off                   |
-| `--journal`                 | Enable journal mode (context compaction)                    | off                   |
-| `--send-reasoning`          | Include reasoning_content in message history                | off                   |
-| `--remove-reasoning`        | Strip reasoning tokens between turns                        | off                   |
-| `-c`, `--continue`          | Continue from last auto-saved session                       | —                     |
-| `--devel`                   | Enable devel mode (show devel-group tools)                  | off                   |
-| `--spinner fast\|slow\|off` | Spinner style                                               | fast                  |
-| `--upgrade`                 | Check for updates and apply, then exit                      | —                     |
-| `--clipboard osc52\|system` | Clipboard method for this session                           | osc52                 |
+| Option                      | Description                                                                                              | Default               |
+| --------------------------- | -------------------------------------------------------------------------------------------------------- | --------------------- |
+| `provider`                  | Provider name from config or OpenAI-compatible URL                                                       | —                     |
+| `--list-providers`          | List available providers and exit                                                                        | —                     |
+| `--version`                 | Show version and exit                                                                                    | —                     |
+| `-p`, `--prompt`            | Run in batch mode with this prompt                                                                       | —                     |
+| `--model`                   | Select model by name or number; with no value, lists models                                              | prompts interactively |
+| `--system-prompt`           | System prompt to use                                                                                     | default               |
+| `--sandbox`                 | Sandbox mode (permissive-open, permissive-closed, etc.)                                                  | permissive-open       |
+| `--pretty on\|off`          | Enable/disable markdown rendering                                                                        | on                    |
+| `--debug`                   | Enable debug logging                                                                                     | off                   |
+| `--tool-response raw\|json` | Tool response format                                                                                     | raw                   |
+| `--mcp`                     | Connect to MCP servers on startup (TUI only)                                                             | off                   |
+| `--skills`                  | Include discovered skills in the system prompt                                                           | off                   |
+| `--journal`                 | Enable journal mode (context compaction)                                                                 | off                   |
+| `--send-reasoning`          | Include reasoning_content in message history                                                             | off                   |
+| `--remove-reasoning`        | Strip reasoning tokens between turns                                                                     | off                   |
+| `-c`, `--continue`          | Continue from last auto-saved session                                                                    | —                     |
+| `--devel`                   | Enable devel mode (show devel-group tools)                                                               | off                   |
+| `--spinner fast\|slow\|off` | Spinner style                                                                                            | fast                  |
+| `--upgrade`                 | Check for updates and apply, then exit                                                                   | —                     |
+| `--clipboard osc52\|system` | Clipboard method for this session                                                                        | osc52                 |
+| `--read FILE`               | Read file(s) into the user message before processing                                                     | —                     |
+| `--repl`                    | Run in REPL mode (readline-based, no TUI)                                                                | off                   |
+| `--output FILE`             | Write REPL chat transcript to file (implies `--repl`) (the REPL still gets output for command responses) | —                     |
 
 ## TUI Reference
 
@@ -279,15 +346,18 @@ Commands are typed in the input field with a `/` prefix:
 | `/clear all`        | Clear conversation and reset UI widgets                |
 | `/save [name] [-y]` | Save conversation context to file (optional overwrite) |
 | `/load [name]`      | Load conversation context from file                    |
+| `/cwd [path]`       | Show or change the working directory                   |
 
 #### Model and Provider
 
-| Command            | Description                             |
-| ------------------ | --------------------------------------- |
-| `/model [name]`    | Switch model (tab-complete for list)    |
-| `/model`           | List available models                   |
-| `/provider [name]` | Switch provider (tab-complete for list) |
-| `/prompt [name]`   | Switch system prompt                    |
+| Command            | Description                                                   |
+| ------------------ | ------------------------------------------------------------- |
+| `/model [name]`    | Switch model; supports `:alias` suffix (e.g., `GLM:nothink`)  |
+| `/model`           | List available models                                         |
+| `/provider [name]` | Switch provider; supports `:alias` suffix (e.g., `6:nothink`) |
+| `/prompt [name]`   | Switch system prompt                                          |
+
+Note: both /model and /provider can use numbered or named models and providers
 
 #### Queue Management
 
@@ -591,10 +661,15 @@ Agent13 ships with these skills (copied to `~/.agent13/skills/` on first run):
 ### Managing Skills
 
 - **List skills**: `/skills` in TUI
+
 - **Invoke skill**: `/skill-name` or ask the AI to use the `skill` tool
+
 - **Skill paths**: Skills are discovered from:
+  
   1. Project directory: `.agent13/skills/`
+  
   2. Global directory: `~/.agent13/skills/`
+  
   3. Bundled defaults: `agent13/default_skills/` (auto-copied to global on first run)
      
      ## Queue and Priority
@@ -658,7 +733,7 @@ Manual save/load: (this saves in current working directory. ie: ./agent13/saves)
 /load my-session     # Load a saved context
 ```
 
-Saves are stored in `~/.agent13/saves/`. Use `/status` to check session state, turn stats, and whether a restorable auto-save is available.
+Saves are stored in `.agent13/saves/` in your current working directory (override with `AGENT13_SAVES_DIR` environment variable). Use `/status` to check session state, turn stats, and whether a restorable auto-save is available.
 
 ## Journal Mode
 

@@ -1,7 +1,7 @@
 ---
 name: manage-skills
 description: Create, validate, and manage Agent Skills following the agentskills.io specification. Use when creating new skills, improving existing ones, or understanding skill structure and best practices.
-license: Commercial
+license: MIT
 compatibility: Requires basic Markdown knowledge and familiarity with file system operations. Works with any agent supporting the agentskills.io format.
 metadata:
   version: 1.0.0
@@ -123,7 +123,7 @@ description: An example skill demonstrating the basic structure.
 ---
 name: data-analysis
 description: Perform statistical analysis and data visualization. Use when analyzing datasets, creating visualizations, or generating reports from data.
-license: Commercial
+license: MIT
 compatibility: Requires Python 3.8+, pandas, matplotlib, numpy
 metadata:
   version: 2.1.0
@@ -425,7 +425,7 @@ python3 scripts/validate-skill.py ../your-skill-name
 
 **Default License: Commercial**
 
-Unless explicitly specified as open source, all skills should use `license: Commercial`.
+Unless explicitly specified as open source, all new skills should use `license: Commercial` unless they are being adapted from an existing skill, in which case they should inherit the existing license
 
 **When to use different licenses:**
 - `Commercial`: Default for internal/proprietary skills
@@ -435,7 +435,7 @@ Unless explicitly specified as open source, all skills should use `license: Comm
 **License field examples:**
 ```yaml
 # Default (recommended)
-license: Commercial
+license: MIT
 
 # Open source alternatives (use only when approved)
 license: MIT

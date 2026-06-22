@@ -15,6 +15,7 @@ from agent13.config import (
     load_environment,
     reset_config,
     resolve_provider_arg,
+    resolve_provider_selection,
 )
 from agent13.config_paths import (
     get_config_dir,
@@ -689,3 +690,163 @@ method = "invalid"
 """)
         config = Config.from_file(config_file)
         assert config.clipboard_method == "osc52"
+
+
+class TestGetProviderNames:
+    """Tests for get_provider_names function."""
+
+    def test_returns_sorted_names(self, tmp_path):
+        """Provider names are returned sorted."""
+        config_file = tmp_path / "config.toml"
+        config_file.write_text("""
+[[providers]]
+name = "zebra"
+api_base = "https://z.example.com/v1"
+
+[[providers]]
+name = "alpha"
+api_base = "https://a.example.com/v1"
+
+[[providers]]
+name = "mu"
+api_base = "https://m.example.com/v1"
+""")
+        with mock.patch("agent13.config.get_config_file", return_value=config_file):
+            reset_config()
+            from agent13.config import get_provider_names
+
+            names = get_provider_names()
+            assert names == ["alpha", "mu", "zebra"]
+
+    def test_empty_config(self, tmp_path):
+        """Empty providers list returns empty."""
+        config_file = tmp_path / "config.toml"
+        config_file.write_text("")
+        with mock.patch("agent13.config.get_config_file", return_value=config_file):
+            reset_config()
+            from agent13.config import get_provider_names
+
+            assert get_provider_names() == []
+
+
+class TestPrintProviderList:
+    """Tests for print_provider_list function."""
+
+    def test_prints_numbered_list(self, tmp_path, capsys):
+        """Prints numbered provider list."""
+        config_file = tmp_path / "config.toml"
+        config_file.write_text("""
+[[providers]]
+name = "alpha"
+api_base = "https://a.example.com/v1"
+
+[[providers]]
+name = "beta"
+api_base = "https://b.example.com/v1"
+""")
+        with mock.patch("agent13.config.get_config_file", return_value=config_file):
+            reset_config()
+            from agent13.config import print_provider_list
+
+            print_provider_list()
+            output = capsys.readouterr().out
+            assert "1. alpha" in output
+            assert "2. beta" in output
+            assert "/provider <name>" in output
+
+    def test_marks_current(self, tmp_path, capsys):
+        """Current provider is marked with *."""
+        config_file = tmp_path / "config.toml"
+        config_file.write_text("""
+[[providers]]
+name = "alpha"
+api_base = "https://a.example.com/v1"
+
+[[providers]]
+name = "beta"
+api_base = "https://b.example.com/v1"
+""")
+        with mock.patch("agent13.config.get_config_file", return_value=config_file):
+            reset_config()
+            from agent13.config import print_provider_list
+
+            print_provider_list(current="beta")
+            output = capsys.readouterr().out
+            assert "beta *" in output
+            assert "alpha *" not in output
+
+    def test_no_providers(self, tmp_path, capsys):
+        """No providers shows message."""
+        config_file = tmp_path / "config.toml"
+        config_file.write_text("")
+        with mock.patch("agent13.config.get_config_file", return_value=config_file):
+            reset_config()
+            from agent13.config import print_provider_list
+
+            print_provider_list()
+            output = capsys.readouterr().out
+            assert "No providers configured" in output
+
+
+# ─── resolve_provider_selection ───────────────────────────────────────
+
+
+class TestResolveProviderSelection:
+    """Provider selection by number or name via resolve_provider_selection."""
+
+    def _make_config_and_run(self, tmp_path, names, choice):
+        """Create config with given providers and resolve a choice."""
+        lines = []
+        for name in names:
+            lines.extend([
+                f'[[providers]]',
+                f'name = "{name}"',
+                f'api_base = "https://{name}.example.com/v1"',
+                f'model = "test-model"',
+            ])
+        config_file = tmp_path / "config.toml"
+        config_file.write_text("\n".join(lines) + "\n")
+        with mock.patch("agent13.config.get_config_file", return_value=config_file):
+            reset_config()
+            return resolve_provider_selection(choice)
+
+    def test_numeric_selection(self, tmp_path):
+        """Numeric string selects provider by 1-indexed position."""
+        result = self._make_config_and_run(tmp_path, ["alpha", "beta", "gamma"], "2")
+        assert result == "beta"
+
+    def test_numeric_out_of_range(self, tmp_path, capsys):
+        """Number beyond range prints error, returns None."""
+        result = self._make_config_and_run(tmp_path, ["alpha", "beta"], "99")
+        assert result is None
+        assert "out of range" in capsys.readouterr().out
+
+    def test_name_exact_match(self, tmp_path):
+        """Exact name match returns the provider."""
+        result = self._make_config_and_run(tmp_path, ["openrouter", "ollama"], "ollama")
+        assert result == "ollama"
+
+    def test_name_partial_match(self, tmp_path):
+        """Partial case-insensitive match returns the provider."""
+        result = self._make_config_and_run(tmp_path, ["openrouter", "ollama"], "open")
+        assert result == "openrouter"
+
+    def test_no_match(self, tmp_path, capsys):
+        """No match prints error, returns None."""
+        result = self._make_config_and_run(tmp_path, ["alpha"], "nonexistent")
+        assert result is None
+        assert "No provider matching" in capsys.readouterr().out
+
+    def test_url_passthrough(self):
+        """URLs are returned as-is (resolve_provider_arg handles them)."""
+        url = "http://localhost:8012/v1"
+        assert resolve_provider_selection(url) == url
+
+    def test_https_passthrough(self):
+        """HTTPS URLs are returned as-is."""
+        url = "https://api.example.com/v1"
+        assert resolve_provider_selection(url) == url
+
+    def test_empty_choice(self):
+        """Empty string returns None."""
+        assert resolve_provider_selection("") is None

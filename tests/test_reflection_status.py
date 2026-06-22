@@ -54,7 +54,7 @@ class TestJournalingStatus:
     def test_compaction_happens_immediately(self):
         """Test that compaction happens immediately (not deferred).
 
-        With the new design, _maybe_reflect_after_turn applies compaction
+        With the new design, maybe_reflect_after_turn applies compaction
         immediately rather than storing pending_compaction. This means
         the message history is always compacted right after reflection.
         """

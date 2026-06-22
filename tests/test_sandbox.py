@@ -607,7 +607,8 @@ class TestBashToolUseCases:
         # If network is available, should get 200; if not, that's OK for this test
         # We're testing that the sandbox mode is applied correctly
         if data["success"]:
-            assert "200" in data["stdout"]
+            # Any HTTP status code means network works
+            assert data["stdout"].strip().isdigit() and len(data["stdout"].strip()) == 3
 
         # Reset sandbox
         set_session_sandbox_mode(None)
@@ -697,6 +698,23 @@ class TestBashToolUseCases:
 
         # Reset sandbox
         set_session_sandbox_mode(None)
+
+    @pytest.mark.asyncio
+    @pytest.mark.skipif(
+        sys.platform == "win32", reason="POSIX shell command (sleep)"
+    )
+    async def test_timeout_message_shows_correct_max(self):
+        """Timeout error message should say 600 seconds, not 300."""
+        from agent13.sandbox import run_sandboxed_async, SandboxMode
+
+        result = await run_sandboxed_async(
+            "sleep 10",
+            SandboxMode.NONE,
+            timeout=0.5,
+        )
+        assert result["timed_out"] is True
+        assert "600 seconds" in result["stderr"]
+        assert "300 seconds" not in result["stderr"]
 
     @pytest.mark.asyncio
     @pytest.mark.skipif(

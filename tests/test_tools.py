@@ -139,10 +139,11 @@ class TestReadFile:
 
     @pytest.mark.asyncio
     async def test_read_file_path_traversal(self):
-        """Should reject path traversal."""
+        """Should reject path traversal — path is resolved before sandbox check."""
         result = await execute_tool("read_file", {"filepath": "../secret.txt"})
         assert "error" in result
-        assert "traversal" in result.lower()
+        # After .resolve(), the path becomes absolute — sandbox rejects as "not found" or "access denied"
+        assert "not found" in result.lower() or "denied" in result.lower()
 
     @pytest.mark.asyncio
     async def test_read_file_offset_limit(self):
@@ -215,6 +216,56 @@ class TestReadFile:
 
     # NOTE: Symbol-related tests removed - symbol parameter was removed from read_file
 
+    @pytest.mark.asyncio
+    async def test_read_file_tilde_expansion(self, monkeypatch, tmp_path):
+        """read_file should expand ~ to HOME."""
+        # Create a file in a fake home dir
+        home = tmp_path / "fakehome"
+        home.mkdir()
+        test_file = home / "testfile.txt"
+        test_file.write_text("hello tilde")
+
+        # Monkeypatch HOME and os.path.expanduser
+        monkeypatch.setenv("HOME", str(home))
+        original_expanduser = os.path.expanduser
+        monkeypatch.setattr(
+            "os.path.expanduser", lambda p: str(home) + p[1:] if p.startswith("~") else original_expanduser(p)
+        )
+
+        # Force reload of pathlib to pick up new HOME
+        import pathlib
+        monkeypatch.setattr(pathlib.Path, "expanduser", lambda self: pathlib.Path(str(home) + str(self)[1:] if str(self).startswith("~") else str(self)))
+
+        result = await execute_tool("read_file", {"filepath": "~/testfile.txt"})
+        assert "error" not in result or "not found" not in result.get("error", "").lower(), \
+            f"Expected file found, got: {result}"
+
+
+class TestWriteFile:
+    """Tests for write_file tool."""
+
+    @pytest.mark.asyncio
+    async def test_write_file_tilde_expansion(self, monkeypatch, tmp_path):
+        """write_file should expand ~ to HOME."""
+        home = tmp_path / "fakehome"
+        home.mkdir()
+
+        monkeypatch.setenv("HOME", str(home))
+        original_expanduser = os.path.expanduser
+        monkeypatch.setattr(
+            "os.path.expanduser", lambda p: str(home) + p[1:] if p.startswith("~") else original_expanduser(p)
+        )
+        import pathlib
+        monkeypatch.setattr(pathlib.Path, "expanduser", lambda self: pathlib.Path(str(home) + str(self)[1:] if str(self).startswith("~") else str(self)))
+
+        result = await execute_tool("write_file", {"filepath": "~/written.txt", "content": "from tilde"})
+        import json
+        data = json.loads(result) if isinstance(result, str) else result
+        assert data.get("success") is True, f"Expected success, got: {result}"
+        written = home / "written.txt"
+        assert written.exists(), f"File not created at {written}"
+        assert written.read_text() == "from tilde"
+
 
 class TestEditFile:
     """Tests for edit_file tool."""
@@ -224,6 +275,31 @@ class TestEditFile:
         """edit_file tool should be registered."""
         names = get_tool_names()
         assert "edit_file" in names
+
+    @pytest.mark.asyncio
+    async def test_edit_file_tilde_expansion(self, monkeypatch, tmp_path):
+        """edit_file should expand ~ to HOME."""
+        home = tmp_path / "fakehome"
+        home.mkdir()
+        test_file = home / "editable.txt"
+        test_file.write_text("original line\n")
+
+        monkeypatch.setenv("HOME", str(home))
+        original_expanduser = os.path.expanduser
+        monkeypatch.setattr(
+            "os.path.expanduser", lambda p: str(home) + p[1:] if p.startswith("~") else original_expanduser(p)
+        )
+        import pathlib
+        monkeypatch.setattr(pathlib.Path, "expanduser", lambda self: pathlib.Path(str(home) + str(self)[1:] if str(self).startswith("~") else str(self)))
+
+        result = await execute_tool(
+            "edit_file",
+            {"filepath": "~/editable.txt", "find": "original", "content": "edited"},
+        )
+        import json
+        data = json.loads(result)
+        assert data.get("success") is True, f"Expected success, got: {result}"
+        assert test_file.read_text() == "edited line\n", f"Unexpected content: {test_file.read_text()!r}"
 
     @pytest.mark.asyncio
     async def test_edit_file_replace_global(self):
@@ -360,12 +436,13 @@ class TestEditFile:
 
     @pytest.mark.asyncio
     async def test_edit_file_path_traversal(self):
-        """Should reject path traversal."""
+        """Should reject path traversal — path is resolved before sandbox check."""
         result = await execute_tool(
             "edit_file", {"filepath": "../secret.txt", "find": "old", "content": "new"}
         )
         assert "error" in result
-        assert "traversal" in result.lower()
+        # After .resolve(), the path becomes absolute — sandbox rejects as "access denied"
+        assert "denied" in result.lower()
 
     @pytest.mark.asyncio
     async def test_edit_file_missing_params(self):

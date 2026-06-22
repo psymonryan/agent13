@@ -5,6 +5,49 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0] - 2026-06-22
+
+### Added
+
+- added --read parameter to allow reading files into user message from command line
+- @filename.txt now inserts file into context
+- REPL mode (--repl) with optional --output file for screen reader support
+- allowed alias name to provider number so `/provider 6:nothink` works
+- lots of new tests to improve coverage
+- load and save support for filenames with full path and extensions
+- rollback to write_file tool and normalised rollback paths for all edit tools
+- /cwd command
+
+### Changed
+
+- fix for @ expansion to correctly handle tilda in path
+- fix for path suffix bug when filename specified including extension .ctx
+- fix for fallback save location when swapping save modes
+- fixed command timeout messages
+- fix for word count issues when journaling
+- fix Windows drive-letter paths in @filename expansion
+- fix CR detection in _is_probably_text and clean up test imports
+- fix to sanitise tool call arguments before adding to message history
+- general code refactor and DRY fixes for repl mode
+- fix for pause and !!messages not correctly setting work_started
+- fix for streaming widget early finalisation
+- fix for when removing empty reasoning widgets
+- fix for a snapshot bug
+- tidied up /history display truncation and newline issues
+- fix for tools not showing when other content present in assistant response
+- changed default save location to under local directory (added config parameter)
+- improved UX message sequencing for when pressing ESC
+- moved tools status display into devel mode
+- fix for spurious cancellations
+- fix for chat window disconnecting if error inside _process_tokens
+- trimmed AGENTS.md
+- changed skill licenses to MIT
+
+### Removed
+
+- removed limit on number of allowed tab completions
+- removed redundant commands table from ARCHITECTURE.md
+
 ## [0.1.13] - 2026-05-19
 
 ### Changed

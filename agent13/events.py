@@ -61,7 +61,6 @@ class AgentEvent(Enum):
     # Deferred commands (processed at safe boundary between items)
     MESSAGES_CLEARED = "messages_cleared"  # /clear completed at safe boundary
     CONTEXT_LOADED = "context_loaded"  # /load completed at safe boundary
-    RETRY_STARTED = "retry_started"  # /retry completed at safe boundary
 
 
 @dataclass

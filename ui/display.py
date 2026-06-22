@@ -65,7 +65,6 @@ class RichDisplay:
         # State tracking
         self._in_reasoning = False
         self._in_content = False
-        self._response_start_time: Optional[float] = None
         self._status = None  # Rich status spinner
 
         # Markdown streaming state (pretty mode only)
@@ -120,8 +119,6 @@ class RichDisplay:
         self._response_buffer = ""
         self._live_display = None
 
-        # Start timing
-        self._response_start_time = time.time()
 
         # Add newline after reasoning if we were thinking
         if was_in_reasoning:
@@ -204,13 +201,6 @@ class RichDisplay:
             finally:
                 self._live_display = None
 
-        # Show elapsed time
-        if self._response_start_time:
-            elapsed = time.time() - self._response_start_time
-            if self.pretty:
-                self._print(f"[dim]({elapsed:.2f}s)[/dim]")
-            else:
-                self._print(f"({elapsed:.2f}s)")
 
         # Show separator in pretty mode
         if self.pretty:
@@ -218,6 +208,8 @@ class RichDisplay:
 
         # Reset content flag for next response
         self._in_content = False
+        # Newline after response content (separates from next prompt)
+        self._print("")
 
     def show_tool_call(self, name: str, arguments: dict):
         """Show a tool call.
@@ -256,7 +248,7 @@ class RichDisplay:
         if self.pretty:
             self.console.print(f"[bold red]Error: {message}[/bold red]")
         else:
-            print(f"Error: {message}", file=sys.stderr)
+            self.console.print(f"Error: {message}", highlight=False)
 
     def show_notification(
         self, message: str, duration: float = 5.0, level: str = "info"
@@ -281,7 +273,7 @@ class RichDisplay:
         if self.pretty:
             self.console.print(f"[{style}]{prefix} {message}[/{style}]")
         else:
-            print(f"{prefix} {message}")
+            self.console.print(f"{prefix} {message}", highlight=False)
 
     def show_separator(self):
         """Show a visual separator between responses."""
@@ -304,7 +296,12 @@ class RichDisplay:
             else:
                 self.console.print(text, end=end)
         else:
-            print(text, end=end, flush=(end == ""))
+            # Always route through console so file-backed consoles write to
+            # their target instead of stdout.
+            if style:
+                self.console.print(text, style=style, end=end, highlight=False)
+            else:
+                self.console.print(text, end=end, highlight=False)
 
     def _print_panel(self, content: str, title: str, border_style: str = "yellow"):
         """Print content in a Rich panel.
@@ -317,7 +314,7 @@ class RichDisplay:
         if self.pretty:
             self.console.print(Panel(content, title=title, border_style=border_style))
         else:
-            print(f"{title}: {content}")
+            self.console.print(f"{title}: {content}", highlight=False)
 
 
 def format_mcp_servers(servers: dict, use_rich: bool = True) -> str:

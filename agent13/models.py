@@ -26,20 +26,27 @@ async def fetch_models(client: AsyncOpenAI) -> list[str]:
         raise RuntimeError(f"Failed to fetch models: {e}")
 
 
-def resolve_model_selection(
-    model_names: list[str], choice: str, use_stderr: bool = False
+def resolve_from_list(
+    items: list[str],
+    choice: str,
+    label: str = "item",
+    output=None,
 ) -> str | None:
-    """Resolve a model selection by number or name.
+    """Resolve a selection from a numbered list by index or name.
+
+    Shared logic for /model, /provider, and any future numbered-list selection.
 
     Args:
-        model_names: List of available model names
+        items: List of available items
         choice: User's choice (number like "1" or name/partial name)
-        use_stderr: If True, print errors to stderr instead of stdout
+        label: Human-readable label for error messages (e.g. "model", "provider")
+        output: File object for error output (default: sys.stdout)
 
     Returns:
-        Selected model name, or None if ambiguous/not found
+        Selected item, or None if ambiguous/not found
     """
-    output = sys.stderr if use_stderr else sys.stdout
+    if output is None:
+        output = sys.stdout
 
     if not choice:
         return None
@@ -47,26 +54,26 @@ def resolve_model_selection(
     # Numeric selection
     if choice.isdigit():
         idx = int(choice) - 1
-        if 0 <= idx < len(model_names):
-            return model_names[idx]
+        if 0 <= idx < len(items):
+            return items[idx]
         else:
             print(
-                f"Model number {choice} out of range (1-{len(model_names)})",
+                f"{label.capitalize()} number {choice} out of range (1-{len(items)})",
                 file=output,
             )
             return None
 
     # Exact match
-    if choice in model_names:
+    if choice in items:
         return choice
 
     # Partial match (case-insensitive)
-    matches = [m for m in model_names if choice.lower() in m.lower()]
+    matches = [m for m in items if choice.lower() in m.lower()]
 
     if len(matches) == 1:
         return matches[0]
     elif len(matches) > 1:
-        print(f"Ambiguous model '{choice}'. Matches:", file=output)
+        print(f"Ambiguous {label} '{choice}'. Matches:", file=output)
         for i, m in enumerate(matches, 1):
             print(f"  {i}. {m}", file=output)
         if len(matches) <= 10:
@@ -78,8 +85,59 @@ def resolve_model_selection(
             )
         return None
     else:
+        print(f"No {label} matching '{choice}'", file=output)
+        return None
+
+
+def resolve_model_selection(
+    model_names: list[str], choice: str, use_stderr: bool = False
+) -> str | None:
+    """Resolve a model selection by number or name, with optional alias.
+
+    An alias may be appended after a colon, e.g. "GLM:nothink" or
+    "3:nothink".  The portion before the last colon is resolved against
+    the model list (by number, exact name, or partial name); the alias
+    is then re-attached to the resolved name with a colon separator.
+
+    Model names that themselves contain colons (e.g.
+    "meta-llama/llama-3.1:free" on OpenRouter) are matched exactly
+    first, so they work unchanged when typed in full.
+
+    Args:
+        model_names: List of available model names
+        choice: User's choice (number, name, or name:alias)
+        use_stderr: If True, print errors to stderr instead of stdout
+
+    Returns:
+        Selected model name (with alias re-attached if given), or None
+        if ambiguous/not found
+    """
+    output = sys.stderr if use_stderr else sys.stdout
+
+    # No colon — resolve as before (unchanged behaviour)
+    if ":" not in choice:
+        return resolve_from_list(model_names, choice, label="model", output=output)
+
+    # Colon present — first try an exact match on the full string.
+    # This handles provider model names that contain colons (e.g.
+    # "meta-llama/llama-3.1:free" on OpenRouter) so they work unchanged.
+    if choice in model_names:
+        return choice
+
+    # No exact match — split on the LAST colon.  Everything before is
+    # the model selector; everything after is the alias.
+    model_part, _, alias = choice.rpartition(":")
+    if not model_part:
+        # Leading colon (e.g. ":nothink") — nothing to resolve
         print(f"No model matching '{choice}'", file=output)
         return None
+
+    resolved = resolve_from_list(model_names, model_part, label="model", output=output)
+    if resolved is None:
+        return None
+
+    # Re-attach alias (drop trailing colon if alias is empty)
+    return f"{resolved}:{alias}" if alias else resolved
 
 
 async def select_model(model_names: list[str], model_arg: str = None) -> str:

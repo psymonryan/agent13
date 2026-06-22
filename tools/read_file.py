@@ -610,6 +610,9 @@ def read_file(
     Returns:
         Dict with filepath, total_lines, view type, and content
     """
+    # Expand ~ and resolve to absolute path — consistent with edit_file/write_file
+    filepath = str(Path(filepath).expanduser().resolve())
+
     # Validate path with sandbox enforcement
     is_valid, error = validate_path_for_read(filepath)
     if not is_valid:

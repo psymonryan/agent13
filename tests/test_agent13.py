@@ -10,21 +10,6 @@ Tests:
 
 import subprocess
 import os
-import pytest
-
-
-def has_test_provider():
-    """Check if 'test' provider is configured."""
-    config_path = os.path.expanduser("~/.agent13/config.toml")
-    if not os.path.exists(config_path):
-        return False
-    with open(config_path) as f:
-        return 'name = "test"' in f.read()
-
-
-requires_test_provider = pytest.mark.skipif(
-    not has_test_provider(), reason="'test' provider not configured"
-)
 
 
 class TestAgent13Help:
@@ -62,26 +47,28 @@ class TestAgent13ProviderList:
 class TestAgent13ModelSelection:
     """Test --model flag."""
 
-    @requires_test_provider
-    def test_model_flag_lists_models(self):
+    def test_model_flag_lists_models(self, mock_provider_env):
         """--model with no value should list models."""
         result = subprocess.run(
-            ["./agent13.py", "test", "--model"],
+            ["uv", "run", "agent13.py", "test_mock", "--model"],
             capture_output=True,
             text=True,
             timeout=60,
+            env=mock_provider_env,
+            cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
         )
         assert result.returncode == 0
         assert "Available models:" in result.stdout
 
-    @requires_test_provider
-    def test_model_selection_by_number(self):
+    def test_model_selection_by_number(self, mock_provider_env):
         """--model 1 should select first model."""
         result = subprocess.run(
-            ["./agent13.py", "test", "--model", "1", "--model"],
+            ["uv", "run", "agent13.py", "test_mock", "--model", "1", "--model"],
             capture_output=True,
             text=True,
             timeout=60,
+            env=mock_provider_env,
+            cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
         )
         assert result.returncode == 0
 
@@ -89,33 +76,37 @@ class TestAgent13ModelSelection:
 class TestAgent13BatchMode:
     """Test batch mode (-p flag)."""
 
-    @requires_test_provider
-    def test_batch_mode_exits_after_processing(self):
+    def test_batch_mode_exits_after_processing(self, mock_provider_env):
         """Batch mode should process and exit."""
         result = subprocess.run(
-            ["./agent13.py", "test", "--model", "devstral2", "-p", "Say 'hello'"],
+            [
+                "uv", "run", "agent13.py", "test_mock",
+                "--model", "mock-model",
+                "-p", "Say 'hello'",
+            ],
             capture_output=True,
             text=True,
             timeout=60,
+            env=mock_provider_env,
+            cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
         )
         assert result.returncode == 0
         assert len(result.stdout) > 0
 
-    @requires_test_provider
-    def test_batch_mode_produces_response(self):
+    def test_batch_mode_produces_response(self, mock_provider_env):
         """Batch mode should produce LLM output."""
         result = subprocess.run(
             [
-                "./agent13.py",
-                "test",
-                "--model",
-                "devstral2",
+                "uv", "run", "agent13.py", "test_mock",
+                "--model", "mock-model",
                 "-p",
                 "What is 2+2? Answer with just the number.",
             ],
             capture_output=True,
             text=True,
             timeout=60,
+            env=mock_provider_env,
+            cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
         )
         assert result.returncode == 0
         # Should contain "4" somewhere in output

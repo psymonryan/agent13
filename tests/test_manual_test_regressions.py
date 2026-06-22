@@ -78,7 +78,7 @@ class TestProcessItemErrorPath:
 
         # Mock _reflect_on_tool_use to raise an error
         with patch.object(
-            agent, '_reflect_on_tool_use',
+            agent.journal, 'reflect_on_tool_use',
             new_callable=AsyncMock,
             side_effect=Exception("Reflection failed"),
         ):
@@ -132,7 +132,7 @@ class TestProcessItemErrorPath:
             events.append(event)
 
         with patch.object(
-            agent, '_reflect_on_tool_use',
+            agent.journal, 'reflect_on_tool_use',
             new_callable=AsyncMock,
             side_effect=Exception("Reflection failed"),
         ):
@@ -186,7 +186,7 @@ class TestProcessItemErrorPath:
             events.append(event)
 
         with patch.object(
-            agent, '_reflect_on_tool_use',
+            agent.journal, 'reflect_on_tool_use',
             new_callable=AsyncMock,
             side_effect=Exception("Reflection failed"),
         ):
@@ -357,11 +357,11 @@ class TestJournalTokenUsage:
 
         # Mock _reflect_on_tool_use to return a summary
         with patch.object(
-            agent, '_reflect_on_tool_use',
+            agent.journal, 'reflect_on_tool_use',
             new_callable=AsyncMock,
             return_value="Summary: read_file returned file contents",
         ):
-            success, message = await agent.journal_last_turn()
+            success, message = await agent.journal.journal_last_turn()
 
         # Journal should succeed
         assert success, f"journal_last_turn should succeed, got: {message}"
@@ -405,11 +405,11 @@ class TestJournalTokenUsage:
             events.append(event)
 
         with patch.object(
-            agent, '_reflect_on_tool_use',
+            agent.journal, 'reflect_on_tool_use',
             new_callable=AsyncMock,
             return_value="Summary: read_file returned file contents",
         ):
-            success, message = await agent.journal_last_turn()
+            success, message = await agent.journal.journal_last_turn()
 
         assert success, f"journal_last_turn should succeed, got: {message}"
 

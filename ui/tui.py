@@ -32,7 +32,14 @@ from datetime import datetime
 from pathlib import Path
 
 # Re-export from shared module for backwards compatibility
-from agent13.models import fetch_models, print_model_list, select_model
+from agent13.models import (
+    fetch_models,
+    print_model_list,
+    resolve_model_selection,
+    select_model,
+)
+from agent13.timing import TokenTimingTracker
+from agent13.file_injection import expand_file_mentions
 
 
 from agent13 import (
@@ -48,6 +55,7 @@ from agent13 import (
     get_filtered_tools,
     execute_tool,
     resolve_provider_arg,
+    resolve_provider_selection,
     create_client,
     init_debug,
     log_session_end,
@@ -67,12 +75,21 @@ from agent13 import (
     skill_manager_ctx,
 )
 from agent13.persistence import (
-    save_context,
     load_context,
     get_saves_dir,
     get_auto_save_dir,
     find_latest_auto_save,
     list_saves,
+    list_all_saves,
+)
+from agent13.commands import (
+    execute_save,
+    execute_delete,
+    execute_retry,
+    execute_prioritise,
+    execute_deprioritise,
+    format_queue_items,
+    format_history_groups,
 )
 from agent13.prompts import get_skills_section
 from agent13.sandbox import (
@@ -523,7 +540,6 @@ class AgentTUI(App):
         "/history",
         "/delete",
         "/model",
-        "/list",
         "/tool-response",
         "/pretty",
         "/prompt",
@@ -548,6 +564,7 @@ class AgentTUI(App):
         "/upgrade",
         "/clipboard",
         "/status",
+        "/cwd",
     ]
     # Class-level attribute for type checking (instance copy created in __init__)
     SLASH_COMMANDS = _BUILTIN_SLASH_COMMANDS
@@ -569,7 +586,7 @@ class AgentTUI(App):
         "journal": ["on", "off", "last", "all", "status"],
         "remove-reasoning": ["on", "off"],
         "save": "_get_save_completions",  # Method to list save files
-        "load": "_get_save_completions",  # Same method for load
+        "load": "_get_load_completions",  # Includes auto-saves
         "devel": ["on", "off", "status"],
         "skills": ["on", "off", "list", "status"],
         "snippet": "_get_snippet_completions",
@@ -617,6 +634,7 @@ class AgentTUI(App):
         devel_mode: bool = False,
         spinner_speed: str = "fast",
         clipboard_method: str = "osc52",
+        read_files: list[str] | None = None,
     ):
         """Initialize the TUI.
 
@@ -643,12 +661,12 @@ class AgentTUI(App):
         super().__init__()
         self.client = client
         self.model = model
-        self.model_names = model_names
         self.provider = provider
         self.pretty = pretty
         self._debug_mode = debug
         self.tool_response_format = tool_response_format
         self._connect_mcp = connect_mcp
+        self.read_files = read_files
 
         # Initialize prompt manager
         self.prompt_manager = prompt_manager or PromptManager()
@@ -703,6 +721,9 @@ class AgentTUI(App):
             skills_mode=skills_mode,
         )
 
+        # Store available models on agent (single source of truth)
+        self.agent.available_models = model_names
+
         # Set MCP server configs for lazy initialization
         if config.mcp_servers:
             self.agent.set_mcp_servers(config.mcp_servers)
@@ -742,7 +763,6 @@ class AgentTUI(App):
         self._agent_task: asyncio.Task | None = None
         self._shutting_down = False  # Set in on_unmount to prevent mount errors
         self._agent_started = asyncio.Event()
-        self._agent_running = False  # Track if agent is actively processing
         self._interrupt_requested = False  # Prevent double-cancellation
         self._interrupt_available = (
             False  # /resume after ESC sends "Sorry, please continue"
@@ -751,22 +771,12 @@ class AgentTUI(App):
         self._error_state = False  # Track if agent stopped due to error
         self._last_error_type = None  # Type of last error
 
-        # TPS tracking — elapsed measured from first_token to last_token,
-        # measuring generation speed (excludes prompt evaluation time).
-        # Short responses (< MIN_TOKENS) keep the stale TPS from a prior
-        # longer response, because prompt_eval inflates elapsed on short
-        # turns, making TPS appear too low.
+        # TPS tracking — delegated to TokenTimingTracker
+        # _last_tps stays as a Textual reactive for status bar binding
+        self.tracker = TokenTimingTracker()
         self._stream_start_time: float | None = (
-            None  # When current stream started (debug tracking, elapsed display)
+            None  # When current stream started (debug tracking only)
         )
-        self._first_token_time: float | None = (
-            None  # When first streamed token arrived (TPS elapsed start)
-        )
-        self._last_token_time: float | None = (
-            None  # When last token arrived (TPS elapsed end)
-        )
-        self._token_count: int = 0  # Chunks received in current stream
-        self._last_tps: float = 0.0  # Last calculated TPS (persists across streams)
 
         # Elapsed time tracking
         self._elapsed_start_time: float | None = (
@@ -777,8 +787,6 @@ class AgentTUI(App):
         # Last turn tracking (persists after idle for status bar + /status)
         self._last_turn_duration: float | None = None  # seconds of last completed turn
         self._last_turn_end_time: float | None = None   # when last turn finished (epoch)
-        self._turn_count: int = 0                        # completed turns this session
-        self._total_processing_time: float = 0.0         # cumulative seconds across all turns
         # Resumed session tracking (for --continue and /load /status)
         self._resumed_saved_at: str | None = None           # ISO timestamp from .ctx file
         self._resumed_turn_count: int = 0                    # user-role messages in loaded session
@@ -1027,12 +1035,12 @@ class AgentTUI(App):
 
         # Filter by partial (skip for method-based completers that already filtered)
         if skip_filter:
-            return options[:20]  # Just limit results
+            return options
         if not partial:
-            return options[:20]  # Return first 20 if no partial
+            return options
 
         partial_lower = partial.lower()
-        return [opt for opt in options if opt.lower().startswith(partial_lower)][:20]
+        return [opt for opt in options if opt.lower().startswith(partial_lower)]
 
     def _get_sandbox_completions(self, partial: str) -> list[str]:
         """Get completions for sandbox modes."""
@@ -1045,11 +1053,23 @@ class AgentTUI(App):
         return [m for m in modes if m.lower().startswith(partial_lower)]
 
     def _get_provider_completions(self, partial: str, full_text: str = "") -> list[str]:
-        """Get completions for provider names from config."""
+        """Get completions for provider names from config.
+
+        Returns provider names for tab completion. If the partial text is a
+        number, returns the corresponding provider name so number selection works.
+        """
         config = get_config()
         providers = [p.name for p in config.providers]
         if not partial:
             return providers
+
+        # If partial is a number, return the corresponding provider name
+        if partial.isdigit():
+            idx = int(partial) - 1
+            if 0 <= idx < len(providers):
+                return [providers[idx]]
+            return []
+
         partial_lower = partial.lower()
         return [p for p in providers if p.lower().startswith(partial_lower)]
 
@@ -1067,19 +1087,18 @@ class AgentTUI(App):
             List of matching model names
         """
         if not partial:
-            return self.model_names[:20]
+            return list(self.agent.available_models)
 
         # If partial is a number, return the corresponding model name
         if partial.isdigit():
             idx = int(partial) - 1
-            if 0 <= idx < len(self.model_names):
-                return [self.model_names[idx]]
+            if 0 <= idx < len(self.agent.available_models):
+                return [self.agent.available_models[idx]]
             return []
 
         # Filter by partial name (case-insensitive prefix match)
         partial_lower = partial.lower()
-        matches = [m for m in self.model_names if m.lower().startswith(partial_lower)]
-        return matches[:20]
+        return [m for m in self.agent.available_models if m.lower().startswith(partial_lower)]
 
     def _get_prompt_completions(self, partial: str, full_text: str = "") -> list[str]:
         """Get completions for /prompt command.
@@ -1183,19 +1202,19 @@ class AgentTUI(App):
 
             # Return completions with subcommand prefix included
             if not arg_partial:
-                return [f"s {n}" for n in names[:20]]
+                return [f"s {n}" for n in names]
 
             arg_lower = arg_partial.lower()
             matches = [n for n in names if n.lower().startswith(arg_lower)]
-            return [f"s {n}" for n in matches[:20]]
+            return [f"s {n}" for n in matches]
 
         # For h and q, no completions (just numbers)
         return []
 
     def _get_save_completions(self, partial: str, full_text: str = "") -> list[str]:
-        """Get completions for /save and /load commands.
+        """Get completions for /save command.
 
-        Lists available save files from ./.agent13/saves/, sorted by newest first.
+        Lists manual save files only, sorted by newest first.
 
         Args:
             partial: The partial save name to complete
@@ -1217,6 +1236,33 @@ class AgentTUI(App):
 
         if not partial:
             return names  # Return all saves
+
+        partial_lower = partial.lower()
+        matches = [n for n in names if n.lower().startswith(partial_lower)]
+        return matches
+
+    def _get_load_completions(self, partial: str, full_text: str = "") -> list[str]:
+        """Get completions for /load command.
+
+        Lists manual saves first (sorted by mtime), then auto-saves (sorted by mtime).
+
+        Args:
+            partial: The partial save name to complete
+            full_text: Full input text (unused, kept for API consistency)
+
+        Returns:
+            List of matching save names (without .ctx extension),
+            manual saves first, then auto-saves, both newest first.
+        """
+        try:
+            saves = list_all_saves()
+        except Exception:
+            return []
+
+        names = [s.stem for s in saves]
+
+        if not partial:
+            return names
 
         partial_lower = partial.lower()
         matches = [n for n in names if n.lower().startswith(partial_lower)]
@@ -1459,7 +1505,6 @@ class AgentTUI(App):
             if event.event != AgentEvent.STARTED:
                 return
             self._agent_started.set()
-            self._agent_running = True
             self._error_state = False  # Clear error state on successful start
             self._last_error_type = None
             asyncio.create_task(self._write_system(f"Agent started with {self.model}"))
@@ -1473,7 +1518,6 @@ class AgentTUI(App):
         async def on_stopped(event: AgentEventData):
             if event.event != AgentEvent.STOPPED:
                 return
-            self._agent_running = False
             self.call_later(self._set_running, False)
             # Show retry hint if stopped due to error
             if self._error_state:
@@ -1513,8 +1557,18 @@ class AgentTUI(App):
             if event.event != AgentEvent.INTERRUPT_INJECTED:
                 return
             text = event.data.get("text", "")
-            # Show the injected interrupt message in chat with a visual indicator
-            await self._write_interrupt(text)
+            # Route through post_message → _token_queue so interrupt message
+            # renders AFTER any pending tool results. This matches the fix
+            # already applied to on_paused (see comment at line 1647).
+            # Previously _write_interrupt() was called directly, which
+            # bypassed the queue and caused interrupts to appear before
+            # tool results that were still waiting to render.
+            self.post_message(
+                SystemQueueMessage(
+                    f"[bold yellow]⚡ Interrupt:[/] {escape_markup(text)}",
+                    escape_text=False,
+                )
+            )
 
         @self.agent.on_event
         async def on_assistant_token(event: AgentEventData):
@@ -1570,6 +1624,12 @@ class AgentTUI(App):
                 return
             message = event.message or "Unknown error"
             error_type = event.data.get("error_type", "unknown")
+            if error_type == "cancelled":
+                # User-initiated interrupt (ESC) — not an error.
+                # The ESC feedback is already shown by _interrupt_agent_loop,
+                # so silently absorb here (no error panel, no _error_state).
+                return
+            # Real errors: show error panel and set error state
             self._error_state = True
             self._last_error_type = error_type
             self.post_message(ErrorMessage(message, error_type))
@@ -1623,7 +1683,6 @@ class AgentTUI(App):
         async def on_interrupted(event: AgentEventData):
             if event.event != AgentEvent.INTERRUPTED:
                 return
-            self._agent_running = False
             self._interrupt_requested = False
             if self._streaming_reasoning_widget:
                 await self._streaming_reasoning_widget.finalize()
@@ -1718,16 +1777,6 @@ class AgentTUI(App):
                 self._update_info_content(f"[red]{message}[/]")
 
         @self.agent.on_event
-        async def on_retry_started(event: AgentEventData):
-            if event.event != AgentEvent.RETRY_STARTED:
-                return
-            # Deferred /retry completed at safe boundary
-            user_text = event.data.get("user_text", "")
-            if user_text:
-                # Re-add the user message and restart agent
-                asyncio.create_task(self._retry_message(user_text))
-
-        @self.agent.on_event
         async def on_mcp_started(event: AgentEventData):
             if event.event != AgentEvent.MCP_SERVER_STARTED:
                 return
@@ -1781,7 +1830,7 @@ class AgentTUI(App):
                 return
             # Capture timing data IMMEDIATELY to avoid race condition with _reset_stream_timing
             # Both this and STREAM_START use call_later, so order is non-deterministic
-            first_time = self._first_token_time
+            first_time = self.tracker._first_token_time
             # Use current time as effective "last token time" - TOKEN_USAGE arrives when
             # the API has finished generating, which is the true end of the stream.
             # This handles cases where the API generates tokens that don't arrive as
@@ -1799,17 +1848,16 @@ class AgentTUI(App):
             if event.event != AgentEvent.STREAM_START:
                 return
 
-            # Finalize any pending streaming widgets from previous stream.
-            # This handles the race condition where is_final token processing
-            # (via asyncio.create_task) hasn't completed before the next stream starts.
-            # This can happen during journal reflection followed immediately by a turn.
-            if self._streaming_reasoning_widget:
-                await self._streaming_reasoning_widget.finalize()
-                self._streaming_reasoning_widget = None
-            if self._streaming_content_widget:
-                await self._streaming_content_widget.finalize()
-                self._streaming_content_widget = None
-            self._in_reasoning = False
+            # NOTE: Do NOT finalize streaming widgets here.
+            # This handler runs in the agent task, but _streaming_content_widget
+            # is managed by _process_tokens in the token processor task.
+            # Finalizing here races with _process_tokens: if ASSISTANT_COMPLETE
+            # is still queued, this would prematurely finalize the widget, causing
+            # subsequent content tokens to create a NEW "Agent:" widget for the
+            # last few words of the message.
+            # The _token_queue guarantees ASSISTANT_COMPLETE is always processed
+            # before new content tokens, so _finalize_streaming() handles cleanup.
+            # Error/interrupt paths finalize via on_interrupted/_interrupt_agent_loop.
 
             # Update status bar display
             self.call_later(self.update_status)
@@ -1828,7 +1876,7 @@ class AgentTUI(App):
             yield Static(id="status-spacer")
             yield Static("", id="status-right")
 
-    def on_mount(self) -> None:
+    async def on_mount(self) -> None:
         """Set up the TUI after mounting."""
         # Set skill manager context for skill tool
         if self.skill_manager:
@@ -1868,6 +1916,12 @@ class AgentTUI(App):
 
         # Start the agent as a background task
         self._agent_task = asyncio.create_task(self.agent.run())
+
+        # Inject files from --read flag if provided
+        if self.read_files:
+            from agent13.file_injection import build_read_message
+            read_msg = build_read_message(self.read_files)
+            await self.agent.add_message(read_msg)
 
         # Connect to MCP servers if requested
         if self._connect_mcp and self.agent._mcp_server_configs:
@@ -2250,6 +2304,107 @@ class AgentTUI(App):
         """Update the info pane content."""
         self._info_content.update(content)
         self._show_info_pane()
+    # ── Info pane formatting helpers ──────────────────────────────────
+
+    @staticmethod
+    def _sanitize_text(text: str, max_len: int = 120) -> str:
+        """Collapse newlines and truncate for single-line display."""
+        text = " ".join(text.split())
+        if len(text) > max_len:
+            return text[:max_len] + "..."
+        return text
+
+    @staticmethod
+    def _format_tool_call_preview(name: str, args_json: str) -> str:
+        """Extract the key argument from a tool call for display."""
+        try:
+            args = json.loads(args_json) if args_json else {}
+        except (json.JSONDecodeError, TypeError):
+            args = {}
+
+        # Pick the most informative arg per tool
+        KEY_ARGS = {
+            "command": "command",
+            "read_file": "filepath",
+            "write_file": "filepath",
+            "edit_file": "filepath",
+            "skill": "name",
+            "square_number": "x",
+        }
+        key = KEY_ARGS.get(name)
+        if key and key in args:
+            preview = str(args[key])
+        elif args:
+            # Fall back to first string-ish value
+            preview = str(next(iter(args.values()), ""))
+        else:
+            return name
+
+        if len(preview) > 60:
+            preview = preview[:60] + "..."
+        return f"{name} \u2192 {preview}"
+
+    @staticmethod
+    def _format_tool_result_preview(content: str) -> str:
+        """Parse tool result JSON and return success/failure preview."""
+        if not content:
+            return "[dim]tool result (empty)[/]"
+
+        try:
+            data = json.loads(content)
+        except (json.JSONDecodeError, TypeError):
+            # Not JSON — show first bit of raw text
+            preview = " ".join(content.split())[:80]
+            if len(content) > 80:
+                preview += "..."
+            return f"[dim]{escape_markup(preview)}[/]"
+
+        if not isinstance(data, dict):
+            preview = " ".join(str(data).split())[:80]
+            return f"[dim]{escape_markup(preview)}[/]"
+
+        ok = data.get("success", not data.get("error"))
+        tag = "[green]\u2713[/]" if ok else "[red]\u2717[/]"
+
+        # Build summary per known tool result shape
+        if "exit_code" in data:
+            # command result
+            exit_code = data.get("exit_code", "?")
+            stdout = (data.get("stdout") or "").strip().split("\n")[0][:60]
+            stderr = (data.get("stderr") or "").strip().split("\n")[0][:60]
+            if exit_code == 0:
+                return f"{tag} exit {exit_code}: {escape_markup(stdout)}"
+            else:
+                return f"{tag} exit {exit_code}: {escape_markup(stderr or stdout)}"
+
+        if "filepath" in data and "total_lines" in data:
+            # read_file result
+            fp = data.get("filepath", "")
+            lines = data.get("total_lines", 0)
+            view = data.get("view", "")
+            return f"{tag} {escape_markup(fp)} ({lines} lines, {view})"
+
+        if data.get("error"):
+            err = str(data["error"])[:80]
+            return f"{tag} {escape_markup(err)}"
+
+        if "message" in data:
+            # write_file / edit_file success
+            msg = data["message"][:80]
+            return f"{tag} {escape_markup(msg)}"
+
+        if "skill_name" in data:
+            # skill result
+            name = data.get("skill_name", "?")
+            return f"{tag} Skill loaded: {escape_markup(name)}"
+
+        # Fallback — first key/value
+        if data:
+            k, v = next(iter(data.items()))
+            preview = f"{k}: {v}"[:80]
+            return f"{tag} {escape_markup(preview)}"
+
+        return f"{tag} (empty result)"
 
     def _reset_stream_timing(self) -> None:
         """Reset timing for a new LLM stream (called on STREAM_START event).
@@ -2261,20 +2416,18 @@ class AgentTUI(App):
         if is_debug_enabled():
             log_tps_timing_reset(
                 source="stream_start",
-                old_first=self._first_token_time,
-                old_last=self._last_token_time,
-                old_count=self._token_count,
+                old_first=self.tracker._first_token_time,
+                old_last=self.tracker._last_token_time,
+                old_count=self.tracker._token_count,
                 old_stream_start=self._stream_start_time,
             )
-        self._first_token_time = None
-        self._last_token_time = None
-        self._token_count = 0
+        self.tracker.reset_stream()
         self._stream_start_time = time.time()
         if is_debug_enabled():
             log_tps_stream_start(
                 source="stream_start",
-                first_token_time=self._first_token_time,
-                token_count=self._token_count,
+                first_token_time=self.tracker._first_token_time,
+                token_count=self.tracker._token_count,
                 stream_start_time=self._stream_start_time,
             )
 
@@ -2302,6 +2455,7 @@ class AgentTUI(App):
             # happen during a stream (thinking→processing→tooling) and resetting
             # would wipe out timing before TOKEN_USAGE arrives.
             # _stream_start_time is set per-stream in _reset_stream_timing
+            self.tracker.turn_start()
             # Start elapsed timer if not already running (new session)
             if self._elapsed_start_time is None:
                 self._elapsed_start_time = time.time()
@@ -2310,12 +2464,10 @@ class AgentTUI(App):
             # Only reset elapsed timer if no pending queue items
             # (timer continues for queued messages)
             if self.agent.queue.pending_count == 0:
-                if self._elapsed_start_time is not None:
-                    duration = time.time() - self._elapsed_start_time
+                duration = self.tracker.turn_end()
+                if duration is not None:
                     self._last_turn_duration = duration
                     self._last_turn_end_time = time.time()
-                    self._total_processing_time += duration
-                    self._turn_count += 1
                 self._elapsed_start_time = None
         elif status == "paused":
             self.processing = False
@@ -2332,12 +2484,8 @@ class AgentTUI(App):
     ) -> None:
         """Update token usage from agent event and calculate TPS.
 
-        TPS elapsed is measured from first_token_time to last_token_time,
-        measuring generation speed (excludes prompt evaluation time).
-        This matches how backends report tokens-per-second on normal turns.
-
-        Thresholds suppress TPS on short responses where the measurement is
-        unreliable. See MIN_TOKENS and MIN_ELAPSED below for rationale.
+        Delegates TPS computation to TokenTimingTracker. Syncs Textual
+        reactive properties from agent data and handles debug logging.
 
         Args:
             data: Token usage data from TOKEN_USAGE event
@@ -2348,95 +2496,37 @@ class AgentTUI(App):
         self.completion_tokens = data.get("completion_tokens", 0)
         self.total_tokens = data.get("total_tokens", 0)
 
-        # Use captured timing if provided (to avoid race condition with _reset_stream_timing)
-        # Otherwise fall back to instance variables
-        first_time = (
-            first_token_time if first_token_time is not None
-            else self._first_token_time
-        )
-        last_time = (
-            last_token_time if last_token_time is not None else self._last_token_time
-        )
-        # TPS display thresholds — suppress TPS on responses where the
-        # measurement is unreliable or misleading.
-        #
-        # MIN_TOKENS: Minimum completion_tokens to show TPS.
-        #   Short responses (e.g. skill acknowledgments ~30 tokens) produce
-        #   inaccurate TPS because prompt evaluation time dominates elapsed.
-        #   When a large tool result (e.g. skill content) is in the context,
-        #   prompt_eval can be 4-5s of a 7s total elapsed, making TPS appear
-        #   3x lower than the backend's reported generation speed.  Suppressing
-        #   short responses avoids showing these misleading numbers; the stale
-        #   TPS from the previous (longer) response persists instead.
-        #
-        # MIN_ELAPSED: Minimum seconds between first_token and last_token.
-        #   Below this, chunk granularity and TTFT variance make TPS noisy.
-        #   Measuring from first_token (generation speed) means elapsed is
-        #   typically shorter than from stream_start, so 1.5s is sufficient.
-        MIN_TOKENS = 50
-        MIN_ELAPSED = 1.5  # seconds
-        MIN_ELAPSED_FOR_CALC = 0.1  # Floor to prevent division by near-zero elapsed
-
-        if first_time and last_time:
-            elapsed = last_time - first_time
-
-            # Sanity check: reject absurdly short elapsed times (likely race condition)
-            if elapsed < MIN_ELAPSED_FOR_CALC:
-                if is_debug_enabled():
-                    log_tps_event(
-                        "sanity_check_elapsed_too_short",
-                        {
-                            "elapsed": elapsed,
-                            "completion_tokens": self.completion_tokens,
-                        },
-                    )
-                threshold_passed = False
-                tps_value = None
-            else:
-                threshold_passed = (
-                    elapsed >= MIN_ELAPSED and self.completion_tokens >= MIN_TOKENS
-                )
-                tps_value = None
-
-                if threshold_passed:
-                    tps_value = self.completion_tokens / elapsed
-                    if tps_value > 0:
-                        self._last_tps = tps_value
-            # else: keep previous TPS value — short/low-token responses produce
-            # inaccurate TPS (prompt_eval inflates elapsed), so the stale
-            # TPS from a longer prior response is a better signal
-
-            if is_debug_enabled():
-                log_tps_calculation(
-                    elapsed=elapsed,
-                    completion_tokens=self.completion_tokens,
-                    min_elapsed=MIN_ELAPSED,
-                    min_tokens=MIN_TOKENS,
-                    threshold_passed=threshold_passed,
-                    tps_value=tps_value,
-                )
-        else:
-            if is_debug_enabled():
-                log_tps_calculation(
-                    elapsed=0,
-                    completion_tokens=self.completion_tokens,
-                    min_elapsed=MIN_ELAPSED,
-                    min_tokens=MIN_TOKENS,
-                    threshold_passed=False,
-                    tps_value=None,
-                )
+        result = self.tracker.compute_tps(data, first_token_time, last_token_time)
+        if result is not None:
+            self._last_tps = result.tps
 
         if is_debug_enabled():
+            first_time = (
+                first_token_time if first_token_time is not None
+                else self.tracker._first_token_time
+            )
+            last_time = (
+                last_token_time if last_token_time is not None
+                else self.tracker._last_token_time
+            )
+            elapsed = (last_time - first_time) if (first_time and last_time) else 0
+            threshold_passed = result is not None
+            tps_value = result.tps if result else None
+            log_tps_calculation(
+                elapsed=elapsed,
+                completion_tokens=self.completion_tokens,
+                min_elapsed=self.tracker.MIN_ELAPSED,
+                min_tokens=self.tracker.MIN_TOKENS,
+                threshold_passed=threshold_passed,
+                tps_value=tps_value,
+            )
             log_tps_token_usage(
                 prompt_tokens=self.prompt_tokens,
                 completion_tokens=self.completion_tokens,
                 total_tokens=self.total_tokens,
-                first_token_time=(
-                    first_token_time if first_token_time is not None
-                    else self._first_token_time
-                ),
+                first_token_time=first_time,
                 last_token_time=last_time,
-                token_count=self._token_count,
+                token_count=self.tracker._token_count,
             )
 
     def _get_spinner_frames(self) -> list[str]:
@@ -2515,7 +2605,7 @@ class AgentTUI(App):
         # Get status - use agent.pause_state as primary source (single source of truth)
         if self.agent.is_pausing:
             status_text = "pausing"
-        elif not self._agent_running:
+        elif not self._agent_task or self._agent_task.done():
             status_text = "stopped"
         elif self.agent.is_paused:
             status_text = "paused"
@@ -2568,9 +2658,9 @@ class AgentTUI(App):
         if self.agent.journal_mode:
             jnl_str = " | jnl: on"
 
-        # Tool stats
+        # Tool stats (only shown in devel mode)
         tool_stats = self.agent.tool_stats
-        if tool_stats.total_calls > 0:
+        if self.agent.devel_mode and tool_stats.total_calls > 0:
             tools_str = (
                 f" | Tools: {tool_stats.total_successes}/{tool_stats.total_calls}"
             )
@@ -2738,7 +2828,8 @@ class AgentTUI(App):
             priority: If True, add to front of queue
             interrupt: If True, interrupt agent loop (implies priority)
         """
-        await self.agent.add_message(text, priority=priority, interrupt=interrupt)
+        expanded = expand_file_mentions(text)
+        await self.agent.add_message(expanded, priority=priority, interrupt=interrupt)
 
     def _handle_command(self, cmd: str) -> None:
         """Handle slash commands."""
@@ -2787,6 +2878,8 @@ class AgentTUI(App):
             self._handle_deprioritise_command(args)
         elif command == "sandbox":
             self._handle_sandbox_command(args)
+        elif command == "cwd":
+            self._handle_cwd_command(args)
         elif command == "provider":
             self._handle_provider_command(args)
         elif command == "mcp":
@@ -2905,62 +2998,11 @@ class AgentTUI(App):
             self._update_info_content(f"[red]Unknown model: {escape_markup(args)}[/]")
 
     def _resolve_model(self, choice: str) -> str | None:
-        """Resolve model selection by number or name."""
-        choice = choice.strip()
-        if not choice:
-            return None
+        """Resolve model selection by number or name.
 
-        if choice.isdigit():
-            idx = int(choice) - 1
-            if 0 <= idx < len(self.model_names):
-                return self.model_names[idx]
-            return None
-
-        # Check for exact match (case-insensitive)
-        for m in self.model_names:
-            if m.lower() == choice.lower():
-                return m
-
-        # Check for substring matches
-        matches = [m for m in self.model_names if choice.lower() in m.lower()]
-        if len(matches) == 1:
-            return matches[0]
-        return None
-
-    def _get_message_groups(self) -> list[list[int]]:
-        """Group messages for atomic deletion.
-
-        Each group starts with a non-interrupt user message and includes all
-        subsequent messages (interrupt user messages, tool calls, tool results,
-        assistant responses) until the next non-interrupt user message.
-
-        Interrupt user messages (marked with "interrupt": True) are kept in
-        the same group as the turn they interrupted, so /history shows them
-        as part of that turn and /journal compacts the entire turn together.
-
-        Returns:
-            List of groups, where each group is a list of message indices.
+        Delegates to the shared resolve_model_selection from models.py.
         """
-        groups = []
-        current_group = []
-
-        for i, msg in enumerate(self.agent.messages):
-            role = msg.get("role", "unknown")
-
-            if role == "user" and not msg.get("interrupt"):
-                # Start a new group (non-interrupt user message)
-                if current_group:
-                    groups.append(current_group)
-                current_group = [i]
-            else:
-                # Add to current group (interrupt user msgs, tools, assistants)
-                current_group.append(i)
-
-        # Don't forget the last group
-        if current_group:
-            groups.append(current_group)
-
-        return groups
+        return resolve_model_selection(self.agent.available_models, choice)
 
     def _handle_hist_command(self) -> None:
         """Handle /history command - show grouped message history."""
@@ -2969,74 +3011,48 @@ class AgentTUI(App):
             self._info_pane_mode = "history"
             return
 
-        groups = self._get_message_groups()
+        groups = format_history_groups(self.agent)
         lines = ["[bold]Message history (grouped):[/]"]
 
-        for group_num, group in enumerate(groups, 1):
-            # First message in group is always user (or should be)
-            first_idx = group[0]
-            first_msg = self.agent.messages[first_idx]
-            first_role = first_msg.get("role", "unknown")
-            first_content = first_msg.get("content", "")
-
-            # Truncate content for display
-            if first_content:
-                display = first_content[:80]
-                if len(first_content) > 80:
-                    display += "..."
+        for g in groups:
+            if g.first_content:
+                display = self._sanitize_text(g.first_content, 120)
             else:
                 display = "(empty)"
 
-            # Show group header
             lines.append(
-                f"  [cyan]{group_num}.[/] [bold]{first_role}:[/] {escape_markup(display)}"
+                f"  [cyan]{g.number}.[/] [bold]{g.first_role}:[/] {escape_markup(display)}"
             )
 
-            # Show subsequent messages in group (indented)
-            for idx in group[1:]:
-                msg = self.agent.messages[idx]
-                role = msg.get("role", "unknown")
-                content = msg.get("content", "")
-
-                if role == "tool":
-                    tool_call_id = msg.get("tool_call_id", "?")
+            for entry in g.entries:
+                if entry.role == "tool":
                     lines.append(
-                        f"      [dim]tool result (id={escape_markup(tool_call_id)})[/]"
+                        f"      {self._format_tool_result_preview(entry.content)}"
                     )
-                elif role == "assistant":
-                    if content:
-                        display = content[:60]
-                        if len(content) > 60:
-                            display += "..."
+                elif entry.role == "assistant":
+                    if entry.content:
+                        display = self._sanitize_text(entry.content, 120)
                         lines.append(
                             f"      [magenta]assistant:[/] {escape_markup(display)}"
                         )
-                    else:
-                        # Check for tool calls
-                        tool_calls = msg.get("tool_calls", [])
-                        if tool_calls:
-                            for tc in tool_calls:
-                                tc_name = tc.get("function", {}).get("name", "?")
-                                lines.append(
-                                    f"      [yellow]tool call: {escape_markup(tc_name)}[/]"
-                                )
-                else:
-                    # Check for interrupt user messages
-                    if role == "user" and msg.get("interrupt"):
-                        if content:
-                            display = content[:60]
-                            if len(content) > 60:
-                                display += "..."
-                        else:
-                            display = "(empty)"
-                        lines.append(
-                            f"      [yellow]⚡ interrupt:[/] {escape_markup(display)}"
+                    for tc in entry.tool_calls:
+                        preview = self._format_tool_call_preview(
+                            tc["name"], tc["arguments"]
                         )
-                    elif content:
-                        display = content[:60]
-                        if len(content) > 60:
-                            display += "..."
-                        lines.append(f"      [dim]{role}:[/] {escape_markup(display)}")
+                        lines.append(
+                            f"      [yellow]tool call: {escape_markup(preview)}[/]"
+                        )
+                elif entry.is_interrupt:
+                    if entry.content:
+                        display = self._sanitize_text(entry.content, 120)
+                    else:
+                        display = "(empty)"
+                    lines.append(
+                        f"      [yellow]\u26a1 interrupt:[/] {escape_markup(display)}"
+                    )
+                elif entry.content:
+                    display = self._sanitize_text(entry.content, 120)
+                    lines.append(f"      [dim]{entry.role}:[/] {escape_markup(display)}")
 
         lines.append("")
         lines.append("[dim]Use /delete h N to delete group N[/]")
@@ -3045,94 +3061,16 @@ class AgentTUI(App):
 
     def _handle_delete_command(self, args: str) -> None:
         """Handle /delete command."""
-        if not args:
-            self._update_info_content(
-                "[red]Usage: /delete h N | /delete q N | /delete s NAME[/]"
+        result = execute_delete(self.agent, args)
+        if result.success:
+            if result.data.get("kind") == "history":
+                self.update_status()
+            asyncio.create_task(
+                self._write_system(result.message)
             )
-            return
-
-        parts = args.split()
-        if len(parts) < 2:
-            self._update_info_content(
-                "[red]Usage: /delete h N | /delete q N | /delete s NAME[/]"
-            )
-            return
-
-        target = parts[0].lower()
-        spec = parts[1]
-
-        if target == "h":
-            # Delete from history (by group)
-            groups = self._get_message_groups()
-            try:
-                if "-" in spec:
-                    # Delete range of groups
-                    start, end = map(int, spec.split("-"))
-                    if start < 1 or end > len(groups) or start > end:
-                        self._update_info_content(
-                            f"[red]Invalid group range: {start}-{end}[/]"
-                        )
-                        return
-                    # Collect all indices to delete
-                    indices_to_delete = []
-                    for group_num in range(start, end + 1):
-                        indices_to_delete.extend(groups[group_num - 1])
-                    # Delete in reverse order to preserve indices
-                    for idx in sorted(indices_to_delete, reverse=True):
-                        del self.agent.messages[idx]
-                    self.update_status()
-                    asyncio.create_task(
-                        self._write_system(
-                            f"Deleted groups {start}-{end} ({len(indices_to_delete)} messages)"
-                        )
-                    )
-                else:
-                    # Delete single group
-                    group_num = int(spec)
-                    if group_num < 1 or group_num > len(groups):
-                        self._update_info_content(
-                            f"[red]Invalid group number: {group_num}[/]"
-                        )
-                        return
-                    indices = groups[group_num - 1]
-                    # Delete in reverse order to preserve indices
-                    for idx in sorted(indices, reverse=True):
-                        del self.agent.messages[idx]
-                    self.update_status()
-                    asyncio.create_task(
-                        self._write_system(
-                            f"Deleted group {group_num} ({len(indices)} messages)"
-                        )
-                    )
-            except ValueError:
-                self._update_info_content("[red]Invalid index format[/]")
-        elif target == "q":
-            # Delete from queue
-            try:
-                idx = int(spec)
-                removed = self.agent.queue.remove_at(idx)
-                if removed:
-                    asyncio.create_task(
-                        self._write_system(f"Removed queue item: {removed.text[:50]}")
-                    )
-                else:
-                    self._update_info_content(f"[red]Invalid queue index: {idx}[/]")
-            except ValueError:
-                self._update_info_content("[red]Invalid index format[/]")
-        elif target == "s":
-            # Delete save file
-            from agent13.persistence import get_saves_dir
-
-            saves_dir = get_saves_dir()
-            save_path = saves_dir / f"{spec}.ctx"
-            if save_path.exists():
-                save_path.unlink()
-                asyncio.create_task(self._write_system(f"Deleted save: {spec}"))
-            else:
-                self._update_info_content(f"[red]Save not found: {spec}[/]")
         else:
             self._update_info_content(
-                "[red]Usage: /delete h N | /delete q N | /delete s NAME[/]"
+                f"[red]{escape_markup(result.message)}[/]"
             )
 
     def _handle_help_command(self) -> None:
@@ -3151,6 +3089,7 @@ class AgentTUI(App):
             "  [yellow]/pretty [on|off][/] - Toggle markdown rendering\n"
             "  [yellow]/tool-response [raw|json][/] - Set tool response format\n"
             "  [yellow]/sandbox [mode][/] - Show/set sandbox mode\n"
+            "  [yellow]/cwd [@path][/] - Show or change working directory (prefix @ for path completion)\n"
             "  [yellow]/mcp [connect|disconnect|reload][/] - List/manage MCP servers\n"
             "  [yellow]/tools[/] - Show tool usage statistics\n"
             "  [yellow]/skills[/] - Toggle/list skills mode (on|off|list|status)\n"
@@ -3190,68 +3129,37 @@ class AgentTUI(App):
 
     def _handle_status_command(self) -> None:
         """Handle /status command - show session status and settings."""
-        sandbox_mode = get_current_sandbox_mode()
+        from agent13.status import gather_status, format_duration, fmt_tokens
 
-        # Session run time
-        run_secs = int(time.time() - self._session_start_time)
-        hours, remainder = divmod(run_secs, 3600)
-        mins, secs = divmod(remainder, 60)
-        if hours > 0:
-            run_time = f"{hours}h {mins}m {secs}s"
-        elif mins > 0:
-            run_time = f"{mins}m {secs}s"
-        else:
-            run_time = f"{secs}s"
+        # Gather core status data (shared with REPL)
+        sd = gather_status(
+            self.agent, self.provider, self.model,
+            self._session_start_time, self.prompt_manager, self.tracker,
+        )
 
-        # Agent status
+        # TUI processing override: agent.status doesn't cover the
+        # "user submitted, agent hasn't started yet" window
         if self.processing:
-            agent_status = "processing"
-        elif self.agent.queue.pending_count > 0:
-            agent_status = "queued"
-        else:
-            agent_status = "idle"
+            sd.agent_status = "processing"
 
-        # Last turn info
+        # Populate TUI-specific resumed session fields
+        sd.resumed_turn_count = self._resumed_turn_count
+        sd.resumed_saved_at = self._resumed_saved_at
+        sd.resumed_prompt_tokens = self._resumed_prompt_tokens
+        sd.resumed_completion_tokens = self._resumed_completion_tokens
+
+        # ── TUI-specific: last turn info ──
         last_turn_str = ""
         if self._last_turn_duration is not None:
-            lt_mins, lt_secs = divmod(int(self._last_turn_duration), 60)
-            lt_hours, lt_mins = divmod(lt_mins, 60)
-            if lt_hours > 0:
-                dur_str = f"{lt_hours}h {lt_mins}m {lt_secs}s"
-            elif lt_mins > 0:
-                dur_str = f"{lt_mins}m {lt_secs}s"
-            else:
-                dur_str = f"{lt_secs}s"
-            ago_secs = int(time.time() - self._last_turn_end_time)
-            ago_m, ago_s = divmod(ago_secs, 60)
-            ago_h, ago_m = divmod(ago_m, 60)
-            if ago_h > 0:
-                ago_str = f"{ago_h}h {ago_m}m {ago_s}s ago"
-            elif ago_m > 0:
-                ago_str = f"{ago_m}m {ago_s}s ago"
-            else:
-                ago_str = f"{ago_s}s ago"
-            total_m, total_s = divmod(int(self._total_processing_time), 60)
-            total_h, total_m = divmod(total_m, 60)
-            if total_h > 0:
-                total_str = f"{total_h}h {total_m}m {total_s}s"
-            elif total_m > 0:
-                total_str = f"{total_m}m {total_s}s"
-            else:
-                total_str = f"{total_s}s"
+            dur_str = format_duration(self._last_turn_duration)
+            ago = format_duration(time.time() - self._last_turn_end_time)
             last_turn_str = (
-                f"  last turn: [yellow]{dur_str}[/] (completed {ago_str})\n"
-                f"  turns: [yellow]{self._turn_count}[/] | "
-                f"total processing: [yellow]{total_str}[/]\n"
+                f"  last turn: [yellow]{dur_str}[/] (completed {ago} ago)\n"
+                f"  turns: [yellow]{sd.turn_count}[/] | "
+                f"total processing: [yellow]{sd.total_processing}[/]\n"
             )
 
-        # Token counts
-        def fmt_tokens(n: int) -> str:
-            if n >= 1000:
-                return f"{n / 1000:.1f}k"
-            return str(n)
-
-        # Resumed session info (for --continue and /load)
+        # ── TUI-specific: resumed session info ──
         resumed_str = ""
         if self._resumed_turn_count > 0:
             resumed_lines = []
@@ -3272,51 +3180,36 @@ class AgentTUI(App):
                     )
                 except (ValueError, OSError):
                     pass
-            prev_p = fmt_tokens(self._resumed_prompt_tokens)
-            prev_c = fmt_tokens(self._resumed_completion_tokens)
+            prev_p = fmt_tokens(sd.resumed_prompt_tokens)
+            prev_c = fmt_tokens(sd.resumed_completion_tokens)
             prev_t = fmt_tokens(
-                self._resumed_prompt_tokens + self._resumed_completion_tokens
+                sd.resumed_prompt_tokens + sd.resumed_completion_tokens
             )
             resumed_lines.append(
-                f"  previous: [yellow]{self._resumed_turn_count}[/] turns | "
+                f"  previous: [yellow]{sd.resumed_turn_count}[/] turns | "
                 f"{prev_p} prompt / {prev_c} completion / {prev_t} total"
             )
-            # This-session deltas
-            delta_p = fmt_tokens(self.prompt_tokens - self._resumed_prompt_tokens)
+            delta_p = fmt_tokens(sd.prompt_tokens - sd.resumed_prompt_tokens)
             delta_c = fmt_tokens(
-                self.completion_tokens - self._resumed_completion_tokens
+                sd.completion_tokens - sd.resumed_completion_tokens
             )
             delta_t = fmt_tokens(
-                (self.prompt_tokens - self._resumed_prompt_tokens)
-                + (self.completion_tokens - self._resumed_completion_tokens)
+                (sd.prompt_tokens - sd.resumed_prompt_tokens)
+                + (sd.completion_tokens - sd.resumed_completion_tokens)
             )
             resumed_lines.append(
-                f"  this session: [yellow]{self._turn_count}[/] turns | "
+                f"  this session: [yellow]{sd.turn_count}[/] turns | "
                 f"{delta_p} prompt / {delta_c} completion / {delta_t} total"
             )
             resumed_str = "\n".join(resumed_lines) + "\n"
 
-        prompt_t = fmt_tokens(self.prompt_tokens)
-        completion_t = fmt_tokens(self.completion_tokens)
-        total_t = fmt_tokens(self.prompt_tokens + self.completion_tokens)
-
-        # Tool stats
-        stats = self.agent.tool_stats
-        tools_str = (
-            f"{stats.total_successes}/{stats.total_calls}"
-            if stats.total_calls > 0
-            else "0"
-        )
-
-        # MCP status
-        mcp_str = (
-            "connected" if self.agent.mcp and self.agent.mcp.is_connected()
-            else "off"
-        )
-
-        # Saves info
+        # ── TUI-specific: saves info ──
         saves_str = ""
         try:
+            from agent13.config import get_config
+            cfg = get_config()
+            saves_loc = cfg.saves_location
+
             project_name = Path.cwd().name
             auto_dir = get_auto_save_dir()
             auto_count = len(list(auto_dir.glob(f"{project_name}-*.ctx")))
@@ -3324,10 +3217,10 @@ class AgentTUI(App):
             manual_count = len(manual_saves)
             saves_lines = []
             saves_lines.append("\n[bold]Saves[/]")
+            loc_label = "local" if saves_loc == "local" else "central"
             saves_lines.append(
-                f"  auto: [yellow]{auto_count}[/] | manual: [yellow]{manual_count}[/]"
+                f"  auto: [yellow]{auto_count}[/] ({loc_label}) | manual: [yellow]{manual_count}[/]"
             )
-            # Check for restorable session
             latest = find_latest_auto_save()
             if latest:
                 try:
@@ -3350,38 +3243,44 @@ class AgentTUI(App):
         except OSError:
             pass
 
-        # Build output
+        # ── Build output (Rich markup) ──
+        tools_str = (
+            f"{sd.tool_successes}/{sd.tool_calls}"
+            if sd.tool_calls > 0
+            else "0"
+        )
+
         self._update_info_content(
             f"[bold]Session[/]\n"
-            f"  status: [yellow]{agent_status}[/]\n"
-            f"  run time: [yellow]{run_time}[/]\n"
-            f"  cwd: [yellow]{escape_markup(os.getcwd())}[/]\n"
+            f"  status: [yellow]{sd.agent_status}[/]\n"
+            f"  run time: [yellow]{sd.run_time}[/]\n"
+            f"  cwd: [yellow]{escape_markup(sd.cwd)}[/]\n"
             f"{last_turn_str}"
             f"{resumed_str}"
             f"{saves_str}"
             f"\n[bold]Provider[/]\n"
-            f"  provider: [yellow]{escape_markup(self.provider)}[/]\n"
-            f"  model: [yellow]{escape_markup(self.model)}[/]\n"
-            f"  prompt: [yellow]{escape_markup(self.prompt_manager.active_prompt)}[/]\n"
+            f"  provider: [yellow]{escape_markup(sd.provider)}[/]\n"
+            f"  model: [yellow]{escape_markup(sd.model)}[/]\n"
+            f"  prompt: [yellow]{escape_markup(sd.active_prompt)}[/]\n"
             f"\n[bold]Context[/]\n"
-            f"  prompt tokens: [yellow]{prompt_t}[/]\n"
-            f"  completion tokens: [yellow]{completion_t}[/]\n"
-            f"  total tokens: [yellow]{total_t}[/]\n"
-            f"  queue: [yellow]{self.agent.queue.pending_count}[/]\n"
+            f"  prompt tokens: [yellow]{sd.prompt_tokens_fmt}[/]\n"
+            f"  completion tokens: [yellow]{sd.completion_tokens_fmt}[/]\n"
+            f"  total tokens: [yellow]{sd.total_tokens_fmt}[/]\n"
+            f"  queue: [yellow]{sd.queue_count}[/]\n"
             f"\n[bold]Connectivity[/]\n"
-            f"  mcp: [yellow]{mcp_str}[/]\n"
+            f"  mcp: [yellow]{sd.mcp_status}[/]\n"
             f"\n[bold]Tools[/]\n"
             f"  success/calls: [yellow]{tools_str}[/]\n"
             f"\n[bold]Settings[/]\n"
-            f"  sandbox: [yellow]{escape_markup(sandbox_mode.value)}[/]\n"
+            f"  sandbox: [yellow]{escape_markup(sd.sandbox_mode)}[/]\n"
             f"  pretty: [yellow]{'on' if self.pretty else 'off'}[/]\n"
             f"  tool-response: [yellow]{escape_markup(self.tool_response_format)}[/]\n"
             f"  spinner: [yellow]{self._spinner_speed}[/]\n"
             f"  clipboard: [yellow]{self._clipboard_method}[/]\n"
-            f"  remove-reasoning: [yellow]{'on' if self.agent.remove_reasoning else 'off'}[/]\n"
-            f"  devel: [yellow]{'on' if self.agent.devel_mode else 'off'}[/]\n"
-            f"  skills: [yellow]{'on' if self.agent.skills_mode else 'off'}[/]\n"
-            f"  journal: [yellow]{'on' if self.agent.journal_mode else 'off'}[/]"
+            f"  remove-reasoning: [yellow]{'on' if sd.remove_reasoning else 'off'}[/]\n"
+            f"  devel: [yellow]{'on' if sd.devel_mode else 'off'}[/]\n"
+            f"  skills: [yellow]{'on' if sd.skills_mode else 'off'}[/]\n"
+            f"  journal: [yellow]{'on' if sd.journal_mode else 'off'}[/]"
         )
         self._info_pane_mode = "status"
 
@@ -3412,8 +3311,8 @@ class AgentTUI(App):
         self._resumed_completion_tokens = self.completion_tokens
         # Reset session timing (conversation effectively restarts)
         self._session_start_time = time.time()
-        self._turn_count = 0
-        self._total_processing_time = 0.0
+        self.tracker._turn_count = 0
+        self.tracker._total_processing_time = 0.0
         self._last_turn_duration = None
         self._last_turn_end_time = None
 
@@ -3593,7 +3492,7 @@ class AgentTUI(App):
 
         Returns None if no suitable message is found.
         """
-        idx = self.agent._find_last_user_idx()
+        idx = self.agent.history.find_last_user_idx()
         if idx is None:
             return None
         content = self.agent.messages[idx].get("content", "")
@@ -3640,24 +3539,24 @@ class AgentTUI(App):
 
     def _handle_queue_command(self) -> None:
         """Handle /queue command - show queue items."""
-        items = self.agent.queue.list_items()
+        items = format_queue_items(self.agent.queue)
         if not items:
             self._update_info_content("[dim]Queue is empty[/]")
             self._info_pane_mode = "queue"
             return
 
         lines = ["[bold]Queue items:[/]"]
-        for i, item in enumerate(items, 1):
+        for item in items:
             if item.interrupt:
                 priority_marker = "[red]!![/] "
             elif item.priority:
                 priority_marker = "[yellow]![/] "
             else:
                 priority_marker = "   "
-            status_marker = "running" if item.status.value == "running" else ""
-            text_preview = item.text[:40] + "..." if len(item.text) > 40 else item.text
+            status_marker = " (running)" if item.running else ""
+            text_preview = self._sanitize_text(item.text, 80)
             lines.append(
-                f"  {priority_marker}[cyan]{i}.[/] {escape_markup(text_preview)} {status_marker}"
+                f"  {priority_marker}[cyan]{item.index}.[/] {escape_markup(text_preview)}{status_marker}"
             )
         self._update_info_content("\n".join(lines))
         self._info_pane_mode = "queue"
@@ -3715,9 +3614,8 @@ class AgentTUI(App):
 
         # Check for incomplete turn from loaded context (even if not paused)
         if self.agent.has_incomplete_turn:
-            self._agent_running = True
-            self.update_status()
-            asyncio.create_task(self._continue_incomplete_turn())
+            self._agent_task = asyncio.create_task(self._continue_incomplete_turn())
+            self.call_later(self._set_running, True)
             return
 
         if self.agent.pause_state == PauseState.RUNNING:
@@ -3730,7 +3628,6 @@ class AgentTUI(App):
             self.agent.resume()
         else:
             # Agent was stopped — restart it
-            self._agent_running = True
             self._agent_task = asyncio.create_task(self.agent.run())
 
         # Immediately update status display (agent will emit STATUS_CHANGE shortly)
@@ -3753,50 +3650,35 @@ class AgentTUI(App):
                 escape_text=False,
             )
         finally:
-            self._agent_running = False
-            self.update_status()
+            self._agent_task = None
+            self.call_later(self._set_running, False)
 
     def _handle_retry_command(self) -> None:
-        """Handle /retry command - retry the last message.
-
-        Queues a kind='retry' item for safe deferred processing.
-        The agent processes it at a safe boundary between items,
-        deleting the last message group and re-adding the user message.
-        """
-        if not self.agent.messages:
-            self._update_info_content("[yellow]No messages to retry[/]")
+        """Handle /retry command - retry the last message."""
+        result = execute_retry(self.agent)
+        if not result.success:
+            self._update_info_content(f"[yellow]{result.message}[/]")
             return
 
-        # Clear error/interrupt state (pause state read from agent.pause_state)
+        # Clear error/interrupt state
         self._error_state = False
         self._last_error_type = None
         self._interrupt_requested = False
         self._interrupt_available = False
 
-        # Queue the retry for safe deferred processing
-        asyncio.create_task(self.agent.request_retry())
+        user_text = result.data["user_text"]
+        asyncio.create_task(self._retry_requeue(user_text))
 
-    async def _retry_message(self, text: str) -> None:
-        """Re-add a message to the queue for retry.
-
-        If the agent loop is running, just adds the message to the queue
-        and the existing loop will pick it up. If the loop has stopped
-        (e.g. after an error), restarts it.
-
-        Args:
-            text: The user message text to retry
-        """
+    async def _retry_requeue(self, text: str) -> None:
+        """Re-add message to queue for retry, restarting loop if needed."""
         if self._agent_task and not self._agent_task.done():
-            # Agent loop is still running — just add the message to the queue
             await self.agent.add_message(text)
         else:
-            # Agent loop has stopped — wait for cleanup, then restart
             if self._agent_task:
                 try:
                     await self._agent_task
                 except asyncio.CancelledError:
                     pass
-            self._agent_running = True
             await self.agent.add_message(text)
             self._agent_task = asyncio.create_task(self.agent.run())
         await self._write_system(
@@ -3806,45 +3688,44 @@ class AgentTUI(App):
 
     def _handle_prioritise_command(self, args: str) -> None:
         """Handle /prioritise command - mark queue item as priority."""
-        if not args:
-            self._update_info_content("[red]Usage: /prioritise N[/]")
-            return
-
-        try:
-            idx = int(args.strip())
-            if self.agent.queue.set_priority_at(idx, True):
-                asyncio.create_task(
-                    self._write_system(f"Item {idx} marked as priority")
-                )
-            else:
-                self._update_info_content(f"[red]Invalid queue index: {idx}[/]")
-        except ValueError:
-            self._update_info_content("[red]Invalid index format[/]")
+        result = execute_prioritise(self.agent, args)
+        if result.success:
+            asyncio.create_task(self._write_system(result.message))
+        else:
+            self._update_info_content(f"[red]{result.message}[/]")
 
     def _handle_deprioritise_command(self, args: str) -> None:
         """Handle /deprioritise command - remove priority from queue item."""
-        if not args:
-            self._update_info_content("[red]Usage: /deprioritise N[/]")
-            return
-
-        try:
-            idx = int(args.strip())
-            if self.agent.queue.set_priority_at(idx, False):
-                asyncio.create_task(self._write_system(f"Item {idx} priority removed"))
-            else:
-                self._update_info_content(f"[red]Invalid queue index: {idx}[/]")
-        except ValueError:
-            self._update_info_content("[red]Invalid index format[/]")
+        result = execute_deprioritise(self.agent, args)
+        if result.success:
+            asyncio.create_task(self._write_system(result.message))
+        else:
+            self._update_info_content(f"[red]{result.message}[/]")
 
     def _handle_provider_command(self, args: str) -> None:
         """Handle /provider command - change provider (use /model to select model after)."""
         if not args:
-            self._update_info_content("[red]Usage: /provider <provider_name_or_url>[/]")
+            # Show provider list via completion system, starting at current provider
+            matches = self._get_provider_completions("")
+            if not matches:
+                self._update_info_content(
+                    "[red]No providers configured in ~/.agent13/config.toml[/]"
+                )
+                return
+            self._enter_command_completion("provider", matches, self.provider)
+            return
+
+        # Resolve numeric selection to provider name
+        resolved = resolve_provider_selection(args)
+        if resolved is None:
+            self._update_info_content(
+                f"[red]No provider matching '{escape_markup(args)}'[/]"
+            )
             return
 
         try:
             base_url, api_key, read_timeout, connect_timeout = resolve_provider_arg(
-                args
+                resolved
             )
         except ValueError as e:
             self._update_info_content(f"[red]Error: {escape_markup(str(e))}[/]")
@@ -3861,7 +3742,9 @@ class AgentTUI(App):
 
         # Update provider name for status bar (empty if URL)
         self.provider = (
-            "" if args.startswith("http://") or args.startswith("https://") else args
+            ""
+            if resolved.startswith("http://") or resolved.startswith("https://")
+            else resolved
         )
         self.update_status()
 
@@ -3886,7 +3769,7 @@ class AgentTUI(App):
             return
 
         # Update model list
-        self.model_names = model_names
+        self.agent.available_models = model_names
 
         # Show model list
         lines = [f"[bold]Provider changed to: {escape_markup(base_url)}[/]"]
@@ -3929,6 +3812,40 @@ class AgentTUI(App):
             )
         except ValueError as e:
             self._update_info_content(f"[red]{escape_markup(str(e))}[/]")
+
+    def _handle_cwd_command(self, args: str) -> None:
+        """Handle /cwd command - show or change working directory."""
+        if not args:
+            self._update_info_content(
+                f"[bold]Working directory:[/]\n  [cyan]{Path.cwd()}[/]"
+            )
+            return
+
+        # Strip @ prefix from path autocomplete (e.g. /cwd @../path)
+        target = Path(args.strip().lstrip("@")).expanduser().resolve()
+        if not target.exists():
+            self._update_info_content(
+                f"[red]Path does not exist: {escape_markup(str(target))}[/]"
+            )
+            return
+        if not target.is_dir():
+            self._update_info_content(
+                f"[red]Not a directory: {escape_markup(str(target))}[/]"
+            )
+            return
+
+        try:
+            os.chdir(target)
+            asyncio.create_task(
+                self._write_system(
+                    f"Working directory changed to: {target}"
+                )
+            )
+        except OSError as e:
+            self._update_info_content(
+                f"[red]Cannot change directory: "
+                f"{escape_markup(str(e))}[/]"
+            )
 
     def _handle_mcp_command(self, args: str) -> None:
         """Handle /mcp command - list MCP servers or manage connections."""
@@ -4393,44 +4310,12 @@ class AgentTUI(App):
 
     def _handle_save_command(self, args: str) -> None:
         """Handle /save command - save context to file."""
-        args = args.strip()
-
-        # Parse args: /save <name> [-y]
-        parts = args.split()
-        if not parts:
+        result = execute_save(self.agent, args)
+        if result.success:
+            self._update_info_content(f"[green]{escape_markup(result.message)}[/]")
+        else:
             self._update_info_content(
-                "[red]Usage: /save <name> [-y][/]\n"
-                "  [yellow]/save mycontext[/] - Save to ./agent13/saves/mycontext.ctx\n"
-                "  [yellow]/save mycontext -y[/] - Overwrite without prompting"
-            )
-            return
-
-        name = parts[0]
-        force = "-y" in parts
-
-        # Validate name
-        if not name or name.startswith("-"):
-            self._update_info_content("[red]Please provide a valid save name[/]")
-            return
-
-        saves_dir = get_saves_dir()
-        path = saves_dir / f"{name}.ctx"
-
-        # Check for overwrite
-        if path.exists() and not force:
-            self._update_info_content(
-                f"[yellow]File already exists: {path}[/]\n"
-                f"Use [yellow]/save {name} -y[/] to overwrite"
-            )
-            return
-
-        # Save
-        try:
-            save_context(self.agent, path)
-            self._update_info_content(f"[green]Saved context to {path}[/]")
-        except Exception as e:
-            self._update_info_content(
-                f"[red]Failed to save: {escape_markup(str(e))}[/]"
+                f"[red]{escape_markup(result.message)}[/]"
             )
 
     def _handle_load_command(self, args: str) -> None:
@@ -4445,13 +4330,13 @@ class AgentTUI(App):
         if not args:
             self._update_info_content(
                 "[red]Usage: /load <name>[/]\n"
-                "  [yellow]/load mycontext[/] - Load from ./agent13/saves/mycontext.ctx"
+                "  [yellow]/load mycontext[/] - Load from ./.agent13/saves/mycontext.ctx\n"
+                "  [yellow]/load 2026-05-25[/] - Load auto-save by date"
             )
             return
 
-        name = args.split()[0]
-        saves_dir = get_saves_dir()
-        path = saves_dir / f"{name}.ctx"
+        from agent13.persistence import resolve_save_path
+        path = resolve_save_path(args)
 
         if not path.exists():
             self._update_info_content(
@@ -4481,7 +4366,7 @@ class AgentTUI(App):
             "message": message,
             "path": str(path),
             "messages_count": len(self.agent.messages),
-            "has_tool_calls": self.agent._has_tool_calls(),
+            "has_tool_calls": self.agent.history.has_tool_calls(),
         })
         if success:
             # Reset TUI token counters
@@ -4527,9 +4412,9 @@ class AgentTUI(App):
         if is_debug_enabled():
             log_tps_tool_call(
                 tool_name=message.name,
-                first_token_time=self._first_token_time,
-                last_token_time=self._last_token_time,
-                token_count=self._token_count,
+                first_token_time=self.tracker._first_token_time,
+                last_token_time=self.tracker._last_token_time,
+                token_count=self.tracker._token_count,
                 pending_token_usage=None,
             )
         self._token_queue.put_nowait(message)
@@ -4554,20 +4439,35 @@ class AgentTUI(App):
                 # Shutdown sentinel
                 break
 
-            if isinstance(message, ToolCallMessage):
-                await self._handle_tool_call(message)
-                continue
+            try:
+                if isinstance(message, ToolCallMessage):
+                    await self._handle_tool_call(message)
+                    continue
 
-            if isinstance(message, ToolResultMessage):
-                await self._handle_tool_result(message)
-                continue
+                if isinstance(message, ToolResultMessage):
+                    await self._handle_tool_result(message)
+                    continue
 
-            if isinstance(message, SystemQueueMessage):
-                await self._write_system(message.text, escape_text=message.escape_text)
-                continue
+                if isinstance(message, SystemQueueMessage):
+                    await self._write_system(message.text, escape_text=message.escape_text)
+                    continue
 
-            # It's a TokenMessage
-            await self._handle_token(message)
+                # It's a TokenMessage
+                await self._handle_token(message)
+            except Exception as e:
+                # Log but don't die — the processor must keep running
+                # or the chat window becomes permanently disconnected
+                # from the agent's output.
+                from agent13.debug_log import log_error
+                log_error(e, {"context": "_process_tokens", "message_type": type(message).__name__})
+                # Try to show error in chat so user knows something went wrong
+                try:
+                    await self._write_system(
+                        f"[red]Display error: {escape_markup(str(e))}[/]",
+                        escape_text=False,
+                    )
+                except Exception:
+                    pass  # If we can't even write the error, just continue
 
     async def _handle_token(self, message: TokenMessage) -> None:
         """Process a single token message sequentially."""
@@ -4576,9 +4476,9 @@ class AgentTUI(App):
             if is_debug_enabled():
                 log_tps_stream_end(
                     reason="is_final",
-                    first_token_time=self._first_token_time,
-                    last_token_time=self._last_token_time,
-                    token_count=self._token_count,
+                    first_token_time=self.tracker._first_token_time,
+                    last_token_time=self.tracker._last_token_time,
+                    token_count=self.tracker._token_count,
                     pending_token_usage=None,
                 )
             self._streaming = False
@@ -4587,13 +4487,10 @@ class AgentTUI(App):
         else:
             # Track timing for TPS calculation
             now = time.time()
-            if self._first_token_time is None:
-                self._first_token_time = now
+            if self.tracker.is_first_token:
                 if is_debug_enabled():
-                    log_tps_first_token(token_count=self._token_count)
-            # Always update last token time for accurate streaming window
-            self._last_token_time = now
-            self._token_count += 1
+                    log_tps_first_token(token_count=self.tracker._token_count)
+            self.tracker.record_token(now)
 
             was_at_bottom = self._is_at_bottom()
 
@@ -4622,6 +4519,15 @@ class AgentTUI(App):
                     self._streaming = True
                     self.update_status()
                     # Clear the flag since we've created a new streaming message
+                    self._finalize_before_tool = False
+                elif not self._streaming:
+                    # Widget exists but stream ended (error path: ASSISTANT_COMPLETE
+                    # was never emitted). Finalize the stale widget and start fresh.
+                    await self._streaming_content_widget.finalize()
+                    self._streaming_content_widget = None
+                    await self._start_content_stream(was_at_bottom, message.text)
+                    self._streaming = True
+                    self.update_status()
                     self._finalize_before_tool = False
                 else:
                     # Append to content widget
@@ -4652,9 +4558,9 @@ class AgentTUI(App):
                 "tool_result",
                 {
                     "tool_name": message.name,
-                    "first_token_time": self._first_token_time,
-                    "last_token_time": self._last_token_time,
-                    "token_count": self._token_count,
+                    "first_token_time": self.tracker._first_token_time,
+                    "last_token_time": self.tracker._last_token_time,
+                    "token_count": self.tracker._token_count,
                 },
             )
         await self._write_tool_result(message.name, message.result)
@@ -4719,7 +4625,7 @@ class AgentTUI(App):
             content = getattr(self._streaming_reasoning_widget, "_content", "")
             if not content or not content.strip():
                 # Remove the empty reasoning widget
-                await self._chat.remove(self._streaming_reasoning_widget)
+                await self._streaming_reasoning_widget.remove()
             self._streaming_reasoning_widget = None
 
     async def _start_content_stream(
@@ -4757,9 +4663,9 @@ class AgentTUI(App):
         if is_debug_enabled():
             log_tps_stream_end(
                 reason="tool_call",
-                first_token_time=self._first_token_time,
-                last_token_time=self._last_token_time,
-                token_count=self._token_count,
+                first_token_time=self.tracker._first_token_time,
+                last_token_time=self.tracker._last_token_time,
+                token_count=self.tracker._token_count,
                 pending_token_usage=None,
             )
         # Finalize reasoning if still open
@@ -5203,12 +5109,17 @@ class AgentTUI(App):
         except Exception:
             pass
 
+        # Stop the old agent loop so it exits cleanly (sets _running = False).
+        # The CancelledError was already absorbed in _process_item; this
+        # ensures the while-loop condition fails and the finally block
+        # runs with the correct MCP cleanup path.
+        self.agent.stop()
+
         # Restart the agent loop so it can process future messages
-        self._agent_running = True
         self._agent_task = asyncio.create_task(self.agent.run())
 
-        # Show interrupt message
-        await self._write_system("[yellow]⚠ Interrupted by user[/]", escape_text=False)
+        # Show interrupt message — immediate, prominent yellow panel
+        await self._write_interrupt("ESC pressed")
 
         # Notify if we were in TOOLING state — the tool may still be running
         # in the background (Python threads can't be killed; see known

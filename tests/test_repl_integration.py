@@ -11,7 +11,6 @@ Requires: pytest-httpserver (provides mock HTTP server).
 """
 
 import os
-import shutil
 import json
 import sys
 import time
@@ -1048,8 +1047,8 @@ class TestSandboxExperience:
         """User types /sandbox <mode> — sees confirmation."""
         proc = spawn_repl(repl_env)
         try:
-            proc.sendline("/sandbox none")
-            proc.expect("Sandbox mode set to: none", timeout=10)
+            proc.sendline("/sandbox off")
+            proc.expect("Sandbox mode set to: off", timeout=10)
             wait_for_prompt(proc)
         finally:
             proc.close()

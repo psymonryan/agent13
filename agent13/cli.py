@@ -11,6 +11,7 @@ Usage:
 """
 
 import json
+import os
 import sys
 
 import argparse
@@ -385,7 +386,7 @@ Provider names are read from ~/.agent13/config.toml
     from agent13.updater import check_for_update, format_update_notice, perform_update
 
     cfg = get_config()
-    if cfg.update_check_enabled:
+    if cfg.update_check_enabled and not os.environ.get("AGENT13_NO_UPDATE_CHECK"):
         update_info = check_for_update(cfg.update_check_interval_hours)
         if update_info:
             notice = format_update_notice(update_info)

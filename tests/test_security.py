@@ -92,15 +92,15 @@ class TestValidatePathForRead:
             assert "Read access denied" in error
             assert "restrictive-closed" in error
 
-    def test_outside_project_allowed_in_none_mode(self):
-        """Paths outside project should be allowed in none mode."""
+    def test_outside_project_allowed_in_off_mode(self):
+        """Paths outside project should be allowed in off mode."""
         with tempfile.TemporaryDirectory() as tmpdir:
             other_dir = Path(tmpdir) / "other"
             other_dir.mkdir()
 
-            set_session_sandbox_mode(SandboxMode.NONE)
+            set_session_sandbox_mode(SandboxMode.OFF)
 
-            # In none mode, outside paths are allowed (but traversal is still blocked)
+            # In off mode, outside paths are allowed (but traversal is still blocked)
             is_valid, error = validate_path_for_read("/etc/passwd", cwd=Path(tmpdir))
             assert is_valid is True
             assert error == ""
@@ -114,7 +114,7 @@ class TestValidatePathForRead:
             assert is_valid is False
             assert "restrictive-open" in error
             # Error message format changed - no longer includes file_read=project
-            assert "/sandbox none" in error
+            assert "/sandbox off" in error
 
 
 class TestValidatePathForWrite:
@@ -155,10 +155,10 @@ class TestValidatePathForWrite:
             assert is_valid is False
             assert "Write access denied" in error
 
-    def test_outside_project_allowed_in_none_mode(self):
-        """Paths outside project should be allowed for write in none mode."""
+    def test_outside_project_allowed_in_off_mode(self):
+        """Paths outside project should be allowed for write in off mode."""
         with tempfile.TemporaryDirectory() as tmpdir:
-            set_session_sandbox_mode(SandboxMode.NONE)
+            set_session_sandbox_mode(SandboxMode.OFF)
 
             is_valid, error = validate_path_for_write("/tmp/test.txt", cwd=Path(tmpdir))
             assert is_valid is True
@@ -248,10 +248,10 @@ class TestIntegrationWithSandboxModes:
                 is_valid, _ = validate_path_for_read("/etc/passwd", cwd=Path(tmpdir))
                 assert is_valid is False, f"Read should be blocked in {mode.value}"
 
-    def test_none_mode_allows_all(self):
-        """None mode should allow all paths (except traversal)."""
+    def test_off_mode_allows_all(self):
+        """Off mode should allow all paths (except traversal)."""
         with tempfile.TemporaryDirectory() as tmpdir:
-            set_session_sandbox_mode(SandboxMode.NONE)
+            set_session_sandbox_mode(SandboxMode.OFF)
 
             is_valid, _ = validate_path_for_read("/etc/passwd", cwd=Path(tmpdir))
             assert is_valid is True

@@ -57,7 +57,7 @@ class SandboxMode(Enum):
     PERMISSIVE_CLOSED = "permissive-closed"
     RESTRICTIVE_OPEN = "restrictive-open"
     RESTRICTIVE_CLOSED = "restrictive-closed"
-    NONE = "none"
+    OFF = "off"
 
 
 @dataclass
@@ -104,7 +104,7 @@ SANDBOX_CAPABILITIES = {
         file_read="project",
         network=False,
     ),
-    SandboxMode.NONE: SandboxCapabilities(
+    SandboxMode.OFF: SandboxCapabilities(
         file_write="anywhere",
         file_read="anywhere",
         network=True,
@@ -166,8 +166,8 @@ def parse_sandbox_paths(mode: SandboxMode) -> SandboxPaths:
     if mode in _sandbox_paths_cache:
         return _sandbox_paths_cache[mode]
 
-    # For 'none' mode, allow everything
-    if mode == SandboxMode.NONE:
+    # For 'off' mode, allow everything
+    if mode == SandboxMode.OFF:
         return SandboxPaths(
             write_paths=[],
             read_paths=[],
@@ -391,7 +391,7 @@ def parse_sandbox_mode(mode_str: str) -> SandboxMode:
     """Parse a sandbox mode string.
 
     Args:
-        mode_str: The mode string (e.g., "permissive-open", "none")
+        mode_str: The mode string (e.g., "permissive-open", "off")
 
     Returns:
         The corresponding SandboxMode
@@ -405,9 +405,8 @@ def parse_sandbox_mode(mode_str: str) -> SandboxMode:
         "permissive-closed": SandboxMode.PERMISSIVE_CLOSED,
         "restrictive-open": SandboxMode.RESTRICTIVE_OPEN,
         "restrictive-closed": SandboxMode.RESTRICTIVE_CLOSED,
-        "none": SandboxMode.NONE,
-        "disabled": SandboxMode.NONE,  # alias
-        "off": SandboxMode.NONE,  # alias
+        "off": SandboxMode.OFF,
+        "disabled": SandboxMode.OFF,  # alias
     }
     if mode_str not in mode_map:
         valid_modes = ", ".join(m.value for m in SandboxMode)
@@ -449,10 +448,10 @@ def build_sandbox_command(
         The command as a list of arguments (suitable for subprocess)
 
     Note:
-        On non-macOS systems or with mode=NONE, returns the command unchanged
+        On non-macOS systems or with mode=OFF, returns the command unchanged
         (wrapped in shell for subprocess compatibility).
     """
-    if not is_macos() or mode == SandboxMode.NONE:
+    if not is_macos() or mode == SandboxMode.OFF:
         # No sandboxing on non-macOS or when disabled
         if sys.platform == "win32":
             return ["cmd.exe", "/c", command]
@@ -627,8 +626,8 @@ def validate_sandbox_profiles() -> list[str]:
     """
     errors = []
     for mode in SandboxMode:
-        if mode == SandboxMode.NONE:
-            continue  # No profile file for 'none' mode
+        if mode == SandboxMode.OFF:
+            continue  # No profile file for 'off' mode
         try:
             profile_path = get_sandbox_profile_path(mode)
             if not profile_path.exists():

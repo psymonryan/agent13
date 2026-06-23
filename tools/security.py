@@ -106,7 +106,7 @@ def validate_path_for_read(filepath: str, cwd: Path = None) -> Tuple[bool, str]:
         f"Read access denied: path not in allowed directories.\n"
         f"  Path: {filepath}\n"
         f"  Sandbox mode: {mode.value}\n"
-        f"  Use '/sandbox none' to allow reads anywhere."
+        f"  Use '/sandbox off' to allow reads anywhere."
     )
 
 
@@ -179,5 +179,5 @@ def validate_path_for_write(filepath: str, cwd: Path = None) -> Tuple[bool, str]
         f"Write access denied: path not in allowed directories.\n"
         f"  Path: {filepath}\n"
         f"  Sandbox mode: {mode.value}\n"
-        f"  Use '/sandbox none' to allow writes anywhere."
+        f"  Use '/sandbox off' to allow writes anywhere."
     )

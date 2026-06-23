@@ -7,18 +7,18 @@
      <a href="https://github.com/psymonryan/agent13/blob/main/LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-green?style=flat"></a>
 </p>
 
-**A self-coding AI agent that runs where others won't — built for tight VRAM, any OpenAI-compatible API.**
+**A self-coding AI agent that runs where others won't - built for tight VRAM, any OpenAI-compatible API.**
 
 ![Agent13 - built for tight spaces](./images/agent13maxing.png)
 
-> Named after the agent from Get Smart who always seemed to end up in the tightest places — a mailbox, a fridge, a grandfather clock, and now a GPU?
+> Named after the agent from Get Smart who always seemed to end up in the tightest places - a mailbox, a fridge, a grandfather clock, and now a GPU?
 
 **What makes agent13 different:**
 
-- **2x effective speed** with local models — tool-use success goes from ~50% to 95% through AI-native tool design
-- **Runs on 24 GB VRAM** — works with any OpenAI-compatible API: llama-server, Ollama, vLLM, LM Studio, OpenRouter
-- **Incremental compaction** — no auto-compaction amnesia; journals tool responses so context stays small without losing information
-- **Zero telemetry** — privacy focussed, no tracking, no analytics, no phoning home
+- **2x effective speed** with local models - tool-use success goes from ~50% to 95% through AI-native tool design
+- **Runs on 24 GB VRAM** - works with any OpenAI-compatible API: llama-server, Ollama, vLLM, LM Studio, OpenRouter
+- **Incremental compaction** - no auto-compaction amnesia; journals tool responses so context stays small without losing information
+- **Zero telemetry** - privacy focussed, no tracking, no analytics, no phoning home
 - **Screen Reader Friendly** - Has both a REPL mode and the option to also to split output to a separate file which can then be tailed into a text to speech engine such as Linux-Speakup
 
 ## How is this different?
@@ -101,10 +101,10 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 
 ### 2. Install agent13
 
-**From GitHub release** (recommended — latest stable):
+**From GitHub release** (recommended - latest stable):
 
 ```bash
-uv tool install https://github.com/psymonryan/agent13/releases/download/v0.2.0/agent13-0.2.0-py3-none-any.whl
+uv tool install https://github.com/psymonryan/agent13/releases/download/v0.2.1/agent13-0.2.1-py3-none-any.whl
 ```
 
 **From source** (for development):
@@ -216,9 +216,9 @@ All commands accept `--help` for full option listing.
 
 | Option                      | Description                                | Default               |
 | --------------------------- | ------------------------------------------ | --------------------- |
-| `--list-providers`          | List providers from config and exit        | —                     |
-| `--version`                 | Show version number and exit               | —                     |
-| `-p, --prompt <text>`       | Batch mode with this prompt                | —                     |
+| `--list-providers`          | List providers from config and exit        | -                     |
+| `--version`                 | Show version number and exit               | -                     |
+| `-p, --prompt <text>`       | Batch mode with this prompt                | -                     |
 | `--model <name>`            | Select model (number or name)              | prompts interactively |
 | `--system-prompt <name>`    | System prompt to use                       | default               |
 | `--sandbox <mode>`          | Set sandbox mode for session               | permissive-open       |
@@ -230,10 +230,10 @@ All commands accept `--help` for full option listing.
 | `--journal`                 | Enable journal mode (context compaction)   | off                   |
 | `--send-reasoning`          | Include reasoning tokens in history        | off                   |
 | `--remove-reasoning`        | Strip reasoning tokens between turns       | off                   |
-| `-c, --continue`            | Resume previous session                    | —                     |
+| `-c, --continue`            | Resume previous session                    | -                     |
 | `--devel`                   | Show devel-group tools to AI               | off                   |
 | `--spinner fast\|slow\|off` | Control spinner animation                  | fast                  |
-| `--upgrade`                 | Check for updates, install, exit           | —                     |
+| `--upgrade`                 | Check for updates, install, exit           | -                     |
 | `--clipboard osc52\|system` | Clipboard method                           | osc52                 |
 
 ## Key bindings
@@ -281,7 +281,7 @@ Agent13 works with any OpenAI-compatible endpoint that supports tool calling:
 
 ## License
 
-MIT License — see [LICENSE](LICENSE) for details.
+MIT License - see [LICENSE](LICENSE) for details.
 
 ## Feedback
 

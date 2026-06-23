@@ -66,7 +66,7 @@ sudo port -b -N install uv
 winget install --id astral-sh.uv
 ```
 
-> ⚠️ **Pipe-to-shell installs** (`curl | sh`, `irm | iex`) are common but risky — a compromised URL or MITM attack can execute arbitrary code. Prefer a package manager or standalone installer. If you do use pipe-to-shell, inspect the script first and don't get comfortable making it a habit.
+> ⚠️ **Pipe-to-shell installs** (`curl | sh`, `irm | iex`) are common but risky - a compromised URL or MITM attack can execute arbitrary code. Prefer a package manager or standalone installer. If you do use pipe-to-shell, inspect the script first and don't get comfortable making it a habit.
 
 ```cmd
 powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
@@ -97,7 +97,7 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 Install package directly from github:
 
 ```
-uv tool install https://github.com/psymonryan/agent13/releases/download/v0.2.0/agent13-0.2.0-py3-none-any.whl
+uv tool install https://github.com/psymonryan/agent13/releases/download/v0.2.1/agent13-0.2.1-py3-none-any.whl
 ```
 
 Or install from source (for hacking on the agent itself):
@@ -215,7 +215,7 @@ For environments without a terminal UI (screen readers, SSH sessions, piping), R
 agent13 local --repl
 ```
 
-To capture the full chat transcript to a file — useful with a screen reader — add `--output` (which implies `--repl`):
+To capture the full chat transcript to a file - useful with a screen reader - add `--output` (which implies `--repl`):
 
 ```bash
 agent13 local --output chat.md
@@ -283,17 +283,17 @@ The `Agent` constructor accepts:
 
 ## Input Features
 
-- **@filename expansion** (REPL mode) — Type `@path/to/file.txt` in your prompt to inline the file contents into your message. Supports `~/` home expansion and Windows drive-letter paths. Binary files are detected and skipped; text files are capped at 256 KB.
-- **--read FILE** — Read one or more files into the user message before the prompt is processed. Works in any mode (TUI, batch, REPL). Useful for injecting context files without manual copy-paste.
+- **@filename expansion** (REPL mode) - Type `@path/to/file.txt` in your prompt to inline the file contents into your message. Supports `~/` home expansion and Windows drive-letter paths. Binary files are detected and skipped; text files are capped at 256 KB.
+- **--read FILE** - Read one or more files into the user message before the prompt is processed. Works in any mode (TUI, batch, REPL). Useful for injecting context files without manual copy-paste.
 
 ## Command-Line Options
 
 | Option                      | Description                                                                                              | Default               |
 | --------------------------- | -------------------------------------------------------------------------------------------------------- | --------------------- |
-| `provider`                  | Provider name from config or OpenAI-compatible URL                                                       | —                     |
-| `--list-providers`          | List available providers and exit                                                                        | —                     |
-| `--version`                 | Show version and exit                                                                                    | —                     |
-| `-p`, `--prompt`            | Run in batch mode with this prompt                                                                       | —                     |
+| `provider`                  | Provider name from config or OpenAI-compatible URL                                                       | -                     |
+| `--list-providers`          | List available providers and exit                                                                        | -                     |
+| `--version`                 | Show version and exit                                                                                    | -                     |
+| `-p`, `--prompt`            | Run in batch mode with this prompt                                                                       | -                     |
 | `--model`                   | Select model by name or number; with no value, lists models                                              | prompts interactively |
 | `--system-prompt`           | System prompt to use                                                                                     | default               |
 | `--sandbox`                 | Sandbox mode (permissive-open, permissive-closed, etc.)                                                  | permissive-open       |
@@ -305,14 +305,14 @@ The `Agent` constructor accepts:
 | `--journal`                 | Enable journal mode (context compaction)                                                                 | off                   |
 | `--send-reasoning`          | Include reasoning_content in message history                                                             | off                   |
 | `--remove-reasoning`        | Strip reasoning tokens between turns                                                                     | off                   |
-| `-c`, `--continue`          | Continue from last auto-saved session                                                                    | —                     |
+| `-c`, `--continue`          | Continue from last auto-saved session                                                                    | -                     |
 | `--devel`                   | Enable devel mode (show devel-group tools)                                                               | off                   |
 | `--spinner fast\|slow\|off` | Spinner style                                                                                            | fast                  |
-| `--upgrade`                 | Check for updates and apply, then exit                                                                   | —                     |
+| `--upgrade`                 | Check for updates and apply, then exit                                                                   | -                     |
 | `--clipboard osc52\|system` | Clipboard method for this session                                                                        | osc52                 |
-| `--read FILE`               | Read file(s) into the user message before processing                                                     | —                     |
+| `--read FILE`               | Read file(s) into the user message before processing                                                     | -                     |
 | `--repl`                    | Run in REPL mode (readline-based, no TUI)                                                                | off                   |
-| `--output FILE`             | Write REPL chat transcript to file (implies `--repl`) (the REPL still gets output for command responses) | —                     |
+| `--output FILE`             | Write REPL chat transcript to file (implies `--repl`) (the REPL still gets output for command responses) | -                     |
 
 ## TUI Reference
 
@@ -410,7 +410,8 @@ Note: both /model and /provider can use numbered or named models and providers
 | Command                      | Description                                                |
 | ---------------------------- | ---------------------------------------------------------- |
 | `/history`                   | Show input history                                         |
-| `/delete [h\|q\|s] num`      | Delete items from history queue, or saves                  |
+| `/delete [h\|q\|s] spec|name`| Delete items from history, queue, or saves                 |
+|                              | eg: `/delete h last` `/delete q -2:` `/delete h 14:18`     |
 | `/snippet`                   | Manage text snippets (saved user messages)                 |
 | `/upgrade [--copy]`          | Check for updates and apply (or copy command to clipboard) |
 | `/clipboard [osc52\|system]` | Show or set clipboard method (default: osc52)              |
@@ -457,12 +458,12 @@ agent13 http://localhost:8012/v1 --model devstral2
 **Timeout tips:**
 
 - Default `read_timeout` is 2400 seconds (40 minutes)
-- Default `connect_timeout` is 30 seconds — increase to `60` for remote servers with cold starts
+- Default `connect_timeout` is 30 seconds - increase to `60` for remote servers with cold starts
 - If you see `ReadTimeout` errors, increase `read_timeout`
 
 | Model type                           | Recommended `read_timeout` |
 | ------------------------------------ | -------------------------- |
-| Fast local (7B–14B)                  | `600`                      |
+| Fast local (7B-14B)                  | `600`                      |
 | Fast cloud (OpenRouter, OpenAI)      | `300`                      |
 | Slower models (DeepSeek-R1, GLM-5.1) | `2400`                     |
 | Slow local server                    | `2400`                     |
@@ -541,13 +542,13 @@ method = "osc52"    # "osc52" (terminal escape sequence, default) or "system" (O
 | `osc52`  | OSC 52 terminal escape sequence                      | SSH sessions, modern terminals (Alacritty, Ghostty, Kitty, iTerm2, Windows Terminal v1.18+) |
 | `system` | OS commands: `pbcopy`, `xclip`/`wl-copy`, `clip.exe` | tmux, screen, older terminals, Windows conhost/PowerShell                                   |
 
-**When to switch:** If mouse select or Ctrl+Y doesn't copy to your clipboard, you likely need `system`. Type `/clipboard system` in the TUI — it persists to your config file.
+**When to switch:** If mouse select or Ctrl+Y doesn't copy to your clipboard, you likely need `system`. Type `/clipboard system` in the TUI - it persists to your config file.
 
 **Switching at runtime:**
 
-- `/clipboard` — show current method
-- `/clipboard system` — switch to OS clipboard commands
-- `/clipboard osc52` — switch back to terminal escape sequence
+- `/clipboard` - show current method
+- `/clipboard system` - switch to OS clipboard commands
+- `/clipboard osc52` - switch back to terminal escape sequence
 
 **CLI override:**
 
@@ -828,15 +829,28 @@ Use `/prompt` in the TUI to see the current system prompt.
 
 ## History Management
 
-Use `/history` to view the full conversation history with message IDs. Use `/delete <id>` to remove specific messages from the conversation:
+Use `/history` to view the full conversation history with message IDs. Use `/delete [h|q|s] <spec>` to remove items from history, queue, or saves:
 
 ```text
+# History (h)
 /history        # List all messages with IDs
-/delete 5       # Remove message 5
-/delete 3-7     # Remove messages 3 through 7
+/delete h 5       # Remove message 5
+/delete h last    # Remove the last message
+/delete h -1      # Remove the last message (negative index)
+/delete h -2      # Remove the second-to-last message
+/delete h 3:7     # Remove messages 3 through 7 (range)
+/delete h -3:-1   # Remove from third-to-last to last
+/delete h 2:      # Remove from message 2 to end
+
+# Queue (q)
+/delete q 1       # Remove the first queued prompt
+/delete q last    # Remove the last queued prompt
+
+# Saves (s)
+/delete s my-save # Remove a named save
 ```
 
-Deleted messages are removed from the context sent to the model. This is useful for cleaning up off-topic tangents or mistakes.
+Deleted messages are removed from the context sent to the model. This is useful for cleaning up off-topic tangents or mistakes. Queue deletions remove prompts from the pending queue. Save deletions remove named conversation snapshots.
 
 ## Updates
 
@@ -851,9 +865,9 @@ Disable these notifications: set check_enabled = false in [updates] section of ~
 
 | Method              | How                                                                                   |
 | ------------------- | ------------------------------------------------------------------------------------- |
-| `/upgrade`          | In the TUI — checks, downloads wheel from GitHub, installs, then tells you to restart |
+| `/upgrade`          | In the TUI - checks, downloads wheel from GitHub, installs, then tells you to restart |
 | `/upgrade --copy`   | Copies the manual install command to clipboard instead of running it                  |
-| `agent13 --upgrade` | Non-interactive — check and apply from the command line, then exit                    |
+| `agent13 --upgrade` | Non-interactive - check and apply from the command line, then exit                    |
 | Manual              | Run the `uv tool install --force <url>` command from the notification                 |
 
 ### Update Configuration
@@ -893,7 +907,7 @@ Not all models support tool/function calling. Try a model known for good tool su
 If mouse select, Ctrl+Y, or `/upgrade --copy` doesn't copy to your clipboard:
 
 1. Type `/clipboard system` in the TUI to switch to OS clipboard commands
-2. This persists to your config — you only need to do it once
+2. This persists to your config - you only need to do it once
 3. On Linux, ensure `xclip` (X11) or `wl-copy` (Wayland) is installed
 
 See [Clipboard Configuration](#clipboard-configuration) for details.

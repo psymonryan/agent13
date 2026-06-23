@@ -276,10 +276,10 @@ class TestGatherStatus:
     @mock.patch("tools.security.get_current_sandbox_mode")
     def test_sandbox_mode(self, mock_sandbox):
         from agent13.sandbox import SandboxMode
-        mock_sandbox.return_value = SandboxMode.NONE
+        mock_sandbox.return_value = SandboxMode.OFF
         agent = self._make_agent()
         sd = gather_status(agent, "p", "m", time.time())
-        assert sd.sandbox_mode == "none"
+        assert sd.sandbox_mode == "off"
 
     @mock.patch("tools.security.get_current_sandbox_mode")
     def test_sandbox_mode_error(self, mock_sandbox):

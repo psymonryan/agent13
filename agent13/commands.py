@@ -70,13 +70,15 @@ def execute_delete(agent, args: str) -> CommandResult:
     target = args.strip()
     if not target:
         return CommandResult(
-            False, "Usage: /delete h N | /delete q N | /delete s NAME"
+            False, "Usage: /delete h N | /delete q N | /delete s NAME\n"
+                   "  N can be: number, 'last', negative index (-1), or range (1:3, -2:)"
         )
 
     parts = target.split()
     if len(parts) < 2:
         return CommandResult(
-            False, "Usage: /delete h N | /delete q N | /delete s NAME"
+            False, "Usage: /delete h N | /delete q N | /delete s NAME\n"
+                   "  N can be: number, 'last', negative index (-1), or range (1:3, -2:)"
         )
 
     kind = parts[0].lower()
@@ -90,59 +92,173 @@ def execute_delete(agent, args: str) -> CommandResult:
         return _delete_save(spec)
     else:
         return CommandResult(
-            False, "Usage: /delete h N | /delete q N | /delete s NAME"
+            False, "Usage: /delete h N | /delete q N | /delete s NAME\n"
+                   "  N can be: number, 'last', negative index (-1), or range (1:3, -2:)"
         )
 
 
-def _delete_history(agent, spec: str) -> CommandResult:
-    """Delete history groups by number or range."""
-    groups = agent.history.get_message_groups()
-    try:
-        if "-" in spec:
-            start, end = map(int, spec.split("-"))
-            if start < 1 or end > len(groups) or start > end:
-                return CommandResult(False, f"Invalid group range: {start}-{end}")
-            indices = []
-            for g in range(start, end + 1):
-                indices.extend(groups[g - 1])
-            for idx in sorted(indices, reverse=True):
-                del agent.messages[idx]
-            return CommandResult(
-                True,
-                f"Deleted groups {start}-{end} ({len(indices)} messages)",
-                {"kind": "history"},
-            )
+def _parse_index_spec(spec: str, total: int) -> tuple[list[int], str | None]:
+    """Parse an index specification with support for 'last', negative indices, and ranges.
+
+    Args:
+        spec: Index specification (e.g., "1", "last", "-1", "1:3", "-2:", "-3:-1")
+        total: Total number of items (for bounds checking and negative index conversion)
+
+    Returns:
+        Tuple of (list of 1-based indices, error message or None)
+
+    Supported formats:
+        - "N" - single positive index (1-based)
+        - "last" - alias for -1 (last item)
+        - "-N" - negative index (-1 = last, -2 = second-to-last)
+        - "N:M" - range from N to M (inclusive, 1-based)
+        - "N:" - range from N to end
+        - ":M" - range from start to M
+        - "-N:M" - range with negative start
+        - "N:-M" - range with negative end
+    """
+    # Handle 'last' keyword
+    if spec.lower() == "last":
+        if total == 0:
+            return [], "No items to delete"
+        return [total], None
+
+    # Handle range syntax with ':'
+    if ":" in spec:
+        parts = spec.split(":")
+        if len(parts) != 2:
+            return [], f"Invalid range format: {spec}"
+
+        start_str, end_str = parts
+
+        # Parse start
+        if start_str == "":
+            start = 1
+        elif start_str.lower() == "last":
+            start = total
         else:
-            group_num = int(spec)
-            if group_num < 1 or group_num > len(groups):
-                return CommandResult(False, f"Invalid group number: {group_num}")
-            indices = groups[group_num - 1]
-            for idx in sorted(indices, reverse=True):
-                del agent.messages[idx]
-            return CommandResult(
-                True,
-                f"Deleted group {group_num}",
-                {"kind": "history"},
-            )
+            try:
+                start = int(start_str)
+            except ValueError:
+                return [], f"Invalid start index: {start_str}"
+
+            # Convert negative to positive
+            if start < 0:
+                start = total + start + 1
+
+        # Parse end
+        if end_str == "":
+            end = total
+        elif end_str.lower() == "last":
+            end = total
+        else:
+            try:
+                end = int(end_str)
+            except ValueError:
+                return [], f"Invalid end index: {end_str}"
+
+            # Convert negative to positive
+            if end < 0:
+                end = total + end + 1
+
+        # Validate range
+        if start < 1 or start > total:
+            return [], f"Start index {start} out of range (1-{total})"
+        if end < 1 or end > total:
+            return [], f"End index {end} out of range (1-{total})"
+        if start > end:
+            return [], f"Invalid range: start ({start}) > end ({end})"
+
+        return list(range(start, end + 1)), None
+
+    # Handle single index
+    try:
+        idx = int(spec)
     except ValueError:
-        return CommandResult(False, "Invalid index format")
+        return [], f"Invalid index: {spec}"
+
+    # Convert negative to positive
+    if idx < 0:
+        idx = total + idx + 1
+
+    # Validate
+    if idx < 1 or idx > total:
+        return [], f"Index {idx} out of range (1-{total})"
+
+    return [idx], None
+
+
+def _delete_history(agent, spec: str) -> CommandResult:
+    """Delete history groups by number or range.
+
+    Supports: N, last, -N (negative), N:M (range), N: (to end), :M (from start)
+    """
+    groups = agent.history.get_message_groups()
+    total = len(groups)
+
+    indices, error = _parse_index_spec(spec, total)
+    if error:
+        return CommandResult(False, error)
+
+    # Collect all message indices to delete
+    all_indices = []
+    for g in indices:
+        all_indices.extend(groups[g - 1])
+
+    # Delete in reverse order to preserve indices
+    for idx in sorted(all_indices, reverse=True):
+        del agent.messages[idx]
+
+    # Build response message
+    if len(indices) == 1:
+        return CommandResult(
+            True,
+            f"Deleted group {indices[0]}",
+            {"kind": "history"},
+        )
+    else:
+        return CommandResult(
+            True,
+            f"Deleted groups {indices[0]}-{indices[-1]} ({len(all_indices)} messages)",
+            {"kind": "history"},
+        )
 
 
 def _delete_queue(agent, spec: str) -> CommandResult:
-    """Delete a queue item by index."""
-    try:
-        idx = int(spec)
+    """Delete queue item(s) by index.
+
+    Supports: N, last, -N (negative), N:M (range), N: (to end), :M (from start)
+    """
+    total = agent.queue.pending_count
+
+    indices, error = _parse_index_spec(spec, total)
+    if error:
+        return CommandResult(False, error)
+
+    # Delete items (in reverse order to preserve indices)
+    removed_items = []
+    for idx in sorted(indices, reverse=True):
         removed = agent.queue.remove_at(idx)
         if removed:
-            return CommandResult(
-                True,
-                f"Removed queue item: {removed.text[:50]}",
-                {"kind": "queue"},
-            )
+            removed_items.append(removed)
         else:
-            return CommandResult(False, f"Invalid queue index: {idx}")
-    except ValueError:
-        return CommandResult(False, "Invalid index format")
+            # This shouldn't happen if parsing is correct, but handle it
+            return CommandResult(False, f"Failed to remove queue item at index {idx}")
+
+    # Build response
+    if len(removed_items) == 1:
+        text_preview = removed_items[0].text[:50]
+        return CommandResult(
+            True,
+            f"Removed queue item: {text_preview}",
+            {"kind": "queue"},
+        )
+    else:
+        return CommandResult(
+            True,
+            f"Removed {len(removed_items)} queue items ({indices[0]}-{indices[-1]})",
+            {"kind": "queue"},
+        )
 
 
 def _delete_save(spec: str) -> CommandResult:

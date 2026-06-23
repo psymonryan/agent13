@@ -33,7 +33,7 @@ class TestSandboxMode:
         assert SandboxMode.PERMISSIVE_CLOSED.value == "permissive-closed"
         assert SandboxMode.RESTRICTIVE_OPEN.value == "restrictive-open"
         assert SandboxMode.RESTRICTIVE_CLOSED.value == "restrictive-closed"
-        assert SandboxMode.NONE.value == "none"
+        assert SandboxMode.OFF.value == "off"
 
     def test_mode_count(self):
         """Should have 5 modes."""
@@ -71,9 +71,9 @@ class TestSandboxCapabilities:
         assert caps.file_read == "project"
         assert caps.network is False
 
-    def test_none_capabilities(self):
-        """None mode should allow everything."""
-        caps = SANDBOX_CAPABILITIES[SandboxMode.NONE]
+    def test_off_capabilities(self):
+        """Off mode should allow everything."""
+        caps = SANDBOX_CAPABILITIES[SandboxMode.OFF]
         assert caps.file_write == "anywhere"
         assert caps.file_read == "anywhere"
         assert caps.network is True
@@ -89,10 +89,10 @@ class TestSandboxProfiles:
         assert profiles_dir.is_dir()
 
     def test_all_profile_files_exist(self):
-        """All profile files should exist (except 'none')."""
+        """All profile files should exist (except 'off')."""
         for mode in SandboxMode:
-            if mode == SandboxMode.NONE:
-                continue  # 'none' mode doesn't need a profile file
+            if mode == SandboxMode.OFF:
+                continue  # 'off' mode doesn't need a profile file
             profile_path = get_sandbox_profile_path(mode)
             assert profile_path.exists(), f"Profile file missing: {profile_path}"
 
@@ -105,7 +105,7 @@ class TestSandboxProfiles:
     def test_load_nonexistent_profile(self):
         """Should raise FileNotFoundError for missing profile."""
         with pytest.raises(FileNotFoundError):
-            load_sandbox_profile(SandboxMode.NONE)  # 'none' has no profile file
+            load_sandbox_profile(SandboxMode.OFF)  # 'off' has no profile file
 
 
 class TestParseSandboxMode:
@@ -119,7 +119,7 @@ class TestParseSandboxMode:
         assert (
             parse_sandbox_mode("restrictive-closed") == SandboxMode.RESTRICTIVE_CLOSED
         )
-        assert parse_sandbox_mode("none") == SandboxMode.NONE
+        assert parse_sandbox_mode("off") == SandboxMode.OFF
 
     def test_parse_case_insensitive(self):
         """Should be case-insensitive."""
@@ -127,9 +127,9 @@ class TestParseSandboxMode:
         assert parse_sandbox_mode("Permissive-Closed") == SandboxMode.PERMISSIVE_CLOSED
 
     def test_parse_aliases(self):
-        """Should accept aliases for 'none' mode."""
-        assert parse_sandbox_mode("disabled") == SandboxMode.NONE
-        assert parse_sandbox_mode("off") == SandboxMode.NONE
+        """Should accept aliases for 'off' mode."""
+        assert parse_sandbox_mode("disabled") == SandboxMode.OFF
+        assert parse_sandbox_mode("off") == SandboxMode.OFF
 
     def test_parse_invalid_mode(self):
         """Should raise ValueError for invalid mode."""
@@ -189,9 +189,9 @@ class TestEffectiveSandboxMode:
 class TestBuildSandboxCommand:
     """Tests for build_sandbox_command function."""
 
-    def test_none_mode_returns_shell_command(self):
-        """'none' mode should return simple shell command."""
-        cmd = build_sandbox_command("echo hello", SandboxMode.NONE)
+    def test_off_mode_returns_shell_command(self):
+        """'off' mode should return simple shell command."""
+        cmd = build_sandbox_command("echo hello", SandboxMode.OFF)
         if sys.platform == "win32":
             assert cmd == ["cmd.exe", "/c", "echo hello"]
         else:
@@ -233,21 +233,21 @@ class TestRunSandboxed:
 
     def test_successful_command(self):
         """Should run command successfully."""
-        result = run_sandboxed("echo hello", SandboxMode.NONE)
+        result = run_sandboxed("echo hello", SandboxMode.OFF)
         assert result["success"] is True
         assert result["exit_code"] == 0
         assert "hello" in result["stdout"]
 
     def test_failed_command(self):
         """Should capture exit code for failed command."""
-        result = run_sandboxed("exit 1", SandboxMode.NONE)
+        result = run_sandboxed("exit 1", SandboxMode.OFF)
         assert result["success"] is False
         assert result["exit_code"] == 1
 
     @pytest.mark.skipif(sys.platform == "win32", reason="POSIX shell command (sleep)")
     def test_timeout(self):
         """Should timeout long-running commands."""
-        result = run_sandboxed("sleep 10", SandboxMode.NONE, timeout=0.5)
+        result = run_sandboxed("sleep 10", SandboxMode.OFF, timeout=0.5)
         assert result["success"] is False
         assert result["timed_out"] is True
         assert "timed out" in result["stderr"].lower()
@@ -257,21 +257,21 @@ class TestRunSandboxed:
         """Should truncate large output."""
         # Generate output larger than max_output
         result = run_sandboxed(
-            "python3 -c 'print(\"x\" * 200000)'", SandboxMode.NONE, max_output=1000
+            "python3 -c 'print(\"x\" * 200000)'", SandboxMode.OFF, max_output=1000
         )
         assert result["truncated"] is True
         assert len(result["stdout"]) < 200000
 
     def test_command_not_found(self):
         """Should handle command not found."""
-        result = run_sandboxed("nonexistent_command_xyz", SandboxMode.NONE)
+        result = run_sandboxed("nonexistent_command_xyz", SandboxMode.OFF)
         assert result["success"] is False
         assert "not found" in result["stderr"].lower() or result["exit_code"] != 0
 
     def test_sandbox_mode_in_result(self):
         """Should include sandbox mode in result."""
-        result = run_sandboxed("echo test", SandboxMode.NONE)
-        assert result["sandbox_mode"] == "none"
+        result = run_sandboxed("echo test", SandboxMode.OFF)
+        assert result["sandbox_mode"] == "off"
 
 
 class TestFormatFunctions:
@@ -292,7 +292,7 @@ class TestFormatFunctions:
         assert "permissive-closed" in text
         assert "restrictive-open" in text
         assert "restrictive-closed" in text
-        assert "none" in text
+        assert "off" in text
 
 
 class TestBashTool:
@@ -333,7 +333,7 @@ class TestBashTool:
             "permissive-closed",
             "restrictive-open",
             "restrictive-closed",
-            "none",
+            "off",
         ]
 
 
@@ -351,8 +351,8 @@ class TestBashToolUseCases:
         from tools.command import set_session_sandbox_mode
         from agent13.sandbox import SandboxMode
 
-        # Set sandbox to none for this test (git needs to read .git)
-        set_session_sandbox_mode(SandboxMode.NONE)
+        # Set sandbox to off for this test (git needs to read .git)
+        set_session_sandbox_mode(SandboxMode.OFF)
 
         # Run git status in project directory
         result = await execute_tool(
@@ -378,8 +378,8 @@ class TestBashToolUseCases:
         from tools.command import set_session_sandbox_mode
         from agent13.sandbox import SandboxMode
 
-        # Set sandbox to none for this test
-        set_session_sandbox_mode(SandboxMode.NONE)
+        # Set sandbox to off for this test
+        set_session_sandbox_mode(SandboxMode.OFF)
 
         result = await execute_tool(
             "command",
@@ -409,8 +409,8 @@ class TestBashToolUseCases:
         if not shutil.which("uv"):
             pytest.skip("uv not installed")
 
-        # Set sandbox to none for this test
-        set_session_sandbox_mode(SandboxMode.NONE)
+        # Set sandbox to off for this test
+        set_session_sandbox_mode(SandboxMode.OFF)
 
         result = await execute_tool(
             "command",
@@ -440,8 +440,8 @@ class TestBashToolUseCases:
         if not shutil.which("npm"):
             pytest.skip("npm not installed")
 
-        # Set sandbox to none for this test
-        set_session_sandbox_mode(SandboxMode.NONE)
+        # Set sandbox to off for this test
+        set_session_sandbox_mode(SandboxMode.OFF)
 
         result = await execute_tool(
             "command",
@@ -474,8 +474,8 @@ class TestBashToolUseCases:
         if not shutil.which("pytest") and not shutil.which("uv"):
             pytest.skip("pytest not available")
 
-        # Set sandbox to none for this test
-        set_session_sandbox_mode(SandboxMode.NONE)
+        # Set sandbox to off for this test
+        set_session_sandbox_mode(SandboxMode.OFF)
 
         # Use 'python -m pytest' instead of bare 'pytest' to avoid
         # process-exec denial when running inside an outer sandbox
@@ -507,8 +507,8 @@ class TestBashToolUseCases:
         from tools.command import set_session_sandbox_mode
         from agent13.sandbox import SandboxMode
 
-        # Set sandbox to none for this test
-        set_session_sandbox_mode(SandboxMode.NONE)
+        # Set sandbox to off for this test
+        set_session_sandbox_mode(SandboxMode.OFF)
 
         result = await execute_tool(
             "command",
@@ -535,8 +535,8 @@ class TestBashToolUseCases:
         from tools.command import set_session_sandbox_mode
         from agent13.sandbox import SandboxMode
 
-        # Set sandbox to none for this test
-        set_session_sandbox_mode(SandboxMode.NONE)
+        # Set sandbox to off for this test
+        set_session_sandbox_mode(SandboxMode.OFF)
 
         result = await execute_tool(
             "command",
@@ -561,8 +561,8 @@ class TestBashToolUseCases:
         from tools.command import set_session_sandbox_mode
         from agent13.sandbox import SandboxMode
 
-        # Set sandbox to none for this test
-        set_session_sandbox_mode(SandboxMode.NONE)
+        # Set sandbox to off for this test
+        set_session_sandbox_mode(SandboxMode.OFF)
 
         # Generate large output (200KB of 'x' characters)
         result = await execute_tool(
@@ -654,8 +654,8 @@ class TestBashToolUseCases:
         from agent13.sandbox import SandboxMode
         import tempfile
 
-        # Set sandbox to none for this test
-        set_session_sandbox_mode(SandboxMode.NONE)
+        # Set sandbox to off for this test
+        set_session_sandbox_mode(SandboxMode.OFF)
 
         # Create a temp directory to simulate a build
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -684,8 +684,8 @@ class TestBashToolUseCases:
         from tools.command import set_session_sandbox_mode
         from agent13.sandbox import SandboxMode
 
-        # Set sandbox to none for this test
-        set_session_sandbox_mode(SandboxMode.NONE)
+        # Set sandbox to off for this test
+        set_session_sandbox_mode(SandboxMode.OFF)
 
         # Command that sleeps longer than timeout
         result = await execute_tool(
@@ -709,7 +709,7 @@ class TestBashToolUseCases:
 
         result = await run_sandboxed_async(
             "sleep 10",
-            SandboxMode.NONE,
+            SandboxMode.OFF,
             timeout=0.5,
         )
         assert result["timed_out"] is True
@@ -727,8 +727,8 @@ class TestBashToolUseCases:
         from tools.command import set_session_sandbox_mode
         from agent13.sandbox import SandboxMode
 
-        # Set sandbox to none for this test
-        set_session_sandbox_mode(SandboxMode.NONE)
+        # Set sandbox to off for this test
+        set_session_sandbox_mode(SandboxMode.OFF)
 
         result = await execute_tool(
             "command", {"command": "sleep 0.2 && echo 'completed'", "timeout": 5}
@@ -749,8 +749,8 @@ class TestBashToolUseCases:
         from tools.command import set_session_sandbox_mode
         from agent13.sandbox import SandboxMode
 
-        # Set sandbox to none for this test
-        set_session_sandbox_mode(SandboxMode.NONE)
+        # Set sandbox to off for this test
+        set_session_sandbox_mode(SandboxMode.OFF)
 
         # First command fails, second succeeds
         result = await execute_tool(
@@ -779,8 +779,8 @@ class TestBashToolUseCases:
         from tools.command import set_session_sandbox_mode
         from agent13.sandbox import SandboxMode
 
-        # Set sandbox to none for this test
-        set_session_sandbox_mode(SandboxMode.NONE)
+        # Set sandbox to off for this test
+        set_session_sandbox_mode(SandboxMode.OFF)
 
         result = await execute_tool(
             "command",
@@ -837,8 +837,8 @@ class TestBashToolUseCases:
         from tools.command import set_session_sandbox_mode
         from agent13.sandbox import SandboxMode
 
-        # Set sandbox to none for this test
-        set_session_sandbox_mode(SandboxMode.NONE)
+        # Set sandbox to off for this test
+        set_session_sandbox_mode(SandboxMode.OFF)
 
         # Command that exits with specific code
         result = await execute_tool("command", {"command": "exit 42"})
@@ -857,8 +857,8 @@ class TestBashToolUseCases:
         from tools.command import set_session_sandbox_mode
         from agent13.sandbox import SandboxMode
 
-        # Set sandbox to none for this test
-        set_session_sandbox_mode(SandboxMode.NONE)
+        # Set sandbox to off for this test
+        set_session_sandbox_mode(SandboxMode.OFF)
 
         result = await execute_tool(
             "command", {"command": "echo 'to stdout' && echo 'to stderr' >&2"}

@@ -469,13 +469,13 @@ async def on_token(event: AgentEventData):
 
 ### REPL (`agent13/repl.py`)
 
-Readline-based interactive mode for environments where the TUI isn't suitable — SSH sessions, screen readers, minimal terminals. Activated with `--repl`; optionally paired with `--output FILE` to stream the conversation to a file for monitoring (`tail -f`).
+Readline-based interactive mode for environments where the TUI isn't suitable - SSH sessions, screen readers, minimal terminals. Activated with `--repl`; optionally paired with `--output FILE` to stream the conversation to a file for monitoring (`tail -f`).
 
 The REPL reuses the same Agent core and event system as the TUI. It subscribes to agent events and prints tokens to stdout (or the output file). It supports `@filename` expansion for inline file injection and `--read FILE` for pre-loading files into the user message.
 
 Key differences from TUI:
 
-- No Textual dependency — pure Python `readline` + stdout
+- No Textual dependency - pure Python `readline` + stdout
 - `@filename.txt` expansion in user input (resolves to file contents)
 - `/cwd` command (REPL-only) for showing/changing working directory
 - Output file mode for screen reader accessibility
@@ -599,11 +599,11 @@ The TUI overrides `App.copy_to_clipboard` to route all clipboard operations (mou
 
 Checks GitHub releases for new versions and performs in-place upgrades:
 
-- **Startup check** — throttled by `~/.agent13/last_update_check.json`, respects `[updates]` config
-- **`/upgrade`** — TUI command to check and apply
-- **`--upgrade`** — CLI flag for non-interactive upgrade
-- **`/upgrade --copy`** — copies the manual install command to clipboard instead of running it
-- **Install method** — downloads `.whl` from GitHub release assets, runs `uv tool install --force <wheel>`
+- **Startup check** - throttled by `~/.agent13/last_update_check.json`, respects `[updates]` config
+- **`/upgrade`** - TUI command to check and apply
+- **`--upgrade`** - CLI flag for non-interactive upgrade
+- **`/upgrade --copy`** - copies the manual install command to clipboard instead of running it
+- **Install method** - downloads `.whl` from GitHub release assets, runs `uv tool install --force <wheel>`
 
 ***
 

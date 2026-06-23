@@ -9,9 +9,9 @@ Design follows the same pattern as models.py's resolve_from_list():
 shared data logic, thin UI wrappers.
 """
 
-import os
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Optional
 
 
@@ -193,7 +193,7 @@ def gather_status(
         # Session
         agent_status=agent_status,
         run_time=run_time,
-        cwd=os.getcwd(),
+        cwd=str(Path.cwd()),
         turn_count=turn_count,
         total_processing=total_processing,
         # Provider

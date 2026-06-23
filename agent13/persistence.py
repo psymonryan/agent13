@@ -108,20 +108,60 @@ def get_auto_save_path(project_name: str | None = None) -> Path:
     """Get the auto-save path for the current session.
 
     Respects config: [saves] location = "central" (default) or "local".
-    Always uses dashed date format: <project>-YYYY-MM-DD.ctx
+    - central: <project>-YYYY-MM-DD.ctx (project prefix needed to distinguish projects)
+    - local: YYYY-MM-DD.ctx (no prefix, directory is already project-specific)
 
     Args:
         project_name: Optional project name. If not provided, uses cwd name.
 
     Returns:
         Path like ~/.agent13/saves/myproject-2026-04-01.ctx (central)
-        or ./.agent13/saves/myproject-2026-04-01.ctx (local)
+        or ./.agent13/saves/2026-04-01.ctx (local)
     """
+    from agent13.config import get_config
+
     if project_name is None:
         project_name = Path.cwd().name
 
+    cfg = get_config()
     date_str = datetime.now().strftime("%Y-%m-%d")
-    return get_auto_save_dir() / f"{project_name}-{date_str}.ctx"
+
+    if cfg.saves_location == "local":
+        # Local mode: no project prefix needed (directory is project-specific)
+        return get_auto_save_dir() / f"{date_str}.ctx"
+    else:
+        # Central mode: include project prefix to distinguish projects
+        return get_auto_save_dir() / f"{project_name}-{date_str}.ctx"
+
+
+def _is_central_dir(path: Path) -> bool:
+    """Check if a path is the central saves directory.
+
+    Args:
+        path: Path to check.
+
+    Returns:
+        True if this is the central (~/.agent13/saves/) directory.
+    """
+    return path == _get_global_saves_dir()
+
+
+def _get_auto_save_pattern(project_name: str, is_central: bool) -> str:
+    """Get the glob pattern for auto-saves in a given directory type.
+
+    Args:
+        project_name: Project name for central mode patterns.
+        is_central: True if searching in central directory.
+
+    Returns:
+        Glob pattern string.
+    """
+    if is_central:
+        # Central: files have project prefix (project-YYYY-MM-DD.ctx)
+        return f"{project_name}-*.ctx"
+    else:
+        # Local: files are date-only (YYYY-MM-DD.ctx)
+        return "*.ctx"
 
 
 def find_latest_auto_save(project_name: str | None = None) -> Path | None:
@@ -140,22 +180,26 @@ def find_latest_auto_save(project_name: str | None = None) -> Path | None:
         Path to the most recent .ctx file, or None if none exist in
         either location.
     """
+    from agent13.config import get_config
+
     if project_name is None:
         project_name = Path.cwd().name
 
-    pattern = f"{project_name}-*.ctx"
-
-    # Try the configured location first
+    cfg = get_config()
     auto_dir = get_auto_save_dir()
+
+    # Use appropriate pattern for the primary directory
+    is_auto_dir_central = _is_central_dir(auto_dir)
+    pattern = _get_auto_save_pattern(project_name, is_auto_dir_central)
+
     matches = list(auto_dir.glob(pattern))
+    # Filter to ensure we only get actual auto-saves
+    matches = [m for m in matches if _is_auto_save_name_for_dir(m.stem, is_auto_dir_central, project_name)]
     if matches:
         matches.sort(key=lambda p: p.stat().st_mtime, reverse=True)
         return matches[0]
 
     # Fallback: try the other location
-    from agent13.config import get_config
-
-    cfg = get_config()
     if cfg.saves_location == "central":
         # Configured for central; try local (project dir)
         fallback_dir = get_saves_dir()
@@ -163,7 +207,13 @@ def find_latest_auto_save(project_name: str | None = None) -> Path | None:
         # Configured for local; try central (~/.agent13/saves/)
         fallback_dir = _get_global_saves_dir()
 
-    fallback_matches = list(fallback_dir.glob(pattern))
+    # Use appropriate pattern for the fallback directory
+    is_fallback_central = _is_central_dir(fallback_dir)
+    fallback_pattern = _get_auto_save_pattern(project_name, is_fallback_central)
+
+    fallback_matches = list(fallback_dir.glob(fallback_pattern))
+    # Filter to ensure we only get actual auto-saves
+    fallback_matches = [m for m in fallback_matches if _is_auto_save_name_for_dir(m.stem, is_fallback_central, project_name)]
     if fallback_matches:
         fallback_matches.sort(key=lambda p: p.stat().st_mtime, reverse=True)
         return fallback_matches[0]
@@ -307,13 +357,21 @@ def list_saves() -> list[Path]:
 
 
 def _is_auto_save_name(stem: str) -> bool:
-    """Check if a filename stem looks like an auto-save (project-YYYY-MM-DD).
+    """Check if a filename stem looks like an auto-save.
 
-    Auto-saves end with a YYYY-MM-DD date suffix after the last '-'.
+    Supports both formats:
+    - Central: project-YYYY-MM-DD (e.g., "myproject-2026-05-25")
+    - Local: YYYY-MM-DD (e.g., "2026-05-25")
+
     e.g. "myproject-2026-05-25" → True
+         "2026-05-25" → True
          "mycontext" → False
     """
-    # Split from the right to get the last three segments
+    # First check for date-only format (local mode)
+    if _AUTO_SAVE_RE.match(stem):
+        return True
+
+    # Then check for project-date format (central mode)
     # stem="myproject-2026-05-25" → parts=["myproject", "2026", "05", "25"]
     parts = stem.split("-")
     if len(parts) < 4:
@@ -324,28 +382,57 @@ def _is_auto_save_name(stem: str) -> bool:
     return bool(_AUTO_SAVE_RE.match(date_candidate))
 
 
+def _is_auto_save_name_for_dir(stem: str, is_central: bool, project_name: str) -> bool:
+    """Check if a filename stem is an auto-save for a specific directory type.
+
+    Args:
+        stem: Filename stem (without .ctx extension).
+        is_central: True if checking a file from the central directory.
+        project_name: Project name for central mode validation.
+
+    Returns:
+        True if this is a valid auto-save name for the given directory type.
+    """
+    if is_central:
+        # Central mode: must have project prefix
+        if not stem.startswith(f"{project_name}-"):
+            return False
+        # Check the date part
+        date_part = stem[len(project_name) + 1:]  # Skip "project-"
+        return bool(_AUTO_SAVE_RE.match(date_part))
+    else:
+        # Local mode: must be date-only
+        return bool(_AUTO_SAVE_RE.match(stem))
+
+
 def list_all_saves() -> list[Path]:
     """List all save files (manual + auto) sorted by mtime, newest first.
 
-    Manual saves appear first, auto-saves (YYYY-MM-DD suffix) last.
+    Manual saves appear first, auto-saves (date-based names) last.
     Used for /load tab completion.
 
     Returns:
         List of paths sorted: manual (mtime desc), then auto-saves (mtime desc).
     """
+    from agent13.config import get_config
+
     manual = list_saves()
     auto_dir = get_auto_save_dir()
     saves_dir = get_saves_dir()
+    cfg = get_config()
+    project_name = Path.cwd().name
 
     auto_saves: list[Path] = []
     if auto_dir == saves_dir:
-        # Local mode: auto-saves are in same dir, filter by name pattern
+        # Local mode: auto-saves are in same dir, filter by date-only pattern
         for f in saves_dir.glob("*.ctx"):
-            if _is_auto_save_name(f.stem):
+            if _is_auto_save_name_for_dir(f.stem, is_central=False, project_name=project_name):
                 auto_saves.append(f)
     else:
-        # Central mode: list all from global dir
-        auto_saves = list(auto_dir.glob("*.ctx"))
+        # Central mode: filter by project-date pattern
+        for f in auto_dir.glob("*.ctx"):
+            if _is_auto_save_name_for_dir(f.stem, is_central=True, project_name=project_name):
+                auto_saves.append(f)
 
     # Deduplicate (if local mode and same file somehow)
     manual_set = set(manual)

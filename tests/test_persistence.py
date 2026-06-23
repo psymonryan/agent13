@@ -149,14 +149,15 @@ class TestGetAutoSavePath:
         assert result.name == f"cool_project-{today}.ctx"
 
     def test_local_mode_uses_project_dir(self, monkeypatch, tmp_path):
-        """Local mode puts auto-save in ./.agent13/saves/."""
+        """Local mode puts auto-save in ./.agent13/saves/ without project prefix."""
         monkeypatch.chdir(tmp_path)
         monkeypatch.setattr(
             "agent13.config.get_config", lambda: _make_config("local")
         )
         today = datetime.now().strftime("%Y-%m-%d")
         result = get_auto_save_path("myproject")
-        assert result == tmp_path / ".agent13" / "saves" / f"myproject-{today}.ctx"
+        # Local mode: no project prefix (directory is project-specific)
+        assert result == tmp_path / ".agent13" / "saves" / f"{today}.ctx"
 
     def test_dashed_date_format(self, monkeypatch, tmp_path):
         """Date format is YYYY-MM-DD (dashed), not YYYYMMDD."""
@@ -204,8 +205,8 @@ class TestIsAutoSaveName:
         assert _is_auto_save_name("proj-26-05-25") is False
 
     def test_bare_date_no_project(self):
-        """bare '2026-05-25' splits into 3 parts (< 4), so returns False."""
-        assert _is_auto_save_name("2026-05-25") is False
+        """bare '2026-05-25' is valid for local mode auto-saves."""
+        assert _is_auto_save_name("2026-05-25") is True
 
     def test_empty_string(self):
         assert _is_auto_save_name("") is False
@@ -264,25 +265,17 @@ class TestFindLatestAutoSave:
         assert result.name == "proj-2026-05-10.ctx"
 
     def test_local_mode_searches_local_dir(self, monkeypatch, tmp_path):
+        """Local mode: auto-saves use date-only naming."""
         monkeypatch.chdir(tmp_path)
         monkeypatch.setattr(
             "agent13.config.get_config", lambda: _make_config("local")
         )
         local_dir = tmp_path / ".agent13" / "saves"
-        _touch(local_dir / "proj-2026-05-25.ctx", mtime=9000)
+        # Local mode: date-only filename (no project prefix)
+        _touch(local_dir / "2026-05-25.ctx", mtime=9000)
         result = find_latest_auto_save("proj")
         assert result is not None
-        assert result.name == "proj-2026-05-25.ctx"
-    def test_local_mode_searches_local_dir(self, monkeypatch, tmp_path):
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setattr(
-            "agent13.config.get_config", lambda: _make_config("local")
-        )
-        local_dir = tmp_path / ".agent13" / "saves"
-        _touch(local_dir / "proj-2026-05-25.ctx", mtime=9000)
-        result = find_latest_auto_save("proj")
-        assert result is not None
-        assert result.name == "proj-2026-05-25.ctx"
+        assert result.name == "2026-05-25.ctx"
 
     def test_fallback_from_central_to_local(self, monkeypatch, tmp_path):
         """Configured for central but save is in local dir — should find it."""
@@ -296,13 +289,13 @@ class TestFindLatestAutoSave:
         monkeypatch.setattr(
             "agent13.persistence._get_global_saves_dir", lambda: global_dir
         )
-        # Local dir has the save
+        # Local dir has the save (date-only format for local mode)
         local_dir = tmp_path / ".agent13" / "saves"
-        _touch(local_dir / "proj-2026-05-25.ctx", mtime=9000)
+        _touch(local_dir / "2026-05-25.ctx", mtime=9000)
 
         result = find_latest_auto_save("proj")
         assert result is not None
-        assert result.name == "proj-2026-05-25.ctx"
+        assert result.name == "2026-05-25.ctx"
 
     def test_fallback_from_local_to_central(self, monkeypatch, tmp_path):
         """Configured for local but save is in central dir — should find it."""
@@ -393,7 +386,10 @@ class TestListSaves:
 class TestListAllSaves:
     def test_manual_then_auto_central(self, monkeypatch, tmp_path):
         """Central mode: manual saves first, then auto-saves from global dir."""
-        monkeypatch.chdir(tmp_path)
+        # Create a fake project directory so Path.cwd().name returns "proj"
+        proj_dir = tmp_path / "proj"
+        proj_dir.mkdir()
+        monkeypatch.chdir(proj_dir)
         monkeypatch.setattr(
             "agent13.config.get_config", lambda: _make_config("central")
         )
@@ -447,7 +443,10 @@ class TestListAllSaves:
 
     def test_only_auto_saves(self, monkeypatch, tmp_path):
         """No manual saves, only auto-saves."""
-        monkeypatch.chdir(tmp_path)
+        # Create a fake project directory so Path.cwd().name returns "proj"
+        proj_dir = tmp_path / "proj"
+        proj_dir.mkdir()
+        monkeypatch.chdir(proj_dir)
         monkeypatch.setattr(
             "agent13.config.get_config", lambda: _make_config("central")
         )

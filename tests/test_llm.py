@@ -18,11 +18,16 @@ from agent13 import (
 from agent13.llm import categorize_error, TimeoutError_
 
 
+# Mock working directory for tests
+MOCK_CWD = "/test/working/directory"
+
+
 class TestBuildMessagesWithSystem:
     """Tests for build_messages_with_system function."""
 
     @patch("agent13.llm._AGENTS_MD_CACHE", None)
-    def test_empty_messages(self):
+    @patch("agent13.llm.Path.cwd", return_value=MOCK_CWD)
+    def test_empty_messages(self, mock_getcwd):
         """Should return only system message for empty list."""
         # Cache is None, so AGENTS.md content won't be included
 
@@ -31,12 +36,13 @@ class TestBuildMessagesWithSystem:
 
         assert len(result) == 1
         assert result[0]["role"] == "system"
-        # System prompt now includes date prefix
+        # System prompt now includes date and working directory
         expected_date = datetime.date.today().isoformat()
-        assert result[0]["content"] == f"Today is {expected_date}\n\nYou are helpful."
+        assert result[0]["content"] == f"Today is {expected_date}\nWorking directory: {MOCK_CWD}\n\nYou are helpful."
 
     @patch("agent13.llm._AGENTS_MD_CACHE", None)
-    def test_with_messages(self):
+    @patch("agent13.llm.Path.cwd", return_value=MOCK_CWD)
+    def test_with_messages(self, mock_getcwd):
         """Should prepend system message to existing messages."""
         # Cache is None, so AGENTS.md content won't be included
 
@@ -48,23 +54,24 @@ class TestBuildMessagesWithSystem:
 
         assert len(result) == 3
         assert result[0]["role"] == "system"
-        # System prompt now includes date prefix
+        # System prompt now includes date and working directory
         expected_date = datetime.date.today().isoformat()
-        assert result[0]["content"] == f"Today is {expected_date}\n\nYou are helpful."
+        assert result[0]["content"] == f"Today is {expected_date}\nWorking directory: {MOCK_CWD}\n\nYou are helpful."
         assert result[1] == {"role": "user", "content": "Hello"}
         assert result[2] == {"role": "assistant", "content": "Hi there!"}
 
     @patch("agent13.llm._AGENTS_MD_CACHE", None)
-    def test_default_system_prompt(self):
+    @patch("agent13.llm.Path.cwd", return_value=MOCK_CWD)
+    def test_default_system_prompt(self, mock_getcwd):
         """Should use default system prompt if none provided."""
         # Cache is None, so AGENTS.md content won't be included
 
         messages = [{"role": "user", "content": "Hello"}]
         result = build_messages_with_system(messages)
 
-        # System prompt now includes date prefix
+        # System prompt now includes date and working directory
         expected_date = datetime.date.today().isoformat()
-        assert result[0]["content"].startswith(f"Today is {expected_date}\n\n")
+        assert result[0]["content"].startswith(f"Today is {expected_date}\nWorking directory: {MOCK_CWD}\n\n")
         assert "tool using AI assistant" in result[0]["content"]
 
     @patch("agent13.llm._AGENTS_MD_CACHE", None)
@@ -79,7 +86,8 @@ class TestBuildMessagesWithSystem:
         assert len(result) == 2  # Result has system + user
 
     @patch("agent13.llm._AGENTS_MD_CACHE", "# Test Guidance\n\nSome test content.")
-    def test_includes_agents_md_when_present(self):
+    @patch("agent13.llm.Path.cwd", return_value=MOCK_CWD)
+    def test_includes_agents_md_when_present(self, mock_getcwd):
         """Should include AGENTS.md content when file exists."""
         # Cache is set with test content
 
@@ -89,11 +97,12 @@ class TestBuildMessagesWithSystem:
         assert len(result) == 1
         assert result[0]["role"] == "system"
         expected_date = datetime.date.today().isoformat()
-        expected = f"Today is {expected_date}\n\nYou are helpful.\n\nGuidance for this project:\n# Test Guidance\n\nSome test content."
+        expected = f"Today is {expected_date}\nWorking directory: {MOCK_CWD}\n\nYou are helpful.\n\nGuidance for this project:\n# Test Guidance\n\nSome test content."
         assert result[0]["content"] == expected
 
     @patch("agent13.llm._AGENTS_MD_CACHE", None)
-    def test_agents_md_read_error_silently_ignored(self):
+    @patch("agent13.llm.Path.cwd", return_value=MOCK_CWD)
+    def test_agents_md_read_error_silently_ignored(self, mock_getcwd):
         """Should work when cache is None (file not found or read error)."""
         # Cache is None, simulating file not existing or read error
 
@@ -103,7 +112,7 @@ class TestBuildMessagesWithSystem:
         # Should still work, just without AGENTS.md content
         assert len(result) == 1
         expected_date = datetime.date.today().isoformat()
-        assert result[0]["content"] == f"Today is {expected_date}\n\nYou are helpful."
+        assert result[0]["content"] == f"Today is {expected_date}\nWorking directory: {MOCK_CWD}\n\nYou are helpful."
 
 
 class TestHandleToolCalls:

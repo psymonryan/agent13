@@ -15,6 +15,7 @@ Usage:
 import asyncio
 import os
 import sys
+from pathlib import Path
 import time
 from typing import Optional
 
@@ -1150,7 +1151,7 @@ async def run_repl(
                             except OSError as e:
                                 print(f"  Cannot change directory: {e}")
                     else:
-                        print(f"  {os.getcwd()}")
+                        print(f"  {Path.cwd()}")
 
                 elif cmd == "/upgrade":
                     try:

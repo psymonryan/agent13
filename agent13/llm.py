@@ -312,9 +312,10 @@ def build_messages_with_system(
     if system_prompt is None:
         system_prompt = DEFAULT_PROMPT
 
-    # Inject current date at the start of the system prompt
+    # Inject current date and working directory at the start of the system prompt
     current_date = datetime.date.today().isoformat()
-    system_prompt = f"Today is {current_date}\n\n{system_prompt}"
+    cwd = str(Path.cwd())
+    system_prompt = f"Today is {current_date}\nWorking directory: {cwd}\n\n{system_prompt}"
 
     # Append cached AGENTS.md content if available
     if _AGENTS_MD_CACHE:

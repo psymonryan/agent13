@@ -8,6 +8,7 @@ agent instance. Persistence is handled via atomic append to the dated file.
 import os
 import re
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Optional
 from agent13.config_paths import get_history_path as _get_history_path
 
@@ -84,7 +85,7 @@ class History:
             # If explicit file path provided, derive project name from it
             self.project_name = os.path.splitext(os.path.basename(file_path))[0]
         elif project_name is None:
-            cwd = os.getcwd()
+            cwd = str(Path.cwd())
             if cwd:
                 self.project_name = os.path.basename(cwd)
             else:

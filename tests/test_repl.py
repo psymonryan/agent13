@@ -780,12 +780,12 @@ class TestDeleteCommand:
         assert "Deleted" in output
 
     async def test_delete_history_range(self):
-        """/delete h 1-2 — deletes a range of groups."""
+        """/delete h 1:2 - deletes a range of groups."""
         output, agent = await run_scenario(
-            ["first", "", "/delete h 1-1", "/quit"]
+            ["first", "", "second", "", "/delete h 1:2", "/quit"]
         )
 
-        assert "Deleted" in output
+        assert "Deleted groups 1-2" in output
 
     async def test_delete_queue_item(self):
         """/delete q N — removes queue item."""
@@ -795,6 +795,81 @@ class TestDeleteCommand:
         )
 
         assert "Invalid" in output or "empty" in output.lower()
+
+    async def test_delete_history_last(self):
+        """/delete h last — deletes the last group."""
+        output, agent = await run_scenario(
+            ["first", "", "second", "", "/delete h last", "/quit"]
+        )
+
+        assert "Deleted group 2" in output
+
+    async def test_delete_history_negative(self):
+        """/delete h -1 — deletes using negative index."""
+        output, agent = await run_scenario(
+            ["first", "", "second", "", "/delete h -1", "/quit"]
+        )
+
+        assert "Deleted group 2" in output
+
+    async def test_delete_history_range_negative(self):
+        """/delete h -2:-1 — deletes range with negative indices."""
+        output, agent = await run_scenario(
+            ["one", "", "two", "", "three", "", "/delete h -2:-1", "/quit"]
+        )
+
+        assert "Deleted groups 2-3" in output
+
+    async def test_delete_queue_last(self):
+        """/delete q last — deletes last queue item."""
+        # Queue is empty, should error gracefully
+        output, agent = await run_scenario(
+            ["/delete q last", "/quit"]
+        )
+
+        assert "No items" in output or "Invalid" in output
+
+    async def test_delete_queue_with_items(self):
+        """/delete q N - removes actual queue item."""
+        from agent13.commands import execute_delete
+
+        agent = MockAgent()
+        agent.queue.add("first queued prompt")
+        agent.queue.add("second queued prompt")
+        agent.queue.add("third queued prompt")
+
+        result = execute_delete(agent, "q 2")
+        assert result.success
+        assert "Removed queue item" in result.message
+        assert "second queued" in result.message
+        assert agent.queue.pending_count == 2
+
+    async def test_delete_queue_last_with_items(self):
+        """/delete q last - removes last queue item."""
+        from agent13.commands import execute_delete
+
+        agent = MockAgent()
+        agent.queue.add("alpha")
+        agent.queue.add("beta")
+
+        result = execute_delete(agent, "q last")
+        assert result.success
+        assert "beta" in result.message
+        assert agent.queue.pending_count == 1
+
+    async def test_delete_queue_range_with_items(self):
+        """/delete q 1:2 - removes range of queue items."""
+        from agent13.commands import execute_delete
+
+        agent = MockAgent()
+        agent.queue.add("one")
+        agent.queue.add("two")
+        agent.queue.add("three")
+
+        result = execute_delete(agent, "q 1:2")
+        assert result.success
+        assert "Removed 2 queue items" in result.message
+        assert agent.queue.pending_count == 1
 
 
 # ── Feature: /help command ─────────────────────────────────────────
@@ -1837,7 +1912,7 @@ class TestSandboxCommand:
         ):
             output, _ = await run_scenario(["/sandbox off", "/quit"])
 
-        mock_set.assert_called_once_with(SandboxMode.NONE)
+        mock_set.assert_called_once_with(SandboxMode.OFF)
 
 
 # -- Feature: /devel command -----------------------------------------------

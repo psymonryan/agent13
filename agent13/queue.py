@@ -95,6 +95,17 @@ class AgentQueue:
 
         return item.id
 
+    def peek_next(self) -> Optional[QueueItem]:
+        """Return the next item that would be processed, without removing it.
+
+        Returns None if queue is empty or an item is already running.
+        Useful for pre-checks (e.g. polite lock acquisition) before
+        committing to process an item via get_next().
+        """
+        if self.current is None and self.items:
+            return self.items[0]
+        return None
+
     def get_next(self) -> Optional[QueueItem]:
         """Get next item to process. Returns None if queue is empty or item is running."""
         if self.current is None and self.items:

@@ -44,17 +44,21 @@ class SnippetManager:
         Returns:
             List of collision warning strings for names that conflict
             with reserved (built-in) command names.
+
+        Raises:
+            yaml.YAMLError: If snippets file exists but is invalid YAML.
+            ValueError: If snippets file exists but has wrong structure
+                or contains non-string values.
         """
         self.snippets = load_yaml(self.config_path)
-        # Ensure it's a dict of strings
-        if not isinstance(self.snippets, dict):
-            self.snippets = {}
-        # Filter to string values only
-        self.snippets = {
-            k: v
-            for k, v in self.snippets.items()
-            if isinstance(k, str) and isinstance(v, str)
-        }
+        # load_yaml already validates top-level is a dict (or missing → {})
+        # Now strictly validate all values are strings
+        for key, value in self.snippets.items():
+            if not isinstance(value, str):
+                raise ValueError(
+                    f"Snippet '{key}' in {self.config_path} must be a "
+                    f"string, got {type(value).__name__}"
+                )
 
         # Check for collisions with reserved names
         self._collisions = []
@@ -183,9 +187,12 @@ class SnippetManager:
     def list_snippets(self) -> list[dict]:
         """List all snippets with preview and collision status.
 
+        Re-reads the snippets file first so external edits are picked up.
+
         Returns:
             List of dicts with keys: name, preview, collision.
         """
+        self.load_snippets()
         result = []
         for name, content in self.snippets.items():
             first_line = content.split("\n", 1)[0]

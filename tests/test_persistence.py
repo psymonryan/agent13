@@ -3,14 +3,12 @@
 import json
 from datetime import datetime
 from pathlib import Path
-from unittest.mock import patch
 
 import pytest
 
 from agent13.config import Config
 from agent13.persistence import (
     _ensure_ctx_stem,
-    _is_auto_save_name,
     find_latest_auto_save,
     get_auto_save_dir,
     get_auto_save_path,
@@ -52,6 +50,7 @@ def _make_agent_stub(messages=None, model="test-model", system_prompt=""):
             self.messages = messages or []
             self.model = model
             self.system_prompt = system_prompt
+            self.session_date = None
             self.prompt_tokens = 0
             self.completion_tokens = 0
             self._incomplete = False
@@ -88,14 +87,14 @@ class TestGetSavesDir:
 
 
 class TestGetAutoSaveDir:
-    def test_default_central(self, monkeypatch, tmp_path):
-        """Default config returns global saves dir."""
+    def test_central_mode(self, monkeypatch, tmp_path):
+        """Central config returns global saves dir."""
         monkeypatch.chdir(tmp_path)
         monkeypatch.setattr(
             "agent13.config.get_config", lambda: _make_config("central")
         )
         monkeypatch.setattr(
-            "agent13.persistence._get_global_saves_dir",
+            "agent13.persistence.get_global_saves_dir",
             lambda: tmp_path / "global_saves",
         )
         result = get_auto_save_dir()
@@ -124,7 +123,7 @@ class TestGetAutoSavePath:
             "agent13.config.get_config", lambda: _make_config("central")
         )
         monkeypatch.setattr(
-            "agent13.persistence._get_global_saves_dir",
+            "agent13.persistence.get_global_saves_dir",
             lambda: tmp_path / "global_saves",
         )
         today = datetime.now().strftime("%Y-%m-%d")
@@ -141,7 +140,7 @@ class TestGetAutoSavePath:
             "agent13.config.get_config", lambda: _make_config("central")
         )
         monkeypatch.setattr(
-            "agent13.persistence._get_global_saves_dir",
+            "agent13.persistence.get_global_saves_dir",
             lambda: tmp_path / "global_saves",
         )
         today = datetime.now().strftime("%Y-%m-%d")
@@ -166,7 +165,7 @@ class TestGetAutoSavePath:
             "agent13.config.get_config", lambda: _make_config("central")
         )
         monkeypatch.setattr(
-            "agent13.persistence._get_global_saves_dir",
+            "agent13.persistence.get_global_saves_dir",
             lambda: tmp_path / "global_saves",
         )
         result = get_auto_save_path("p")
@@ -175,44 +174,27 @@ class TestGetAutoSavePath:
         parts = stem.split("-")
         assert len(parts) == 4  # ["p", "2026", "05", "25"]
 
+    def test_uses_session_date_when_provided(self, monkeypatch, tmp_path):
+        """Session date overrides today in the filename."""
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setattr(
+            "agent13.config.get_config", lambda: _make_config("central")
+        )
+        monkeypatch.setattr(
+            "agent13.persistence.get_global_saves_dir",
+            lambda: tmp_path / "global_saves",
+        )
+        result = get_auto_save_path("myproject", session_date="2026-01-15")
+        assert result.name == "myproject-2026-01-15.ctx"
 
-# ---------------------------------------------------------------------------
-# _is_auto_save_name
-# ---------------------------------------------------------------------------
-
-
-class TestIsAutoSaveName:
-    def test_auto_save_with_project(self):
-        assert _is_auto_save_name("myproject-2026-05-25") is True
-
-    def test_auto_save_short_project(self):
-        assert _is_auto_save_name("p-2026-01-01") is True
-
-    def test_manual_save(self):
-        assert _is_auto_save_name("mycontext") is False
-
-    def test_manual_save_with_dashes(self):
-        assert _is_auto_save_name("debug-session") is False
-
-    def test_manual_save_two_parts(self):
-        assert _is_auto_save_name("my-project") is False
-
-    def test_invalid_date_still_matches_regex(self):
-        """Regex checks digit format, not calendar validity. 99-99 matches \\d{2}."""
-        assert _is_auto_save_name("proj-2026-99-99") is True
-
-    def test_short_year(self):
-        assert _is_auto_save_name("proj-26-05-25") is False
-
-    def test_bare_date_no_project(self):
-        """bare '2026-05-25' is valid for local mode auto-saves."""
-        assert _is_auto_save_name("2026-05-25") is True
-
-    def test_empty_string(self):
-        assert _is_auto_save_name("") is False
-
-    def test_underscores_not_dashes(self):
-        assert _is_auto_save_name("proj_2026_05_25") is False
+    def test_local_mode_uses_session_date(self, monkeypatch, tmp_path):
+        """Local mode also respects session_date."""
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setattr(
+            "agent13.config.get_config", lambda: _make_config("local")
+        )
+        result = get_auto_save_path(session_date="2026-01-15")
+        assert result == tmp_path / ".agent13" / "saves" / "2026-01-15.ctx"
 
 
 # ---------------------------------------------------------------------------
@@ -229,7 +211,7 @@ class TestFindLatestAutoSave:
         auto_dir = tmp_path / "global_saves"
         auto_dir.mkdir()
         monkeypatch.setattr(
-            "agent13.persistence._get_global_saves_dir", lambda: auto_dir
+            "agent13.persistence.get_global_saves_dir", lambda: auto_dir
         )
         assert find_latest_auto_save("proj") is None
 
@@ -241,7 +223,7 @@ class TestFindLatestAutoSave:
         auto_dir = tmp_path / "global_saves"
         auto_dir.mkdir()
         monkeypatch.setattr(
-            "agent13.persistence._get_global_saves_dir", lambda: auto_dir
+            "agent13.persistence.get_global_saves_dir", lambda: auto_dir
         )
         _touch(auto_dir / "proj-2026-05-01.ctx", mtime=1000)
         _touch(auto_dir / "proj-2026-05-10.ctx", mtime=2000)
@@ -257,7 +239,7 @@ class TestFindLatestAutoSave:
         auto_dir = tmp_path / "global_saves"
         auto_dir.mkdir()
         monkeypatch.setattr(
-            "agent13.persistence._get_global_saves_dir", lambda: auto_dir
+            "agent13.persistence.get_global_saves_dir", lambda: auto_dir
         )
         _touch(auto_dir / "other-2026-05-25.ctx", mtime=5000)
         _touch(auto_dir / "proj-2026-05-10.ctx", mtime=3000)
@@ -287,7 +269,7 @@ class TestFindLatestAutoSave:
         global_dir = tmp_path / "global_saves"
         global_dir.mkdir()
         monkeypatch.setattr(
-            "agent13.persistence._get_global_saves_dir", lambda: global_dir
+            "agent13.persistence.get_global_saves_dir", lambda: global_dir
         )
         # Local dir has the save (date-only format for local mode)
         local_dir = tmp_path / ".agent13" / "saves"
@@ -310,7 +292,7 @@ class TestFindLatestAutoSave:
         global_dir.mkdir()
         _touch(global_dir / "proj-2026-06-01.ctx", mtime=9000)
         monkeypatch.setattr(
-            "agent13.persistence._get_global_saves_dir", lambda: global_dir
+            "agent13.persistence.get_global_saves_dir", lambda: global_dir
         )
 
         result = find_latest_auto_save("proj")
@@ -326,7 +308,7 @@ class TestFindLatestAutoSave:
         global_dir = tmp_path / "global_saves"
         global_dir.mkdir()
         monkeypatch.setattr(
-            "agent13.persistence._get_global_saves_dir", lambda: global_dir
+            "agent13.persistence.get_global_saves_dir", lambda: global_dir
         )
         # Both locations have saves; primary (central) should win
         _touch(global_dir / "proj-2026-05-20.ctx", mtime=3000)
@@ -346,7 +328,7 @@ class TestFindLatestAutoSave:
         global_dir = tmp_path / "global_saves"
         global_dir.mkdir()
         monkeypatch.setattr(
-            "agent13.persistence._get_global_saves_dir", lambda: global_dir
+            "agent13.persistence.get_global_saves_dir", lambda: global_dir
         )
         # Local dir exists but is empty too
         (tmp_path / ".agent13" / "saves").mkdir(parents=True, exist_ok=True)
@@ -396,7 +378,7 @@ class TestListAllSaves:
         global_dir = tmp_path / "global_saves"
         global_dir.mkdir()
         monkeypatch.setattr(
-            "agent13.persistence._get_global_saves_dir", lambda: global_dir
+            "agent13.persistence.get_global_saves_dir", lambda: global_dir
         )
 
         saves_dir = get_saves_dir()
@@ -453,7 +435,7 @@ class TestListAllSaves:
         global_dir = tmp_path / "global_saves"
         global_dir.mkdir()
         monkeypatch.setattr(
-            "agent13.persistence._get_global_saves_dir", lambda: global_dir
+            "agent13.persistence.get_global_saves_dir", lambda: global_dir
         )
         get_saves_dir()  # ensure dir exists
 
@@ -473,7 +455,7 @@ class TestListAllSaves:
         global_dir = tmp_path / "global_saves"
         global_dir.mkdir()
         monkeypatch.setattr(
-            "agent13.persistence._get_global_saves_dir", lambda: global_dir
+            "agent13.persistence.get_global_saves_dir", lambda: global_dir
         )
 
         saves_dir = get_saves_dir()
@@ -492,7 +474,7 @@ class TestListAllSaves:
         global_dir = tmp_path / "global_saves"
         global_dir.mkdir()
         monkeypatch.setattr(
-            "agent13.persistence._get_global_saves_dir", lambda: global_dir
+            "agent13.persistence.get_global_saves_dir", lambda: global_dir
         )
         get_saves_dir()
         assert list_all_saves() == []
@@ -524,6 +506,38 @@ class TestSaveLoadContext:
         assert incomplete is False
         assert agent2.messages == agent.messages
         assert agent2.system_prompt == "be nice"
+
+    def test_session_date_round_trip(self, tmp_path):
+        """Save then load restores session_date."""
+        path = tmp_path / "test.ctx"
+        agent = _make_agent_stub(
+            messages=[{"role": "user", "content": "hello"}],
+        )
+        agent.session_date = "2026-01-15"
+        save_context(agent, path)
+
+        agent2 = _make_agent_stub()
+        ok, msg, _ = load_context(agent2, path)
+        assert ok is True
+        assert agent2.session_date == "2026-01-15"
+
+    def test_session_date_missing_in_old_save(self, tmp_path):
+        """Old save files without session_date don't break load."""
+        import json
+
+        path = tmp_path / "old.ctx"
+        path.write_text(json.dumps({
+            "version": 1,
+            "model": "test",
+            "system_prompt": "",
+            "messages": [{"role": "user", "content": "hi"}],
+        }))
+        agent = _make_agent_stub()
+        agent.session_date = "2026-07-29"
+        ok, msg, _ = load_context(agent, path)
+        assert ok is True
+        # session_date should remain unchanged (not overwritten with None)
+        assert agent.session_date == "2026-07-29"
 
     def test_load_missing_file(self, tmp_path):
         agent = _make_agent_stub()

@@ -78,7 +78,11 @@ async def run_headless(
     if debug:
         init_debug()
 
-    prompt_manager = prompt_manager or PromptManager()
+    try:
+        prompt_manager = prompt_manager or PromptManager()
+    except Exception as e:
+        print(f"Error: Failed to load prompts: {e}", file=sys.stderr)
+        sys.exit(1)
 
     # Set up skill manager context for skill tool
     skill_manager = SkillManager(lambda: get_config())

@@ -9,6 +9,7 @@ import pytest
 from agent13.config import (
     Config,
     ProviderConfig,
+    ensure_default_env,
     get_config,
     get_provider,
     create_client,
@@ -364,6 +365,43 @@ class TestEnvironmentLoading:
                 os.environ.pop("ONCE_VAR", None)
 
 
+class TestEnsureDefaultEnv:
+    """Tests for ensure_default_env (starter ~/.env copy)."""
+
+    def test_copies_default_when_missing(self, tmp_path):
+        """Default .env is copied to ~/.env when none exists."""
+        target = tmp_path / ".env"
+        assert not target.exists()
+
+        with mock.patch("agent13.config.get_global_env_file", return_value=target):
+            ensure_default_env()
+
+        assert target.exists()
+        assert "OPENAI_API_KEY" in target.read_text()
+
+    def test_does_not_overwrite_existing(self, tmp_path):
+        """Existing ~/.env is never overwritten."""
+        target = tmp_path / ".env"
+        target.write_text("OPENAI_API_KEY=real_key\n")
+
+        with mock.patch("agent13.config.get_global_env_file", return_value=target):
+            ensure_default_env()
+
+        assert target.read_text() == "OPENAI_API_KEY=real_key\n"
+
+    def test_noop_when_default_missing(self, tmp_path):
+        """No error when bundled default_env is absent."""
+        target = tmp_path / ".env"
+        with mock.patch("agent13.config.get_global_env_file", return_value=target):
+            with mock.patch(
+                "agent13.config.DEFAULT_ENV_FILE",
+                tmp_path / "does_not_exist",
+            ):
+                ensure_default_env()
+
+        assert not target.exists()
+
+
 class TestGlobalConfig:
     """Tests for global config functions."""
 
@@ -598,6 +636,7 @@ class TestCreateClient:
         client = create_client("http://localhost:8012/v1", "none")
         assert str(client.base_url).startswith("http://localhost:8012/v1")
         timeout = client._client.timeout
+        assert timeout is not None
 
 
 class TestUpdatesConfig:
@@ -690,6 +729,57 @@ method = "invalid"
 """)
         config = Config.from_file(config_file)
         assert config.clipboard_method == "osc52"
+
+
+class TestBellConfig:
+    """Tests for [bell] section config parsing."""
+
+    def test_bell_defaults(self):
+        """Default config: bell enabled, threshold 0 (always ring)."""
+        config = Config()
+        assert config.bell_threshold == 0.0
+        assert config.bell_enabled is True
+
+    def test_bell_threshold_from_file(self, tmp_path):
+        """Parse [bell] threshold from TOML."""
+        config_file = tmp_path / "config.toml"
+        config_file.write_text("""
+[[providers]]
+name = "test"
+api_base = "http://localhost:8012/v1"
+
+[bell]
+threshold = 30
+""")
+        config = Config.from_file(config_file)
+        assert config.bell_threshold == 30.0
+        assert config.bell_enabled is True
+
+    def test_bell_disabled_from_file(self, tmp_path):
+        """Parse [bell] enabled = false from TOML."""
+        config_file = tmp_path / "config.toml"
+        config_file.write_text("""
+[[providers]]
+name = "test"
+api_base = "http://localhost:8012/v1"
+
+[bell]
+enabled = false
+""")
+        config = Config.from_file(config_file)
+        assert config.bell_enabled is False
+
+    def test_bell_no_section(self, tmp_path):
+        """Config without [bell] section uses defaults (enabled, threshold 0)."""
+        config_file = tmp_path / "config.toml"
+        config_file.write_text("""
+[[providers]]
+name = "test"
+api_base = "http://localhost:8012/v1"
+""")
+        config = Config.from_file(config_file)
+        assert config.bell_threshold == 0.0
+        assert config.bell_enabled is True
 
 
 class TestGetProviderNames:
@@ -799,10 +889,10 @@ class TestResolveProviderSelection:
         lines = []
         for name in names:
             lines.extend([
-                f'[[providers]]',
+                '[[providers]]',
                 f'name = "{name}"',
                 f'api_base = "https://{name}.example.com/v1"',
-                f'model = "test-model"',
+                'model = "test-model"',
             ])
         config_file = tmp_path / "config.toml"
         config_file.write_text("\n".join(lines) + "\n")

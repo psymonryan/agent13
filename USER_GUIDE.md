@@ -97,7 +97,7 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 Install package directly from github:
 
 ```
-uv tool install https://github.com/psymonryan/agent13/releases/download/v0.2.1/agent13-0.2.1-py3-none-any.whl
+uv tool install https://github.com/psymonryan/agent13/releases/download/v0.3.0/agent13-0.3.0-py3-none-any.whl
 ```
 
 Or install from source (for hacking on the agent itself):
@@ -177,7 +177,7 @@ The primary interface - a full-featured terminal UI (using Textual library) with
 
 ```bash
 agent13 local
-agent13 openrouter --model devstral2
+agent13 openrouter --model qwen/qwen3.7-flash
 ```
 
 The TUI provides:
@@ -206,6 +206,14 @@ Batch mode processes the prompt, prints the response, and exits. Useful for:
 - Shell script integration
 - Quick one-off queries
 - Easy markdown output for copy and paste when rendering unwanted
+
+`--mcp` works in batch mode too, letting scripts invoke MCP-provided tools (web search, fetch, deep research skills, etc.) and exit cleanly:
+
+```bash
+agent13 local --mcp -p "Use the deep_research skill to investigate X and write findings to report.md"
+```
+
+MCP servers are auto-disconnected when the batch run exits.
 
 ### REPL Mode
 
@@ -300,7 +308,7 @@ The `Agent` constructor accepts:
 | `--pretty on\|off`          | Enable/disable markdown rendering                                                                        | on                    |
 | `--debug`                   | Enable debug logging                                                                                     | off                   |
 | `--tool-response raw\|json` | Tool response format                                                                                     | raw                   |
-| `--mcp`                     | Connect to MCP servers on startup (TUI only)                                                             | off                   |
+| `--mcp`                     | Connect to MCP servers on startup (TUI and batch modes)                                                  | off                   |
 | `--skills`                  | Include discovered skills in the system prompt                                                           | off                   |
 | `--journal`                 | Enable journal mode (context compaction)                                                                 | off                   |
 | `--send-reasoning`          | Include reasoning_content in message history                                                             | off                   |
@@ -310,6 +318,8 @@ The `Agent` constructor accepts:
 | `--spinner fast\|slow\|off` | Spinner style                                                                                            | fast                  |
 | `--upgrade`                 | Check for updates and apply, then exit                                                                   | -                     |
 | `--clipboard osc52\|system` | Clipboard method for this session                                                                        | osc52                 |
+| `--bell`                    | Bell threshold: N seconds (0=always), or 'off'                                                           | off                   |
+| `--polite`                  | Polite mode: N seconds poll interval or 'off'                                                            | 10                    |
 | `--read FILE`               | Read file(s) into the user message before processing                                                     | -                     |
 | `--repl`                    | Run in REPL mode (readline-based, no TUI)                                                                | off                   |
 | `--output FILE`             | Write REPL chat transcript to file (implies `--repl`) (the REPL still gets output for command responses) | -                     |
@@ -378,6 +388,8 @@ Note: both /model and /provider can use numbered or named models and providers
 | `/tool-response raw\|json`  | Toggle tool output format api request                          |
 | `/spinner fast\|slow\|off`  | Change spinner style for slow connections (eg from your phone) |
 | `/remove-reasoning on\|off` | Strip reasoning between turns                                  |
+| `/bell [N\|off]`            | Show bell threshold, or set to N seconds / off                 |
+| `/polite [N\|off]`          | Show polite mode status, or set interval / disable             |
 
 #### Tools and Skills
 
@@ -410,7 +422,7 @@ Note: both /model and /provider can use numbered or named models and providers
 | Command                      | Description                                                |
 | ---------------------------- | ---------------------------------------------------------- |
 | `/history`                   | Show input history                                         |
-| `/delete [h\|q\|s] spec|name`| Delete items from history, queue, or saves                 |
+| `/delete [h\|q\|s] spec      | name`                                                      |
 |                              | eg: `/delete h last` `/delete q -2:` `/delete h 14:18`     |
 | `/snippet`                   | Manage text snippets (saved user messages)                 |
 | `/upgrade [--copy]`          | Check for updates and apply (or copy command to clipboard) |
@@ -555,6 +567,24 @@ method = "osc52"    # "osc52" (terminal escape sequence, default) or "system" (O
 ```bash
 agent13 --clipboard system studio
 ```
+
+### Bell Configuration
+
+Control the terminal bell notification when a turn completes:
+
+```toml
+[bell]
+enabled = true       # false = disable entirely
+threshold = 0        # 0 = always ring; 30 = only if turn took >30s
+```
+
+The bell can also be set at runtime with `/bell N` (or `/bell off`) in the TUI, or with `--bell N|off` on the command line.
+
+### Polite Mode
+
+Polite mode coordinates access when multiple agent13 instances share the same provider - only one sends at a time, waiting for a shared provider lock. It is enabled by default with a 10-second poll interval.
+
+Disable for a session with `--polite off` on the command line, or `/polite off` in the TUI. There is no config.toml section for polite mode - it is CLI/TUI-only.
 
 ### Environment Variables
 
@@ -704,7 +734,7 @@ Sandbox modes control what tools can do - file access and network permissions:
 | `permissive-closed`  | Project only | Anywhere     | ❌       | No network - safe for offline work      |
 | `restrictive-open`   | Project only | Project only | ✅       | Locked reads - sandboxed exploration    |
 | `restrictive-closed` | Project only | Project only | ❌       | Maximum restriction - fully locked down |
-| `none`               | Anywhere     | Anywhere     | ✅       | No restrictions - full access           |
+| `off`                | Anywhere     | Anywhere     | ✅       | No restrictions - full access           |
 
 **Default**: `permissive-open` on all platforms.
 
@@ -761,12 +791,16 @@ Journal commands:
 MCP (Model Context Protocol) servers extend Agent13 with additional tools:
 
 ```bash
-# Connect on startup
+# Connect on startup (TUI or batch mode)
 agent13 local --mcp
+agent13 local --mcp -p "Use the web_research tool to summarize <topic>"
 
 # Or in TUI
 /mcp connect
 ```
+
+In batch mode (`-p`), MCP servers connect at startup and disconnect
+automatically when the run finishes - ideal for scripted one-shots.
 
 MCP tools appear with the `mcp://` prefix:
 
@@ -780,11 +814,13 @@ Configure MCP servers in `~/.agent13/config.toml`:
 name = "web_research"
 transport = "stdio"
 command = "uvx"
-args = ["web-research-assistant"]
+args = ["--with", "mcp<2", "web-research-assistant"]
 env = { "SEARXNG_BASE_URL" = "http://searxng/search" }
 ```
 
-MCP servers use a "reconnect-per-operation" pattern - they connect when needed and handle disconnections gracefully.
+Note: `--with mcp<2` pins MCP SDK 1.x. Many MCP servers import `mcp.server.fastmcp` which was removed in SDK 2.0. agent13 auto-injects this fallback on startup failure, but including it explicitly avoids the retry.
+
+MCP servers use persistent connections - they stay connected for the session and transparently reconnect once on mid-call failure before surfacing errors.
 
 ## Snippets
 
@@ -804,13 +840,13 @@ square: square all the numbers from 1.06 to 3.06, step 1.0 for me (do one at a t
   rather than all in parallel)
 ```
 
-Use `/snippet` in the TUI to see available snippets and insert one. Snippets can use `{placeholder}` syntax - you'll be prompted to fill in values before insertion.
+Use `/snippet` in the TUI to see available snippets and insert one. `/snippet list` re-reads the snippets file first, so external edits are picked up without restarting. Snippets can use `{placeholder}` syntax - you'll be prompted to fill in values before insertion.
 
 ## Reasoning Token Control
 
 Agent13 can include or exclude reasoning tokens (chain-of-thought) in message history:
 
-- `--send-reasoning` - Include the model's reasoning tokens the api call (defaults to on) - currently it does nothing, this was used as an experiment and will be removed.
+- `--send-reasoning` - Include the model's reasoning_content in the next API call's message history.
 - `--remove-reasoning` - Strip reasoning tokens between turns. Reduces context size and focuses on final answers. Recommended for most use cases.
 
 Toggle reasoning visibility in the TUI with `Ctrl+O` to collapse/expand reasoning content.

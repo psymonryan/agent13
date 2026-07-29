@@ -7,7 +7,8 @@
 ;; Parameters (set via -D on sandbox-exec command line):
 ;;   PROJECT_DIR  - the project working directory
 ;;   AGENT_DIR    - agent config dir (~/.agent13 or AGENT13_CONFIG_DIR)
-;;   USER_CACHE   - user cache dir (~/.cache)
+;;   USER_CACHE   - user cache dir (~/.cache, XDG convention)
+;;   USER_LIB_CACHE - user Library cache dir (~/Library/Caches, macOS convention)
 ;;   USER_LOCAL   - user local share dir (~/.local/share)
 ;;   USER_LOCAL_BIN - user local bin dir (~/.local/bin)
 ;;   USER_HOME_SSH - user SSH directory (~/.ssh)
@@ -26,9 +27,12 @@
 (allow file-write*
     (subpath (param "AGENT_DIR")))
 
-;; Allow writes to cache directories (uv, python bytecode, etc.)
+;; Allow writes to cache directories (uv, python bytecode, deno, playwright, etc.)
+;; USER_CACHE covers the XDG convention (~/.cache); USER_LIB_CACHE covers the
+;; macOS convention (~/Library/Caches) used by deno, playwright, and most native apps.
 (allow file-write*
     (subpath (param "USER_CACHE"))
+    (subpath (param "USER_LIB_CACHE"))
     (subpath (param "USER_LOCAL")))
 
 ;; Allow writes to /tmp directory (note: /tmp is symlink to /private/tmp on macOS)
@@ -50,6 +54,7 @@
     (subpath "/bin")
     (subpath "/usr/local/bin")
     (subpath "/opt/local/bin")
+    (subpath "/opt/local/libexec/git-core")
     (subpath "/Library/Developer/CommandLineTools")
     (subpath (param "USER_CACHE"))
     (subpath (param "USER_LOCAL"))

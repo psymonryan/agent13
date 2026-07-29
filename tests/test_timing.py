@@ -17,7 +17,6 @@ Key behaviors characterized:
 
 import time
 
-import pytest
 
 from agent13.timing import TokenTimingTracker, TPSResult
 

@@ -57,10 +57,17 @@ class AgentEvent(Enum):
     MCP_SERVER_READY = "mcp_server_ready"  # Server connected, tools available
     MCP_SERVER_ERROR = "mcp_server_error"  # Server connection failed
     MCP_SERVER_STDERR = "mcp_server_stderr"  # Server stderr output
+    MCP_SERVER_WARNING = "mcp_server_warning"  # Non-fatal warning (e.g. MCP SDK fallback)
 
     # Deferred commands (processed at safe boundary between items)
     MESSAGES_CLEARED = "messages_cleared"  # /clear completed at safe boundary
     CONTEXT_LOADED = "context_loaded"  # /load completed at safe boundary
+
+    # Polite mode (multi-agent lock coordination)
+    POLITE_WAITING = (
+        "polite_waiting"  # Waiting for shared provider lock (elapsed seconds)
+    )
+    POLITE_ACQUIRED = "polite_acquired"  # Lock won, turn proceeding
 
 
 @dataclass
@@ -130,6 +137,11 @@ class AgentEventData:
     def line(self) -> str | None:
         """Get line field from data (for MCP stderr events)."""
         return self.data.get("line")
+
+    @property
+    def warning(self) -> str | None:
+        """Get warning field from data (for MCP warning events)."""
+        return self.data.get("warning")
 
     @property
     def summary(self) -> str | None:

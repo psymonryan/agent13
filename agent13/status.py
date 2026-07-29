@@ -153,8 +153,6 @@ def gather_status(
     run_time = format_duration(time.time() - session_start_time)
 
     # ── Last turn ──
-    last_turn_duration = None
-    last_turn_ago = None
     turn_count = 0
     total_processing = "0s"
 

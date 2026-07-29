@@ -16,6 +16,14 @@ REFLECTION_PROMPT = (
     "Skip where the goal was not achieved"
 )
 
+PRIMING_PROMPT = (
+    "The previous turns have been journalled to reduce context. "
+    "From now on, actually call the tools rather than reflecting. Dont reflect again until asked. "
+    "Acknowledge this imperative with an `ok`"
+)
+
+PRIMING_RESPONSE = "ok"
+
 # Default prompts bundled with the package
 DEFAULT_PROMPTS_FILE = Path(__file__).parent / "default_prompts.yaml"
 
@@ -71,11 +79,22 @@ class PromptManager:
         self.load_prompts()
 
     def load_prompts(self) -> None:
-        """Load prompts from config file."""
+        """Load prompts from config file.
+
+        Raises:
+            yaml.YAMLError: If prompts file exists but is invalid YAML.
+            ValueError: If prompts file exists but has wrong structure
+                or contains non-string values.
+        """
         self.prompts = load_yaml(self.config_path)
-        # Ensure it's a dict of strings
-        if not isinstance(self.prompts, dict):
-            self.prompts = {}
+        # load_yaml already validates top-level is a dict (or missing → {})
+        # Now strictly validate all values are strings
+        for key, value in self.prompts.items():
+            if not isinstance(value, str):
+                raise ValueError(
+                    f"Prompt '{key}' in {self.config_path} must be a "
+                    f"string, got {type(value).__name__}"
+                )
 
         # Ensure default exists
         if "default" not in self.prompts:

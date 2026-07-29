@@ -11,6 +11,7 @@ from difflib import SequenceMatcher
 
 from tools import tool
 from tools.security import validate_path_for_write, get_current_sandbox_mode
+from agent13.file_injection import is_probably_text
 
 # =============================================================================
 # Snapshot storage — per-session undo for edit_file
@@ -25,14 +26,6 @@ MAX_SNAPSHOTS_PER_FILE = 10
 # =============================================================================
 # Helpers
 # =============================================================================
-
-
-def _is_binary_file(content: bytes) -> bool:
-    """Check if content appears to be binary (non-text).
-
-    Simple check: look for null bytes.
-    """
-    return b"\x00" in content
 
 
 def _do_replace(
@@ -882,6 +875,11 @@ def edit_file(
         Dict with success status and details. Every edit result includes
         snapshot_id for potential rollback.
     """
+    # Reject embedded null bytes early — .resolve() would crash with a
+    # confusing ValueError before validation runs.
+    if "\0" in filepath:
+        return {"error": "Invalid path: embedded null character."}
+
     # Expand ~ and resolve to absolute path (shell-like behavior)
     # Done early so snapshot keys and rollback use the same path regardless
     # of whether the caller passes a relative or absolute path.
@@ -1006,7 +1004,7 @@ def edit_file(
         return {"error": f"Failed to read file: {e}"}
 
     # Check for binary content
-    if _is_binary_file(raw_content):
+    if not is_probably_text(raw_content):
         return {"error": f"Binary file not supported: {filepath}"}
 
     # Decode content

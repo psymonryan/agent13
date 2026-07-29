@@ -13,7 +13,7 @@ import os
 import tempfile
 from pathlib import Path
 import pytest
-from tools.edit_file import edit_file, _snapshots, _snapshot_counter, MAX_SNAPSHOTS_PER_FILE
+from tools.edit_file import edit_file, _snapshots, _snapshot_counter
 
 
 def resolved(path: str) -> str:

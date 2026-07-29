@@ -265,6 +265,7 @@ def parse_sandbox_paths(mode: SandboxMode) -> SandboxPaths:
         "PROJECT_DIR": str(Path.cwd().resolve()),
         "AGENT_DIR": str(_get_config_dir().resolve()),
         "USER_CACHE": str(Path.home() / ".cache"),
+        "USER_LIB_CACHE": str(Path.home() / "Library" / "Caches"),
         "USER_LOCAL": str(Path.home() / ".local" / "share"),
         "USER_LOCAL_BIN": str(Path.home() / ".local" / "bin"),
     }
@@ -471,6 +472,7 @@ def build_sandbox_command(
         f"PROJECT_DIR={project_dir.resolve()}",
         f"AGENT_DIR={get_config_dir().resolve()}",
         f"USER_CACHE={Path.home() / '.cache'}",
+        f"USER_LIB_CACHE={Path.home() / 'Library' / 'Caches'}",
         f"USER_LOCAL={Path.home() / '.local' / 'share'}",
         f"USER_LOCAL_BIN={Path.home() / '.local' / 'bin'}",
         f"USER_HOME_SSH={Path.home() / '.ssh'}",

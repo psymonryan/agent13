@@ -1,6 +1,5 @@
 """Tests for ui.display module."""
 
-import time
 from unittest.mock import MagicMock, patch
 from io import StringIO
 

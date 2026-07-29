@@ -54,27 +54,83 @@ api_key = "test-key"
     return env
 
 
+def _wait_for_repl_prompt(proc, timeout):
+    """Wait for the REPL '>' prompt, converting startup EOF to a retryable error.
+
+    PopenSpawn (Windows) uses pipes instead of a pty, so the first spawn can
+    occasionally hit EOF before the prompt is emitted -- a startup race that
+    does not reflect a real failure. On EOF we raise `_StartupEOFError` so the
+    caller can respawn; the captured `proc.before` makes final failures
+    diagnosable instead of an opaque EOF.
+    """
+    try:
+        proc.expect(r">", timeout=timeout)
+    except pexpect.EOF:
+        raise _StartupEOFError(proc)
+
+
+class _StartupEOFError(Exception):
+    """Raised when the REPL dies before emitting its first prompt.
+
+    Carries the captured `before` output so callers can retry with a fresh
+    process and, on final failure, surface a readable assertion message.
+    """
+
+    def __init__(self, proc):
+        self.before = proc.before or ""
+        self.exitstatus = getattr(proc, "exitstatus", None)
+        super().__init__(
+            f"REPL exited before emitting '>' prompt.\n"
+            f"exitstatus={self.exitstatus}\n"
+            f"captured output:\n{self.before!r}"
+        )
+
+
+def _spawn_repl_with_retry(provider, model, env, timeout=30, retries=1):
+    """Spawn a REPL and wait for its first prompt, retrying on startup EOF.
+
+    Windows PopenSpawn can non-deterministically hit EOF at startup (a pipe
+    buffering race, not a real failure). On `_StartupEOFError` we close the
+    dead process and respawn, up to `retries` extra attempts. The final
+    attempt's error propagates as an AssertionError with captured output.
+    """
+    from .helpers import spawn_process
+    last_err = None
+    for attempt in range(retries + 1):
+        proc = spawn_process(
+            "uv",
+            args=["run", "agent13", provider, "--repl", "--model", model],
+            env=env,
+            encoding="utf-8",
+            timeout=timeout,
+            dimensions=(50, 200),
+            maxread=4096,
+        )
+        proc.timeout = timeout
+        try:
+            _wait_for_repl_prompt(proc, timeout)
+            return proc
+        except _StartupEOFError as err:
+            last_err = err
+            try:
+                proc.close()
+            except Exception:
+                pass
+            if attempt < retries:
+                time.sleep(1)
+                continue
+    raise AssertionError(
+        f"REPL failed to start after {retries + 1} attempt(s).\n{last_err}"
+    )
+
+
 def spawn_repl(env, timeout=30):
     """Spawn a REPL process with the given environment.
 
     Returns a process handle ready for interaction.
     Uses pexpect.spawn on Unix, PopenSpawn on Windows.
     """
-    from .helpers import spawn_process
-    proc = spawn_process(
-        "uv",
-        args=["run", "agent13", "test_mock", "--repl", "--model", "mock-model"],
-        env=env,
-        encoding="utf-8",
-        timeout=timeout,
-        dimensions=(50, 200),
-        maxread=4096,
-    )
-    proc.timeout = timeout
-
-    # Wait for the REPL prompt
-    proc.expect(r">", timeout=timeout)
-    return proc
+    return _spawn_repl_with_retry("test_mock", "mock-model", env, timeout=timeout)
 
 
 # ─── Helpers ───────────────────────────────────────────────────────
@@ -833,19 +889,9 @@ api_key = "test-key"
 
 def spawn_multi_model_repl(env, timeout=30):
     """Spawn a REPL with multi-model server."""
-    from .helpers import spawn_process
-    proc = spawn_process(
-        "uv",
-        args=["run", "agent13", "test_multi", "--repl", "--model", "alpha-model"],
-        env=env,
-        encoding="utf-8",
-        timeout=timeout,
-        dimensions=(50, 200),
-        maxread=4096,
+    return _spawn_repl_with_retry(
+        "test_multi", "alpha-model", env, timeout=timeout
     )
-    proc.timeout = timeout
-    proc.expect(r">", timeout=timeout)
-    return proc
 
 
 # ─── Test: /model experience ───────────────────────────────────
@@ -948,8 +994,8 @@ class TestProviderExperience:
 # ─── Test: /status experience ────────────────────────────────────
 
 
-class TestStatusExperience:
-    """User interacts with /status in the REPL."""
+class TestStatusSections:
+    """User interacts with /status sections in the REPL."""
 
     def test_status_shows_session_section(self, repl_env):
         """User types /status — sees Session section."""

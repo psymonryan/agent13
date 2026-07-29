@@ -7,6 +7,17 @@ UIs call these functions and render the result in their own format.
 from dataclasses import dataclass, field
 from typing import Any
 
+_DELETE_USAGE = (
+    "Usage: /delete h N | /delete q N | /delete s NAME\n"
+    "  N can be: number, 'last', negative index (-1), or range (1:3, -2:)"
+)
+
+_POLITE_USAGE = (
+    "Usage: /polite N | /polite off\n"
+    "  N    - poll interval in seconds (pseudo-priority; lower = more aggressive)\n"
+    "  off  - disable polite mode"
+)
+
 
 @dataclass
 class CommandResult:
@@ -69,17 +80,11 @@ def execute_delete(agent, args: str) -> CommandResult:
     """
     target = args.strip()
     if not target:
-        return CommandResult(
-            False, "Usage: /delete h N | /delete q N | /delete s NAME\n"
-                   "  N can be: number, 'last', negative index (-1), or range (1:3, -2:)"
-        )
+        return CommandResult(False, _DELETE_USAGE)
 
     parts = target.split()
     if len(parts) < 2:
-        return CommandResult(
-            False, "Usage: /delete h N | /delete q N | /delete s NAME\n"
-                   "  N can be: number, 'last', negative index (-1), or range (1:3, -2:)"
-        )
+        return CommandResult(False, _DELETE_USAGE)
 
     kind = parts[0].lower()
     spec = parts[1]
@@ -91,10 +96,18 @@ def execute_delete(agent, args: str) -> CommandResult:
     elif kind == "s":
         return _delete_save(spec)
     else:
-        return CommandResult(
-            False, "Usage: /delete h N | /delete q N | /delete s NAME\n"
-                   "  N can be: number, 'last', negative index (-1), or range (1:3, -2:)"
-        )
+        return CommandResult(False, _DELETE_USAGE)
+
+
+def _normalize_idx(idx: int, total: int) -> int:
+    """Convert a (possibly negative) 1-based index to a positive 1-based index.
+
+    -1 maps to ``total``, -2 to ``total - 1``, etc. Positive indices are
+    returned unchanged. Used by ``_parse_index_spec`` for the negative-index
+    keyword convention (``-1`` = last item, mirroring Python's negative-index
+    ergonomics but on a 1-based scale).
+    """
+    return total + idx + 1 if idx < 0 else idx
 
 
 def _parse_index_spec(spec: str, total: int) -> tuple[list[int], str | None]:
@@ -141,10 +154,7 @@ def _parse_index_spec(spec: str, total: int) -> tuple[list[int], str | None]:
                 start = int(start_str)
             except ValueError:
                 return [], f"Invalid start index: {start_str}"
-
-            # Convert negative to positive
-            if start < 0:
-                start = total + start + 1
+            start = _normalize_idx(start, total)
 
         # Parse end
         if end_str == "":
@@ -156,16 +166,15 @@ def _parse_index_spec(spec: str, total: int) -> tuple[list[int], str | None]:
                 end = int(end_str)
             except ValueError:
                 return [], f"Invalid end index: {end_str}"
-
-            # Convert negative to positive
-            if end < 0:
-                end = total + end + 1
+            end = _normalize_idx(end, total)
 
         # Validate range
         if start < 1 or start > total:
-            return [], f"Start index {start} out of range (1-{total})"
+            rng = f" (1-{total})" if total else ""
+            return [], f"Start index {start} out of range{rng}"
         if end < 1 or end > total:
-            return [], f"End index {end} out of range (1-{total})"
+            rng = f" (1-{total})" if total else ""
+            return [], f"End index {end} out of range{rng}"
         if start > end:
             return [], f"Invalid range: start ({start}) > end ({end})"
 
@@ -176,14 +185,12 @@ def _parse_index_spec(spec: str, total: int) -> tuple[list[int], str | None]:
         idx = int(spec)
     except ValueError:
         return [], f"Invalid index: {spec}"
-
-    # Convert negative to positive
-    if idx < 0:
-        idx = total + idx + 1
+    idx = _normalize_idx(idx, total)
 
     # Validate
     if idx < 1 or idx > total:
-        return [], f"Index {idx} out of range (1-{total})"
+        rng = f" (1-{total})" if total else ""
+        return [], f"Index {idx} out of range{rng}"
 
     return [idx], None
 
@@ -284,8 +291,14 @@ def execute_retry(agent) -> CommandResult:
     Sync: validates agent is idle, deletes the last group from agent.messages.
     Caller must await agent.add_message(result.data["user_text"]) to re-queue.
 
+    Skips trailing priming pairs (left by journal compaction) so the priming
+    prompt is never offered as retry text. Priming pairs are left in place;
+    journal's sweep-on-next-run handles multiples.
+
     Returns CommandResult with data["user_text"] on success.
     """
+    from agent13.prompts import PRIMING_PROMPT, PRIMING_RESPONSE
+
     if not agent.is_idle:
         return CommandResult(False, "Agent is busy")
     if not agent.messages:
@@ -295,7 +308,29 @@ def execute_retry(agent) -> CommandResult:
     if not groups:
         return CommandResult(False, "No messages to retry")
 
-    last_group = groups[-1]
+    def _is_priming_group(group):
+        """True if a group is a priming pair (priming prompt + 'ok')."""
+        if len(group) != 2:
+            return False
+        user_msg = agent.messages[group[0]]
+        asst_msg = agent.messages[group[1]]
+        return (
+            user_msg.get("role") == "user"
+            and user_msg.get("content") == PRIMING_PROMPT
+            and asst_msg.get("role") == "assistant"
+            and asst_msg.get("content") == PRIMING_RESPONSE
+        )
+
+    # Walk backwards past trailing priming-pair groups to find the real
+    # last group the user would want to retry.
+    target_idx = len(groups) - 1
+    while target_idx >= 0 and _is_priming_group(groups[target_idx]):
+        target_idx -= 1
+
+    if target_idx < 0:
+        return CommandResult(False, "No messages to retry")
+
+    last_group = groups[target_idx]
     first_msg_idx = last_group[0]
     user_text = agent.messages[first_msg_idx].get("content", "")
 
@@ -336,6 +371,51 @@ def execute_deprioritise(agent, args: str) -> CommandResult:
     return CommandResult(False, f"Invalid queue index: {idx}")
 
 
+def execute_polite(agent, args: str) -> CommandResult:
+    """Execute /polite command — enable/disable polite multi-agent mode.
+
+    Forms:
+      /polite N   - enable with poll interval N seconds
+      /polite off - disable (silent no-op if not enabled)
+      /polite     - show usage
+
+    Returns CommandResult with data['action'] = 'enabled'|'disabled' and
+    data['interval'] (when enabled) for UI side-effects.
+    """
+    args = args.strip()
+    if not args:
+        # Show current status plus usage hint.
+        if agent.polite_lock is not None:
+            status = f"Polite mode: enabled (interval {agent.polite_lock.interval}s)"
+        else:
+            status = "Polite mode: off"
+        return CommandResult(True, f"{status}\n{_POLITE_USAGE}")
+
+    if args.lower() == "off":
+        # Silent no-op if never enabled (per design).
+        if agent.polite_lock is None:
+            return CommandResult(
+                True, "Polite mode not enabled", {"action": "disabled"}
+            )
+        agent.disable_polite()
+        return CommandResult(True, "Polite mode disabled", {"action": "disabled"})
+
+    # Parse interval N (float, must be non-negative).
+    try:
+        interval = float(args)
+    except ValueError:
+        return CommandResult(False, _POLITE_USAGE)
+    if interval < 0:
+        return CommandResult(False, f"Interval must be non-negative\n{_POLITE_USAGE}")
+
+    agent.set_polite(interval=interval)
+    return CommandResult(
+        True,
+        f"Polite mode enabled (interval {interval}s)",
+        {"action": "enabled", "interval": interval},
+    )
+
+
 # ---------------------------------------------------------------------------
 # /queue — shared data extraction
 # ---------------------------------------------------------------------------
@@ -355,18 +435,19 @@ class QueueItemDisplay:
 def format_queue_items(queue) -> list[QueueItemDisplay]:
     """Format queue items for display.
 
-    Includes the currently running item (if any) followed by pending items.
+    The currently running item (if any) is included first, WITHOUT a
+    deletable index number (index=0).  Pending items are then numbered
+    1..N so that the numbers shown to the user match the indices accepted
+    by ``/delete q N`` (which operates on pending items only).
     Returns structured data — each UI renders in its own format.
     """
     result = []
-    idx = 0
 
-    # Include currently running item (not in list_items())
+    # Running item: shown as a header, not numbered (not deletable)
     if queue.current:
-        idx += 1
         result.append(
             QueueItemDisplay(
-                index=idx,
+                index=0,
                 text=queue.current.text,
                 interrupt=queue.current.interrupt,
                 priority=queue.current.priority,
@@ -374,12 +455,11 @@ def format_queue_items(queue) -> list[QueueItemDisplay]:
             )
         )
 
-    # Include pending items
-    for item in queue.list_items():
-        idx += 1
+    # Pending items numbered 1..N — matches /delete q indexing
+    for i, item in enumerate(queue.list_items(), start=1):
         result.append(
             QueueItemDisplay(
-                index=idx,
+                index=i,
                 text=item.text,
                 interrupt=item.interrupt,
                 priority=item.priority,

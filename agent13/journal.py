@@ -226,7 +226,9 @@ class JournalManager:
             )
             return False, "No messages in context"
 
-        if not self.history.has_tool_calls():
+        if not self.history.has_tool_calls() or (
+            self.history.count_tool_turns() == 0
+        ):
             log_journal_debug(
                 "journal_all",
                 {
@@ -235,20 +237,19 @@ class JournalManager:
                     "messages_count": len(self.history.messages),
                 },
             )
-            return False, "No tool-using turns to journal"
+            # Even with no tool turns to compact, sweep any scattered
+            # priming pairs left behind by journal-on's tail-tracking,
+            # then leave one fresh pair at the tail.
+            removed = self.history.remove_all_priming_pairs()
+            self.history.append_priming_pair()
+            if removed:
+                return True, (
+                    f"No tool-using turns to journal "
+                    f"(swept {removed} priming pair(s))"
+                )
+            return True, "No tool-using turns to journal"
 
         total_turns = self.history.count_tool_turns()
-        if total_turns == 0:
-            log_journal_debug(
-                "journal_all",
-                {
-                    "step": "early_return",
-                    "reason": "zero_tool_turns",
-                    "messages_count": len(self.history.messages),
-                },
-            )
-            return False, "No tool-using turns to journal"
-
         total_tokens_before = 0
         total_tokens_after = 0
         iteration = 0
@@ -321,11 +322,17 @@ class JournalManager:
         if iteration == 0:
             return False, "No tool-using turns to journal"
 
+        # Sweep all priming pairs left scattered through history by
+        # journal-on's tail-tracking, then append one fresh pair.
+        removed = self.history.remove_all_priming_pairs()
+        self.history.append_priming_pair()
+
         savings = total_tokens_before - total_tokens_after
+        removed_note = f" (swept {removed} priming pair(s))" if removed else ""
         return True, (
             f"Journalled {iteration} turn(s): "
             f"{total_tokens_before}\u2192{total_tokens_after} "
-            f"words (saved {savings})"
+            f"words (saved {savings}){removed_note}"
         )
 
     # ------------------------------------------------------------------
@@ -479,6 +486,12 @@ class JournalManager:
                 if idx not in skip_indices:
                     reflect_messages.append(msg)
 
+        # Strip priming pair from tail before compaction so it doesn't
+        # contaminate the reflection or get caught in the compact boundary.
+        # Only strip if it's at the tail (consecutive tool-turn tracking).
+        # If it's mid-history (abandoned after non-tool turns), leave it.
+        self.history.remove_priming_pair_at_tail()
+
         tool_summary = await self.reflect_on_tool_use(
             skill_names=skill_names,
             messages=reflect_messages,
@@ -521,5 +534,9 @@ class JournalManager:
                 "source": "journal_compact",
             },
         )
+
+        # Append a fresh priming pair at the tail to re-prime the model
+        # toward tool-calling after the journal summary.
+        self.history.append_priming_pair()
 
         return True, tool_summary, tokens_before, tokens_after

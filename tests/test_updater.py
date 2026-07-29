@@ -17,7 +17,9 @@ from agent13.updater import (
     _restore_renamed_scripts_dir,
     cleanup_old_scripts_dir,
     check_for_update,
+    check_and_apply_update,
     perform_update,
+    UpdateStatus,
 )
 from agent13.clipboard import copy_via_system
 
@@ -571,3 +573,195 @@ class TestPerformUpdateWindowsDirRename:
         assert success is True
         assert "0.1.9" in msg
         assert "successfully" in msg
+
+
+class TestCheckAndApplyUpdate:
+    """Tests for the centralized /upgrade flow used by REPL and TUI."""
+
+    def _release(self, tag="0.2.0", wheel_url="https://example.com/wheel.whl"):
+        return {
+            "tag_name": tag,
+            "html_url": "",
+            "wheel_url": wheel_url,
+        }
+
+    def test_unreachable_when_fetch_fails(self, tmp_path):
+        """Should return UNREACHABLE when GitHub can't be reached."""
+        state_file = tmp_path / "last_update_check.json"
+        with (
+            patch("agent13.updater._LAST_CHECK_FILE", state_file),
+            patch("agent13.updater.fetch_latest_release", return_value=None),
+        ):
+            result = check_and_apply_update()
+        assert result.status is UpdateStatus.UNREACHABLE
+        assert "Could not reach" in result.message
+        assert result.remote_tag == ""
+
+    def test_up_to_date_when_not_newer(self, tmp_path):
+        """Should return UP_TO_DATE when remote version equals local."""
+        state_file = tmp_path / "last_update_check.json"
+        with (
+            patch("agent13.updater._LAST_CHECK_FILE", state_file),
+            patch("agent13.updater.fetch_latest_release") as mock_fetch,
+            patch("agent13.updater.__version__", "0.2.0"),
+        ):
+            mock_fetch.return_value = self._release(tag="0.2.0")
+            result = check_and_apply_update()
+        assert result.status is UpdateStatus.UP_TO_DATE
+        assert "0.2.0" in result.message
+        assert result.remote_tag == "0.2.0"
+
+    def test_updated_on_successful_apply(self, tmp_path):
+        """Should return UPDATED when perform_update succeeds."""
+        state_file = tmp_path / "last_update_check.json"
+        with (
+            patch("agent13.updater._LAST_CHECK_FILE", state_file),
+            patch("agent13.updater.fetch_latest_release") as mock_fetch,
+            patch("agent13.updater.__version__", "0.1.8"),
+            patch("agent13.updater.perform_update", return_value=(True, "Installed 0.2.0")),
+        ):
+            mock_fetch.return_value = self._release(tag="0.2.0")
+            result = check_and_apply_update()
+        assert result.status is UpdateStatus.UPDATED
+        assert result.message == "Installed 0.2.0"
+        assert result.remote_tag == "0.2.0"
+        assert "uv tool install" in result.manual_cmd
+
+    def test_failed_when_perform_update_fails(self, tmp_path):
+        """Should return FAILED with manual_cmd fallback when apply fails."""
+        state_file = tmp_path / "last_update_check.json"
+        with (
+            patch("agent13.updater._LAST_CHECK_FILE", state_file),
+            patch("agent13.updater.fetch_latest_release") as mock_fetch,
+            patch("agent13.updater.__version__", "0.1.8"),
+            patch("agent13.updater.perform_update", return_value=(False, "Network error")),
+        ):
+            mock_fetch.return_value = self._release(tag="0.2.0")
+            result = check_and_apply_update()
+        assert result.status is UpdateStatus.FAILED
+        assert result.message == "Network error"
+        assert result.manual_cmd  # non-empty fallback
+
+    def test_failed_when_no_wheel_in_copy_mode(self, tmp_path):
+        """Should return FAILED in copy_mode when no wheel asset exists."""
+        state_file = tmp_path / "last_update_check.json"
+        with (
+            patch("agent13.updater._LAST_CHECK_FILE", state_file),
+            patch("agent13.updater.fetch_latest_release") as mock_fetch,
+            patch("agent13.updater.__version__", "0.1.8"),
+        ):
+            mock_fetch.return_value = self._release(tag="0.2.0", wheel_url="")
+            result = check_and_apply_update(copy_mode=True)
+        assert result.status is UpdateStatus.FAILED
+        assert "No wheel asset" in result.message
+        assert result.manual_cmd == ""
+
+    def test_copied_in_copy_mode_with_wheel(self, tmp_path):
+        """Should return COPIED with manual_cmd when copy_mode and wheel exists."""
+        state_file = tmp_path / "last_update_check.json"
+        with (
+            patch("agent13.updater._LAST_CHECK_FILE", state_file),
+            patch("agent13.updater.fetch_latest_release") as mock_fetch,
+            patch("agent13.updater.__version__", "0.1.8"),
+        ):
+            mock_fetch.return_value = self._release(tag="0.2.0")
+            result = check_and_apply_update(copy_mode=True)
+        assert result.status is UpdateStatus.COPIED
+        assert "uv tool install" in result.manual_cmd
+        assert result.message == result.manual_cmd
+        assert result.remote_tag == "0.2.0"
+
+    def test_cancelled_when_confirm_returns_false(self, tmp_path):
+        """Should return CANCELLED when confirm callback rejects."""
+        state_file = tmp_path / "last_update_check.json"
+        with (
+            patch("agent13.updater._LAST_CHECK_FILE", state_file),
+            patch("agent13.updater.fetch_latest_release") as mock_fetch,
+            patch("agent13.updater.__version__", "0.1.8"),
+            patch("agent13.updater.perform_update") as mock_perform,
+        ):
+            mock_fetch.return_value = self._release(tag="0.2.0")
+            result = check_and_apply_update(confirm=lambda tag: False)
+        assert result.status is UpdateStatus.CANCELLED
+        assert "cancelled" in result.message.lower()
+        assert result.remote_tag == "0.2.0"
+        mock_perform.assert_not_called()  # must not apply when cancelled
+
+    def test_confirm_receives_remote_tag(self, tmp_path):
+        """confirm callback should be called with the remote version tag."""
+        state_file = tmp_path / "last_update_check.json"
+        received_tags = []
+        with (
+            patch("agent13.updater._LAST_CHECK_FILE", state_file),
+            patch("agent13.updater.fetch_latest_release") as mock_fetch,
+            patch("agent13.updater.__version__", "0.1.8"),
+            patch("agent13.updater.perform_update", return_value=(True, "ok")),
+        ):
+            mock_fetch.return_value = self._release(tag="0.3.1")
+            check_and_apply_update(confirm=lambda tag: received_tags.append(tag) or True)
+        assert received_tags == ["0.3.1"]
+
+    def test_confirm_not_called_in_copy_mode(self, tmp_path):
+        """confirm must not be called in copy_mode (non-destructive)."""
+        state_file = tmp_path / "last_update_check.json"
+        confirm_calls = []
+        with (
+            patch("agent13.updater._LAST_CHECK_FILE", state_file),
+            patch("agent13.updater.fetch_latest_release") as mock_fetch,
+            patch("agent13.updater.__version__", "0.1.8"),
+        ):
+            mock_fetch.return_value = self._release(tag="0.2.0")
+            check_and_apply_update(
+                copy_mode=True,
+                confirm=lambda tag: confirm_calls.append(tag) or False,
+            )
+        assert confirm_calls == []
+
+    def test_on_status_called_during_flow(self, tmp_path):
+        """on_status should be called with progress messages."""
+        state_file = tmp_path / "last_update_check.json"
+        messages = []
+        with (
+            patch("agent13.updater._LAST_CHECK_FILE", state_file),
+            patch("agent13.updater.fetch_latest_release") as mock_fetch,
+            patch("agent13.updater.__version__", "0.1.8"),
+            patch("agent13.updater.perform_update", return_value=(True, "done")),
+        ):
+            mock_fetch.return_value = self._release(tag="0.2.0")
+            check_and_apply_update(on_status=messages.append)
+        # At least: "Checking for updates..." and "Update available... Downloading..."
+        assert any("Checking" in m for m in messages)
+        assert any("Downloading" in m for m in messages)
+
+    def test_on_status_not_called_when_up_to_date_apply(self, tmp_path):
+        """on_status 'Downloading' message should not fire when up-to-date."""
+        state_file = tmp_path / "last_update_check.json"
+        messages = []
+        with (
+            patch("agent13.updater._LAST_CHECK_FILE", state_file),
+            patch("agent13.updater.fetch_latest_release") as mock_fetch,
+            patch("agent13.updater.__version__", "0.2.0"),
+        ):
+            mock_fetch.return_value = self._release(tag="0.2.0")
+            check_and_apply_update(on_status=messages.append)
+        # Only the initial "Checking..." fires; no "Downloading" since up-to-date
+        assert any("Checking" in m for m in messages)
+        assert not any("Downloading" in m for m in messages)
+
+    def test_writes_last_check_timestamp(self, tmp_path):
+        """Should update the throttle timestamp so the startup check doesn't nag.
+
+        Regression: the old REPL /upgrade path skipped _write_last_check,
+        causing cli.py's throttled check to keep showing update notices.
+        """
+        state_file = tmp_path / "last_update_check.json"
+        assert not state_file.exists()
+        with (
+            patch("agent13.updater._LAST_CHECK_FILE", state_file),
+            patch("agent13.updater.fetch_latest_release") as mock_fetch,
+            patch("agent13.updater.__version__", "0.1.8"),
+            patch("agent13.updater.perform_update", return_value=(True, "ok")),
+        ):
+            mock_fetch.return_value = self._release(tag="0.2.0")
+            check_and_apply_update()
+        assert state_file.exists()  # timestamp was written

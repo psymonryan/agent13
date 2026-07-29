@@ -17,11 +17,9 @@ and tracking the actual widget mount order.
 
 import asyncio
 import pytest
-from unittest.mock import AsyncMock, MagicMock
-from collections import deque
 import time
 
-from agent13.core import Agent, AgentEvent
+from agent13.core import AgentEvent
 from agent13.events import AgentEventData
 
 
@@ -148,6 +146,7 @@ class RealisticTUIHandlers:
 
         # Real errors: mount error panel immediately
         await self.tracker.mount("ERROR_PANEL", f"✗ Error: {message}")
+
     async def _interrupt_agent_loop_sim(self):
         """Simulates _interrupt_agent_loop — mounts interrupt panel immediately.
 
@@ -237,7 +236,7 @@ async def test_interrupt_respects_queue_ordering():
         f"\nExpected TOOL_RESULT (pos {tool_pos}) to render BEFORE "
         f"INTERRUPT (pos {interrupt_pos}).\n\n"
         f"Mount order:\n" + "\n".join(f"  {i}: {wtype} - {content}"
-                                       for i, (wtype, content) in enumerate(order))
+                                      for i, (wtype, content) in enumerate(order))
     )
 
 
@@ -361,7 +360,6 @@ async def test_concurrent_events_preserve_order():
         f"Interrupt position: {interrupt_pos}\n"
         f"Order: {order}"
     )
-
 
 
 @pytest.mark.asyncio

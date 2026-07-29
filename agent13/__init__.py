@@ -125,6 +125,8 @@ __all__ = [
     "AgentStatus",
     "PauseState",
     "SpinnerSpeed",
+    "MessageHistory",
+    "JournalManager",
     # LLM helpers
     "stream_response",
     "stream_response_complete",

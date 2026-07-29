@@ -176,17 +176,23 @@ class TokenTimingTracker:
 
         self._session_elapsed_start = time.time()
 
-    def turn_end(self) -> None:
-        """Mark the end of a turn. Increments turn count and accumulates time."""
+    def turn_end(self) -> float | None:
+        """Mark the end of a turn. Increments turn count and accumulates time.
+
+        Returns the duration of the turn in seconds, or None if turn_start
+        was not called.
+        """
         import time
 
         if self._session_elapsed_start is None:
-            return  # turn_start not called — no-op
+            return None  # turn_start not called — no-op
 
         now = time.time()
-        self._total_processing_time += now - self._session_elapsed_start
+        duration = now - self._session_elapsed_start
+        self._total_processing_time += duration
         self._turn_count += 1
         self._session_elapsed_start = None
+        return duration
 
     @property
     def session_elapsed(self) -> float:

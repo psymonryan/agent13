@@ -61,6 +61,36 @@ def ensure_default_config() -> None:
         logging.getLogger(__name__).warning("Failed to copy default config: %s", e)
 
 
+# Default .env bundled with the package
+DEFAULT_ENV_FILE = Path(__file__).parent / "default_env"
+
+
+def ensure_default_env() -> None:
+    """Copy default .env to the user's home directory if none exists.
+
+    Mirrors ensure_default_config(): provides a starter .env for new users.
+    Only ~/.env is created (never ./.env); existing files are never overwritten.
+    """
+    env_file = get_global_env_file()
+
+    # If .env already exists, don't overwrite
+    if env_file.exists():
+        return
+
+    # Check if we have a default .env to copy
+    if not DEFAULT_ENV_FILE.exists():
+        return
+
+    # Copy default .env
+    try:
+        env_file.write_text(DEFAULT_ENV_FILE.read_text())
+    except OSError as e:
+        # Log warning but don't fail
+        import logging
+
+        logging.getLogger(__name__).warning("Failed to copy default .env: %s", e)
+
+
 @dataclass
 class ProviderConfig:
     """Configuration for an LLM provider.
@@ -180,6 +210,8 @@ class Config:
     update_check_interval_hours: float = 24
     clipboard_method: str = "osc52"
     saves_location: str = "local"
+    bell_threshold: float = 0.0  # Seconds before bell on long turns (0 = always)
+    bell_enabled: bool = True  # Whether bell is active
 
     @classmethod
     def from_file(cls, path: Optional[Path] = None) -> "Config":
@@ -328,6 +360,16 @@ class Config:
             if isinstance(loc, str) and loc in ("central", "local"):
                 config.saves_location = loc
 
+        # Parse [bell] section
+        bell_data = data.get("bell", {})
+        if isinstance(bell_data, dict):
+            bt = bell_data.get("threshold", 0)
+            if isinstance(bt, (int, float)):
+                config.bell_threshold = float(bt)
+            be = bell_data.get("enabled", True)
+            if isinstance(be, bool):
+                config.bell_enabled = be
+
         config.validate()
         return config
 
@@ -346,11 +388,7 @@ class Config:
         if not path.exists():
             return cls()
 
-        try:
-            return cls.from_file(path)
-        except ValueError:
-            # Invalid config - re-raise
-            raise
+        return cls.from_file(path)
 
     def get_provider(self, name: str) -> Optional[ProviderConfig]:
         """Get a provider by name.
@@ -416,6 +454,9 @@ def load_environment() -> None:
 
     if _environment_loaded:
         return
+
+    # Ensure a starter ~/.env exists (mirrors ensure_default_config)
+    ensure_default_env()
 
     # Load global .env first
     global_env = get_global_env_file()

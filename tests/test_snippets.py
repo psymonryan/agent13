@@ -144,18 +144,39 @@ class TestSnippetManager:
         assert "2 snippets" in repr(sm)
 
     def test_load_corrupt_file(self, temp_dir):
-        """Should handle corrupt YAML gracefully."""
+        """Should raise on corrupt YAML (fail-fast)."""
+        import pytest
+        import yaml
+
         path = os.path.join(temp_dir, "snippets.yaml")
         with open(path, "w") as f:
             f.write("{{{{invalid yaml")
-        sm = SnippetManager(config_path=path)
-        assert sm.snippets == {}
+        with pytest.raises(yaml.YAMLError):
+            SnippetManager(config_path=path)
 
     def test_load_non_dict_file(self, temp_dir):
-        """Should handle non-dict YAML gracefully."""
+        """Should raise on non-dict YAML (fail-fast)."""
+        import pytest
+
         path = os.path.join(temp_dir, "snippets.yaml")
         with open(path, "w") as f:
             f.write("- item1\n- item2\n")
+        with pytest.raises(ValueError, match="Expected a YAML mapping"):
+            SnippetManager(config_path=path)
+
+    def test_load_non_string_value(self, temp_dir):
+        """Should raise on non-string snippet value (fail-fast)."""
+        import pytest
+
+        path = os.path.join(temp_dir, "snippets.yaml")
+        with open(path, "w") as f:
+            f.write("count: 42\n")
+        with pytest.raises(ValueError, match="must be a string"):
+            SnippetManager(config_path=path)
+
+    def test_missing_file_ok(self, temp_dir):
+        """Should return empty dict when file is missing (first run)."""
+        path = os.path.join(temp_dir, "nonexistent.yaml")
         sm = SnippetManager(config_path=path)
         assert sm.snippets == {}
 

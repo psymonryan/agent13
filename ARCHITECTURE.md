@@ -95,16 +95,16 @@ The `Agent` class is the central orchestrator. Key responsibilities:
 
 The agent has distinct states managed by the `AgentStatus` enum:
 
-| Status         | Meaning                            |
-| -------------- | ---------------------------------- |
-| `INITIALISING` | Agent created, not yet running     |
-| `IDLE`         | No active processing               |
-| `WAITING`      | Waiting for queue item             |
-| `THINKING`     | LLM is generating reasoning tokens |
-| `PROCESSING`   | LLM is generating content tokens   |
-| `TOOLING`      | Executing tool calls               |
-| `JOURNALING`   | Compacting context via journal     |
-| `PAUSED`       | Paused at a safe point             |
+| Status         | Meaning                               |
+| -------------- | ------------------------------------- |
+| `INITIALISING` | Agent created, not yet running        |
+| `IDLE`         | No active processing                  |
+| `WAITING`      | Waiting for queue item or polite lock |
+| `THINKING`     | LLM is generating reasoning tokens    |
+| `PROCESSING`   | LLM is generating content tokens      |
+| `TOOLING`      | Executing tool calls                  |
+| `JOURNALING`   | Compacting context via journal        |
+| `PAUSED`       | Paused at a safe point                |
 
 ### Pause State
 
@@ -126,37 +126,39 @@ This replaces the previous `_paused`/`_pausing` booleans which could admit the i
 
 All events are defined in the `AgentEvent` enum. Event data is carried in `AgentEventData`, which wraps a `data: dict` with convenience properties.
 
-| Event                 | When Emitted                             |
-| --------------------- | ---------------------------------------- |
-| `STARTED`             | Agent `run()` begins                     |
-| `STOPPED`             | Agent `run()` ends                       |
-| `INTERRUPTED`         | User cancelled current operation         |
-| `PAUSED`              | Agent paused at safe point               |
-| `RESUMED`             | Agent resumed from pause                 |
-| `QUEUE_UPDATE`        | Queue contents change                    |
-| `ITEM_STARTED`        | A queued item begins processing          |
-| `USER_MESSAGE`        | User message added to queue              |
-| `ASSISTANT_TOKEN`     | Content token from LLM stream            |
-| `ASSISTANT_REASONING` | Reasoning token from LLM stream          |
-| `ASSISTANT_COMPLETE`  | Response finished (no tool calls)        |
-| `TOOL_CALL`           | Tool execution starts                    |
-| `TOOL_RESULT`         | Tool execution completes                 |
-| `STATUS_CHANGE`       | Agent status transitions                 |
-| `ERROR`               | Error occurs                             |
-| `NOTIFICATION`        | User notification with optional duration |
-| `MODEL_CHANGE`        | Model switched at runtime                |
-| `TOKEN_USAGE`         | Token usage stats from stream            |
-| `JOURNAL_COMPACT`     | History compacted via journal mode       |
-| `JOURNAL_RESULT`      | Journal command completed                |
-| `INTERRUPT_INJECTED`  | Interrupt message injected mid-turn      |
-| `STREAM_START`        | Start of each LLM stream                 |
-| `MCP_SERVER_STARTED`  | MCP server being connected               |
-| `MCP_SERVER_READY`    | MCP server connected, tools available    |
-| `MCP_SERVER_ERROR`    | MCP server connection failed             |
-| `MCP_SERVER_STDERR`   | MCP server stderr output                 |
-| `MESSAGES_CLEARED`    | `/clear` completed at safe boundary      |
-| `CONTEXT_LOADED`      | `/load` completed at safe boundary       |
-| `RETRY_STARTED`       | `/retry` completed at safe boundary      |
+| Event                 | When Emitted                                       |
+| --------------------- | -------------------------------------------------- |
+| `STARTED`             | Agent `run()` begins                               |
+| `STOPPED`             | Agent `run()` ends                                 |
+| `INTERRUPTED`         | User cancelled current operation                   |
+| `PAUSED`              | Agent paused at safe point                         |
+| `RESUMED`             | Agent resumed from pause                           |
+| `QUEUE_UPDATE`        | Queue contents change                              |
+| `ITEM_STARTED`        | A queued item begins processing                    |
+| `USER_MESSAGE`        | User message added to queue                        |
+| `ASSISTANT_TOKEN`     | Content token from LLM stream                      |
+| `ASSISTANT_REASONING` | Reasoning token from LLM stream                    |
+| `ASSISTANT_COMPLETE`  | Response finished (no tool calls)                  |
+| `TOOL_CALL`           | Tool execution starts                              |
+| `TOOL_RESULT`         | Tool execution completes                           |
+| `STATUS_CHANGE`       | Agent status transitions                           |
+| `ERROR`               | Error occurs                                       |
+| `NOTIFICATION`        | User notification with optional duration           |
+| `MODEL_CHANGE`        | Model switched at runtime                          |
+| `TOKEN_USAGE`         | Token usage stats from stream                      |
+| `JOURNAL_COMPACT`     | History compacted via journal mode                 |
+| `JOURNAL_RESULT`      | Journal command completed                          |
+| `INTERRUPT_INJECTED`  | Interrupt message injected mid-turn                |
+| `STREAM_START`        | Start of each LLM stream                           |
+| `MCP_SERVER_STARTED`  | MCP server being connected                         |
+| `MCP_SERVER_READY`    | MCP server connected, tools available              |
+| `MCP_SERVER_ERROR`    | MCP server connection failed                       |
+| `MCP_SERVER_STDERR`   | MCP server stderr output                           |
+| `MESSAGES_CLEARED`    | `/clear` completed at safe boundary                |
+| `CONTEXT_LOADED`      | `/load` completed at safe boundary                 |
+| `POLITE_WAITING`      | Waiting for shared provider lock (elapsed seconds) |
+| `POLITE_ACQUIRED`     | Lock won, turn proceeding                          |
+| `RETRY_STARTED`       | `/retry` completed at safe boundary                |
 
 ### Event Data
 
@@ -611,7 +613,7 @@ Checks GitHub releases for new versions and performs in-place upgrades:
 
 ### MCP Manager (`agent13/mcp.py`)
 
-The MCP (Model Context Protocol) system allows external tool servers. It uses a reconnect-per-operation pattern for reliability - each tool call reconnects to the server, executes, and disconnects.
+The MCP (Model Context Protocol) system allows external tool servers. It uses persistent connections for reliability - servers stay connected for the session, with transparent reconnect-on-failure (one attempt) before surfacing errors.
 
 ```text
 ┌────────────────────────────────────────────────┐
@@ -762,7 +764,7 @@ The `SkillManager` scans these directories for `SKILL.md` files, parses the fron
 | `permissive-closed`  | Project dir | Anywhere    | Blocked |
 | `restrictive-open`   | Project dir | Project dir | Allowed |
 | `restrictive-closed` | Project dir | Project dir | Blocked |
-| `none`               | Anywhere    | Anywhere    | Allowed |
+| `off`                | Anywhere    | Anywhere    | Allowed |
 
 The default mode is `permissive-open` on all platforms. Override with the `sandbox_mode` config option or `--sandbox` CLI flag.
 

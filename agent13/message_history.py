@@ -491,6 +491,72 @@ class MessageHistory:
 
         # assistant without tool_calls -> already complete, nothing to do
 
+    def is_priming_pair_at_tail(self) -> bool:
+        """Check if the last two messages are a priming pair.
+
+        A priming pair is a user message with the priming prompt followed by
+        an assistant message with the priming response ("ok").
+
+        Returns:
+            True if the last two messages match the priming pair pattern.
+        """
+        from agent13.prompts import PRIMING_PROMPT, PRIMING_RESPONSE
+
+        if len(self.messages) < 2:
+            return False
+        user_msg = self.messages[-2]
+        asst_msg = self.messages[-1]
+        return (
+            user_msg.get("role") == "user"
+            and user_msg.get("content") == PRIMING_PROMPT
+            and asst_msg.get("role") == "assistant"
+            and asst_msg.get("content") == PRIMING_RESPONSE
+        )
+
+    def remove_priming_pair_at_tail(self) -> bool:
+        """Remove the priming pair if it's at the tail.
+
+        Returns:
+            True if a pair was removed, False otherwise.
+        """
+        if self.is_priming_pair_at_tail():
+            self.messages.pop()
+            self.messages.pop()
+            return True
+        return False
+
+    def remove_all_priming_pairs(self) -> int:
+        """Remove all priming pairs from anywhere in history.
+
+        Returns:
+            Number of pairs removed.
+        """
+        from agent13.prompts import PRIMING_PROMPT, PRIMING_RESPONSE
+
+        removed = 0
+        i = 0
+        while i < len(self.messages) - 1:
+            user_msg = self.messages[i]
+            asst_msg = self.messages[i + 1]
+            if (
+                user_msg.get("role") == "user"
+                and user_msg.get("content") == PRIMING_PROMPT
+                and asst_msg.get("role") == "assistant"
+                and asst_msg.get("content") == PRIMING_RESPONSE
+            ):
+                del self.messages[i : i + 2]
+                removed += 1
+            else:
+                i += 1
+        return removed
+
+    def append_priming_pair(self) -> None:
+        """Append a fresh priming pair at the tail."""
+        from agent13.prompts import PRIMING_PROMPT, PRIMING_RESPONSE
+
+        self.messages.append({"role": "user", "content": PRIMING_PROMPT})
+        self.messages.append({"role": "assistant", "content": PRIMING_RESPONSE})
+
     def compact(
         self,
         tool_summary: str,

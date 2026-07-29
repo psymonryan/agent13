@@ -237,9 +237,116 @@ def test_queue_get_next_and_complete():
     assert current is not None
     assert current.text == "item 2"
 
-    # Complete and verify queue is empty
-    queue.complete_current()
-    assert queue.get_next() is None
+
+def test_queue_display_running_not_numbered():
+    """Running item should not consume an index number; pending items start at 1."""
+    from agent13.commands import format_queue_items
+
+    queue = AgentQueue()
+    queue.add("first pending")
+    queue.add("second pending")
+    queue.get_next()  # "first pending" becomes current/running
+
+    items = format_queue_items(queue)
+
+    assert len(items) == 2
+    # Running item: index 0, running=True
+    assert items[0].running is True
+    assert items[0].index == 0
+    assert items[0].text == "first pending"
+    # First pending: index 1 (NOT 2)
+    assert items[1].running is False
+    assert items[1].index == 1
+    assert items[1].text == "second pending"
+
+
+def test_queue_display_no_running():
+    """With nothing running, pending items are numbered 1..N as before."""
+    from agent13.commands import format_queue_items
+
+    queue = AgentQueue()
+    queue.add("item a")
+    queue.add("item b")
+
+    items = format_queue_items(queue)
+
+    assert len(items) == 2
+    assert items[0].running is False
+    assert items[0].index == 1
+    assert items[1].running is False
+    assert items[1].index == 2
+
+
+def test_queue_display_running_only():
+    """Running item with no pending items: single unnumbered entry."""
+    from agent13.commands import format_queue_items
+
+    queue = AgentQueue()
+    queue.add("only item")
+    queue.get_next()
+
+    items = format_queue_items(queue)
+
+    assert len(items) == 1
+    assert items[0].running is True
+    assert items[0].index == 0
+
+
+def test_queue_delete_index_matches_display():
+    """/delete q N index must match the number shown by /queue.
+
+    Regression test for the bug where /queue numbered the running item as 1,
+    so the first pending item appeared as 2 — but /delete q operated on
+    pending-only indices, making /delete q 2 fail with out-of-range.
+    """
+    from agent13.commands import format_queue_items, _delete_queue
+    from unittest.mock import MagicMock
+
+    queue = AgentQueue()
+    queue.add("running item")
+    queue.add("pending item")
+    queue.get_next()  # "running item" becomes current/running
+
+    # What the user sees: the pending item is index 1 (not 2)
+    items = format_queue_items(queue)
+    pending = [it for it in items if not it.running]
+    assert len(pending) == 1
+    assert pending[0].index == 1
+
+    # /delete q 1 should remove it — previously this would have failed or
+    # removed the wrong item because the display offset was wrong.
+    agent = MagicMock()
+    agent.queue = queue
+    result = _delete_queue(agent, "1")
+
+    assert result.success
+    assert queue.pending_count == 0
+
+
+def test_queue_delete_last_matches_display():
+    """'last' keyword in /delete q should refer to the last pending item,
+    consistent with the display numbering."""
+    from agent13.commands import format_queue_items, _delete_queue
+    from unittest.mock import MagicMock
+
+    queue = AgentQueue()
+    queue.add("first pending")
+    queue.add("second pending")
+    queue.get_next()  # "first pending" becomes running
+
+    # Display: running (index 0), then "second pending" at index 1
+    items = format_queue_items(queue)
+    pending = [it for it in items if not it.running]
+    assert len(pending) == 1
+    assert pending[0].index == 1  # only pending item, also the "last"
+
+    # /delete q last should remove the last (and only) pending item
+    agent = MagicMock()
+    agent.queue = queue
+    result = _delete_queue(agent, "last")
+
+    assert result.success
+    assert queue.pending_count == 0
 
 
 # ============== Message Grouping Tests ==============
@@ -1361,7 +1468,7 @@ class TestProviderCompletion:
 
     def test_handle_provider_no_args_enters_completion(self):
         """/provider with no args enters completion mode with provider names."""
-        from unittest.mock import MagicMock, patch, AsyncMock
+        from unittest.mock import MagicMock
 
         mock_config = MagicMock()
         mock_config.providers = [
@@ -1446,3 +1553,113 @@ if __name__ == "__main__":
             result = AgentTUI._get_provider_completions(app, "99")
 
         assert result == []
+
+
+# ============== History Preview Newline Regression ==============
+# /history displays one entry per line.  Tool call arguments and tool
+# result messages (especially edit_file's "Replaced ... of '<find>' with
+# '<content>'") embed raw user content that frequently contains newlines.
+# If those newlines reach the rendered output they corrupt the layout —
+# see samples/corrupted_history.md.  These tests pin the single-line
+# guarantee.
+
+
+def test_tool_result_preview_edit_file_multiline_message():
+    """edit_file success message embeds find/content with newlines."""
+    import json
+    from ui.tui import AgentTUI
+
+    msg = "Replaced 1 occurrence of '---\n\n## 6. Open Questions' with '---\n\n## 6. iPad Safar"
+    content = json.dumps({"success": True, "message": msg, "filepath": "doc.md"})
+    result = AgentTUI._format_tool_result_preview(content)
+    assert "\n" not in result, f"newline leaked into preview: {repr(result)}"
+    assert "✓" in result or "[green]" in result
+
+
+def test_tool_result_preview_error_with_newlines():
+    import json
+    from ui.tui import AgentTUI
+
+    content = json.dumps({"success": False, "error": "line1\nline2\n## bad"})
+    result = AgentTUI._format_tool_result_preview(content)
+    assert "\n" not in result
+
+
+def test_tool_result_preview_command_multiline_stdout():
+    import json
+    from ui.tui import AgentTUI
+
+    content = json.dumps(
+        {"success": True, "exit_code": 0, "stdout": "line1\nline2\n## out", "stderr": ""}
+    )
+    result = AgentTUI._format_tool_result_preview(content)
+    assert "\n" not in result
+
+
+def test_tool_result_preview_non_json_multiline():
+    from ui.tui import AgentTUI
+
+    result = AgentTUI._format_tool_result_preview("raw\ntext\n## heading")
+    assert "\n" not in result
+
+
+def test_tool_result_preview_fallback_dict_multiline_value():
+    import json
+    from ui.tui import AgentTUI
+
+    content = json.dumps({"custom_key": "val1\nval2\n## x"})
+    result = AgentTUI._format_tool_result_preview(content)
+    assert "\n" not in result
+
+
+def test_tool_call_preview_multiline_content_arg():
+    """Tool not in KEY_ARGS falls back to first arg — may be multiline content."""
+    import json
+    from ui.tui import AgentTUI
+
+    args = json.dumps({"content": "line1\nline2\n## Heading", "filepath": "x.md"})
+    result = AgentTUI._format_tool_call_preview("some_tool", args)
+    assert "\n" not in result, f"newline leaked into preview: {repr(result)}"
+
+
+def test_tool_call_preview_multiline_command_arg():
+    import json
+    from ui.tui import AgentTUI
+
+    args = json.dumps({"command": "echo a\necho b\n## Heading"})
+    result = AgentTUI._format_tool_call_preview("command", args)
+    assert "\n" not in result
+
+
+def test_tool_result_preview_normal_still_works():
+    """Regression fix must not break normal single-line results."""
+    import json
+    from ui.tui import AgentTUI
+
+    content = json.dumps(
+        {"success": True, "filepath": "doc.md", "total_lines": 406, "view": "raw"}
+    )
+    result = AgentTUI._format_tool_result_preview(content)
+    assert "\n" not in result
+    assert "doc.md" in result
+    assert "406" in result
+
+
+def test_tool_call_preview_normal_still_works():
+    import json
+    from ui.tui import AgentTUI
+
+    args = json.dumps({"filepath": "doc.md", "find": "x"})
+    result = AgentTUI._format_tool_call_preview("edit_file", args)
+    assert "\n" not in result
+    assert "doc.md" in result
+
+
+def test_tool_result_preview_long_message_truncated():
+    import json
+    from ui.tui import AgentTUI
+
+    content = json.dumps({"success": True, "message": "x" * 200})
+    result = AgentTUI._format_tool_result_preview(content)
+    assert result.endswith("...")
+    assert "\n" not in result

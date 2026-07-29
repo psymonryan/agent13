@@ -68,6 +68,7 @@ class TestExpandFileMentions:
         f.write_text("tilde content")
         # Mock expanduser to map ~/anything to tmp_path/anything
         original_expanduser = os.path.expanduser
+
         def mock_expanduser(path):
             if path.startswith("~/"):
                 return str(tmp_path) + "/" + path[2:]

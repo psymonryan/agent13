@@ -31,7 +31,6 @@ from agent13 import (
     skill_manager_ctx,
     init_debug,
     get_config,
-    __version__
 )
 from ui.display import RichDisplay
 from agent13.timing import TokenTimingTracker
@@ -53,10 +52,9 @@ from agent13.commands import (
     format_queue_items,
     format_history_groups,
 )
-from agent13.status import toggle_enum, get_tool_stats_summary
+from agent13.status import get_tool_stats_summary
 from agent13.sandbox import (
     parse_sandbox_mode,
-    format_all_sandbox_modes,
     get_default_sandbox_mode,
 )
 from tools.security import (
@@ -95,6 +93,7 @@ COMMANDS = {
     "/mcp": "Show MCP server status: /mcp [connect|disconnect|reload]",
     "/cwd": "Show or change working directory: /cwd [path]",
     "/upgrade": "Check for and apply updates",
+    "/polite": "Multi-agent lock coordination: /polite N | /polite off",
 }
 
 
@@ -148,7 +147,6 @@ def _sanitize(text: str, max_len: int = 120) -> str:
     return text
 
 
-
 def _display_loaded_messages(agent) -> None:
     """Display loaded conversation messages to the console.
 
@@ -192,7 +190,9 @@ def _display_loaded_messages(agent) -> None:
                 if tc_id:
                     pending_tool_calls[tc_id] = (tc_name, tc_args)
                     # Show tool name and brief args
-                    args_brief = tc_args[:100] + "..." if len(tc_args) > 100 else tc_args
+                    args_brief = (
+                        tc_args[:100] + "..." if len(tc_args) > 100 else tc_args
+                    )
                     print(f"    Tool: {tc_name}({args_brief})")
 
         elif role == "tool":
@@ -223,6 +223,7 @@ async def run_repl(
     output_path: Optional[str] = None,
     model_names: Optional[list[str]] = None,
     read_files: list[str] | None = None,
+    polite_interval: float | None = None,
 ):
     """Run the agent in interactive REPL mode.
 
@@ -342,6 +343,10 @@ async def run_repl(
     if config and config.mcp_servers:
         agent.set_mcp_servers(config.mcp_servers)
 
+    # Enable polite mode if requested (--polite N)
+    if polite_interval is not None:
+        agent.set_polite(interval=polite_interval)
+
     # Load previous session if --continue
     if continue_session:
         from agent13.persistence import find_latest_auto_save, load_context
@@ -369,7 +374,7 @@ async def run_repl(
     _processing_start_time: Optional[float] = None
     _session_start_time: float = time.time()
     _last_turn_duration: Optional[float] = None  # seconds
-    _last_turn_end_time: Optional[float] = None   # epoch
+    _last_turn_end_time: Optional[float] = None  # epoch
 
     # ── Event handlers ───────────────────────────────────────────────
     # Wire agent events to RichDisplay (chat content) and OutputController
@@ -547,6 +552,7 @@ async def run_repl(
     # Inject files from --read flag if provided
     if read_files:
         from agent13.file_injection import build_read_message
+
         read_msg = build_read_message(read_files)
         await agent.add_message(read_msg)
 
@@ -623,9 +629,7 @@ async def run_repl(
                     else:
                         in_multi_mode = False
                         print("  Multi-line mode cancelled (empty)")
-                        user_input = await loop.run_in_executor(
-                            None, read_with_prompt
-                        )
+                        user_input = await loop.run_in_executor(None, read_with_prompt)
                         continue
                 elif user_input in ("/quit", "/exit"):
                     in_multi_mode = False
@@ -635,43 +639,31 @@ async def run_repl(
                     in_multi_mode = False
                     multi_buffer = []
                     print("  Multi-line input cancelled")
-                    user_input = await loop.run_in_executor(
-                        None, read_with_prompt
-                    )
+                    user_input = await loop.run_in_executor(None, read_with_prompt)
                     continue
                 else:
                     multi_buffer.append(user_input)
-                    user_input = await loop.run_in_executor(
-                        None, read_multi_prompt
-                    )
+                    user_input = await loop.run_in_executor(None, read_multi_prompt)
                     continue
             # ── Backslash continuation (enter multi-line mode) ──
             if not in_multi_mode and not from_multi and user_input.endswith("\\"):
                 in_multi_mode = True
                 multi_buffer = [user_input[:-1]]  # strip trailing backslash
                 print("  Multi-line mode (\\). End with . on its own line.")
-                user_input = await loop.run_in_executor(
-                    None, read_multi_prompt
-                )
+                user_input = await loop.run_in_executor(None, read_multi_prompt)
                 continue
             if not user_input:
                 if agent.is_idle:
                     # Agent is idle — just re-show the prompt
-                    user_input = await loop.run_in_executor(
-                        None, read_with_prompt
-                    )
+                    user_input = await loop.run_in_executor(None, read_with_prompt)
                 else:
                     # Agent is streaming — switch to streaming, wait for Enter
                     output_ctrl.unfreeze()
-                    user_input = await loop.run_in_executor(
-                        None, read_no_prompt
-                    )
+                    user_input = await loop.run_in_executor(None, read_no_prompt)
                     # Back to input mode (freeze set in read_no_prompt finally)
                     if not user_input.strip():
                         # Another empty — show prompt
-                        user_input = await loop.run_in_executor(
-                            None, read_with_prompt
-                        )
+                        user_input = await loop.run_in_executor(None, read_with_prompt)
                 continue
 
             # ── Slash commands ────────────────────────────────────
@@ -687,11 +679,11 @@ async def run_repl(
                     print("\n  Commands:")
                     for c, desc in COMMANDS.items():
                         print(f"    {c:12s}  {desc}")
-                    print(
-                        "\n  Press Enter (empty line) to switch between modes."
-                    )
+                    print("\n  Press Enter (empty line) to switch between modes.")
                     print("  - Streaming mode: output flows, no prompt.")
-                    print("  - Input mode: prompt shown, output pauses, type your message.")
+                    print(
+                        "  - Input mode: prompt shown, output pauses, type your message."
+                    )
 
                 elif cmd == "/status":
                     from agent13.status import gather_status, format_duration
@@ -699,8 +691,12 @@ async def run_repl(
 
                     # Build last-turn info if available
                     sd = gather_status(
-                        agent, provider, model,
-                        _session_start_time, prompt_manager, tracker,
+                        agent,
+                        provider,
+                        model,
+                        _session_start_time,
+                        prompt_manager,
+                        tracker,
                     )
                     # Add last-turn data from local tracking
                     if _last_turn_duration is not None:
@@ -715,9 +711,13 @@ async def run_repl(
                     print(f"    run time:  {sd.run_time}")
                     print(f"    cwd:       {sd.cwd}")
                     if sd.last_turn_duration:
-                        print(f"    last turn: {sd.last_turn_duration} (completed {sd.last_turn_ago})")
+                        print(
+                            f"    last turn: {sd.last_turn_duration} (completed {sd.last_turn_ago})"
+                        )
                     if sd.turn_count > 0:
-                        print(f"    turns:     {sd.turn_count} | total processing: {sd.total_processing}")
+                        print(
+                            f"    turns:     {sd.turn_count} | total processing: {sd.total_processing}"
+                        )
                     print()
                     print("  Provider")
                     print(f"    provider:  {sd.provider}")
@@ -732,17 +732,25 @@ async def run_repl(
                     print()
                     print("  Connectivity")
                     print(f"    mcp: {sd.mcp_status}")
-                    tools_str = f"{sd.tool_successes}/{sd.tool_calls}" if sd.tool_calls > 0 else "0"
+                    tools_str = (
+                        f"{sd.tool_successes}/{sd.tool_calls}"
+                        if sd.tool_calls > 0
+                        else "0"
+                    )
                     print()
                     print("  Tools")
                     print(f"    success/calls: {tools_str}")
                     print()
                     print("  Settings")
                     print(f"    sandbox:           {sd.sandbox_mode}")
-                    print(f"    remove-reasoning:  {'on' if sd.remove_reasoning else 'off'}")
+                    print(
+                        f"    remove-reasoning:  {'on' if sd.remove_reasoning else 'off'}"
+                    )
                     print(f"    devel:             {'on' if sd.devel_mode else 'off'}")
                     print(f"    skills:            {'on' if sd.skills_mode else 'off'}")
-                    print(f"    journal:           {'on' if sd.journal_mode else 'off'}")
+                    print(
+                        f"    journal:           {'on' if sd.journal_mode else 'off'}"
+                    )
                     print()
 
                 elif cmd == "/pause":
@@ -754,7 +762,9 @@ async def run_repl(
                         print("  Nothing to pause (agent is idle)")
                     else:
                         agent.pause()
-                        print("  Pausing at next safe point \u2014 use /resume to cancel")
+                        print(
+                            "  Pausing at next safe point \u2014 use /resume to cancel"
+                        )
 
                 elif cmd == "/resume":
                     if agent.is_paused or agent.is_pausing:
@@ -815,7 +825,9 @@ async def run_repl(
                             if not agent.is_idle:
                                 # Defer the load to a safe boundary
                                 await agent.request_load(str(path))
-                                print("  Load queued (will take effect after current response)")
+                                print(
+                                    "  Load queued (will take effect after current response)"
+                                )
                             else:
                                 # Load immediately
                                 try:
@@ -825,7 +837,9 @@ async def run_repl(
                                     if success:
                                         print(f"  {msg}")
                                         if incomplete:
-                                            print("  Warning: Incomplete turn. Use /resume to continue.")
+                                            print(
+                                                "  Warning: Incomplete turn. Use /resume to continue."
+                                            )
                                         _display_loaded_messages(agent)
                                     else:
                                         print(f"  Error: {msg}")
@@ -836,9 +850,7 @@ async def run_repl(
                     in_multi_mode = True
                     multi_buffer = []
                     print("  Multi-line mode. End with . on its own line.")
-                    user_input = await loop.run_in_executor(
-                        None, read_multi_prompt
-                    )
+                    user_input = await loop.run_in_executor(None, read_multi_prompt)
                     continue
 
                 elif cmd == "/clear":
@@ -849,9 +861,13 @@ async def run_repl(
                     else:
                         # Queue the clear so it happens at a safe boundary
                         await agent.request_clear(clear_widgets=False)
-                        print("  Clear queued (will take effect after current response)")
+                        print(
+                            "  Clear queued (will take effect after current response)"
+                        )
                     if clear_all:
-                        print("  (Note: /clear all has no effect in REPL — no scrollback to clear)")
+                        print(
+                            "  (Note: /clear all has no effect in REPL — no scrollback to clear)"
+                        )
 
                 elif cmd == "/history":
                     if not agent.messages:
@@ -864,16 +880,26 @@ async def run_repl(
                             print(f"  {g.number:3d}. {g.first_role}: {first_content}")
                             for entry in g.entries:
                                 if entry.role == "tool":
-                                    print(f"         tool result: {_sanitize(entry.content, 80)}")
+                                    print(
+                                        f"         tool result: {_sanitize(entry.content, 80)}"
+                                    )
                                 elif entry.role == "assistant":
                                     if entry.content:
-                                        print(f"         assistant: {_sanitize(entry.content, 80)}")
+                                        print(
+                                            f"         assistant: {_sanitize(entry.content, 80)}"
+                                        )
                                     for tc in entry.tool_calls:
-                                        print(f"         tool call: {tc['name']}({_sanitize(tc['arguments'], 60)})")
+                                        print(
+                                            f"         tool call: {tc['name']}({_sanitize(tc['arguments'], 60)})"
+                                        )
                                 elif entry.is_interrupt:
-                                    print(f"         interrupt: {_sanitize(entry.content)}")
+                                    print(
+                                        f"         interrupt: {_sanitize(entry.content)}"
+                                    )
                                 elif entry.content:
-                                    print(f"         {entry.role}: {_sanitize(entry.content)}")
+                                    print(
+                                        f"         {entry.role}: {_sanitize(entry.content)}"
+                                    )
                         print("\n  Use /delete h N to delete group N")
 
                 elif cmd == "/queue":
@@ -881,15 +907,23 @@ async def run_repl(
                     if not items:
                         print("  Queue is empty")
                     else:
-                        print(f"\n  Queue ({len(items)} items):")
+                        pending_count = sum(1 for it in items if not it.running)
+                        print(f"\n  Queue ({pending_count} pending):")
                         for item in items:
                             marker = ""
                             if item.interrupt:
                                 marker = "!! "
                             elif item.priority:
                                 marker = "!  "
-                            status = " (running)" if item.running else ""
-                            print(f"  {marker}{item.index}. {_sanitize(item.text, 80)}{status}")
+                            if item.running:
+                                # Running item: header line, no index number
+                                print(
+                                    f"  {marker}→ {_sanitize(item.text, 80)} (running)"
+                                )
+                            else:
+                                print(
+                                    f"  {marker}{item.index}. {_sanitize(item.text, 80)}"
+                                )
 
                 elif cmd == "/retry":
                     result = execute_retry(agent)
@@ -918,7 +952,9 @@ async def run_repl(
                     if args == "on":
                         agent.journal_mode = True
                         print("  Journal mode enabled")
-                        print("  Context will be compacted via reflection before each new message.")
+                        print(
+                            "  Context will be compacted via reflection before each new message."
+                        )
                     elif args == "off":
                         agent.journal_mode = False
                         print("  Journal mode disabled")
@@ -933,8 +969,12 @@ async def run_repl(
                         print("  Usage: /journal [on|off|last|all|status]")
                         print("    /journal on      - Enable context compaction")
                         print("    /journal off     - Disable context compaction")
-                        print("    /journal last    - Journal the most recent tool-using turn")
-                        print("    /journal all     - Journal all tool-using turns iteratively")
+                        print(
+                            "    /journal last    - Journal the most recent tool-using turn"
+                        )
+                        print(
+                            "    /journal all     - Journal all tool-using turns iteratively"
+                        )
                         print("    /journal status  - Show current state")
 
                 elif cmd == "/model":
@@ -947,11 +987,11 @@ async def run_repl(
                                 print(f"  {i}. {name}{marker}")
                             print()
                         else:
-                            print("  No models loaded. Use /provider to switch providers.")
+                            print(
+                                "  No models loaded. Use /provider to switch providers."
+                            )
                     else:
-                        model = resolve_model_selection(
-                            agent.available_models, cmd_arg
-                        )
+                        model = resolve_model_selection(agent.available_models, cmd_arg)
                         if model:
                             agent.set_model(model)
                             print(f"  Model set to: {model}")
@@ -983,17 +1023,13 @@ async def run_repl(
                             print(f"  {i}. {name}{marker}")
                         print()
                         print("  Use /provider <name> to switch")
-                        user_input = await loop.run_in_executor(
-                            None, read_with_prompt
-                        )
+                        user_input = await loop.run_in_executor(None, read_with_prompt)
                         continue
                     # Resolve numeric selection to provider name
                     resolved = resolve_provider_selection(cmd_arg)
                     if resolved is None:
                         # resolve_provider_selection prints its own error
-                        user_input = await loop.run_in_executor(
-                            None, read_with_prompt
-                        )
+                        user_input = await loop.run_in_executor(None, read_with_prompt)
                         continue
                     try:
                         base_url, api_key, read_timeout, connect_timeout = (
@@ -1001,9 +1037,7 @@ async def run_repl(
                         )
                     except ValueError as e:
                         print(f"  Error: {e}")
-                        user_input = await loop.run_in_executor(
-                            None, read_with_prompt
-                        )
+                        user_input = await loop.run_in_executor(None, read_with_prompt)
                         continue
                     new_client = create_client(
                         base_url,
@@ -1037,16 +1071,17 @@ async def run_repl(
                         current = get_current_sandbox_mode()
                         session = get_session_sandbox_mode()
                         config_default = get_default_sandbox_mode()
-                        print(f"\n  Sandbox Configuration:")
+                        print("\n  Sandbox Configuration:")
                         print(f"    Current mode: {current.value}")
                         if session:
                             print(f"    Session override: {session.value}")
                         else:
-                            print(f"    Session override: none (using config default)")
+                            print("    Session override: none (using config default)")
                         print(f"    Config default: {config_default.value}")
                         print()
                         # Print available modes (plain text)
                         from agent13.sandbox import SandboxMode
+
                         for mode in SandboxMode:
                             print(f"    - {mode.value}")
                         print()
@@ -1086,10 +1121,14 @@ async def run_repl(
                         print("  No tool calls yet this session")
                     else:
                         rate = summary["success_rate"]
-                        print(f"\n  Tool Usage  {summary['total_successes']}/{summary['total_calls']} successful ({rate:.0f}%)")
+                        print(
+                            f"\n  Tool Usage  {summary['total_successes']}/{summary['total_calls']} successful ({rate:.0f}%)"
+                        )
                         print()
                         for tool in summary["per_tool"]:
-                            print(f"    {tool['name']}  {tool['successes']}/{tool['calls']}")
+                            print(
+                                f"    {tool['name']}  {tool['successes']}/{tool['calls']}"
+                            )
 
                 elif cmd == "/mcp":
                     args = cmd_arg.strip().lower()
@@ -1120,8 +1159,8 @@ async def run_repl(
                         # List MCP servers
                         if not agent.mcp:
                             configured = len(agent._mcp_server_configs)
-                            print(f"\n  MCP Status:")
-                            print(f"    Status: Not initialized")
+                            print("\n  MCP Status:")
+                            print("    Status: Not initialized")
                             print(f"    Configured servers: {configured}")
                             print()
                             print("  Use /mcp connect to connect to MCP servers.")
@@ -1129,7 +1168,7 @@ async def run_repl(
                             servers = agent.mcp.get_server_info()
                             if not servers:
                                 configured = len(agent._mcp_server_configs)
-                                print(f"\n  MCP Status:")
+                                print("\n  MCP Status:")
                                 print(f"    Configured servers: {configured}")
                                 print()
                                 print("  Use /mcp connect to connect to servers.")
@@ -1156,49 +1195,58 @@ async def run_repl(
                 elif cmd == "/upgrade":
                     try:
                         from agent13.updater import (
-                            fetch_latest_release,
-                            _is_newer,
-                            perform_update,
-                            _build_manual_command,
+                            check_and_apply_update,
+                            UpdateStatus,
                         )
-                        release = fetch_latest_release()
-                        if release is None:
-                            print("  Could not reach GitHub releases API.")
+
+                        def _confirm(tag: str) -> bool:
+                            try:
+                                c = input(f"  Update to {tag}? [y/N] ")
+                            except (EOFError, KeyboardInterrupt):
+                                return False
+                            return c.strip().lower() in ("y", "yes")
+
+                        result = check_and_apply_update(confirm=_confirm)
+
+                        if result.status is UpdateStatus.UPDATED:
+                            print(f"  {result.message}")
+                            print("  Restart agent13 to use the new version.")
+                        elif result.status is UpdateStatus.UP_TO_DATE:
+                            print(f"  {result.message}")
+                        elif result.status is UpdateStatus.CANCELLED:
+                            print(f"  {result.message}")
+                        elif result.status is UpdateStatus.UNREACHABLE:
+                            print(f"  {result.message}")
                             print("  You can manually upgrade with:")
                             print("    uv tool install --force agent13")
-                        elif not _is_newer(release["tag_name"], __version__):
-                            print("  Already on the latest version.")
-                        else:
-                            tag = release["tag_name"]
-                            print(f"  New version available: {tag}")
-                            try:
-                                confirm = input(f"  Update to {tag}? [y/N] ")
-                            except (EOFError, KeyboardInterrupt):
-                                confirm = ""
-                            if confirm.strip().lower() in ("y", "yes"):
-                                ok, msg = perform_update()
-                                if ok:
-                                    print(f"  {msg}")
-                                    print("  Restart agent13 to use the new version.")
-                                else:
-                                    print(f"  Update failed: {msg}")
-                                    print("  Manual install:")
-                                    cmd_str = _build_manual_command(release)
-                                    print(f"    {cmd_str}")
+                        elif result.status is UpdateStatus.FAILED:
+                            print(f"  Update failed: {result.message}")
+                            if result.manual_cmd:
+                                print("  Manual install:")
+                                print(f"    {result.manual_cmd}")
                             else:
-                                print("  Update cancelled.")
+                                print("  No wheel asset available for manual install.")
                     except Exception as e:
                         print(f"  Update check failed: {e}")
+
+                elif cmd == "/polite":
+                    from agent13.commands import execute_polite
+
+                    result = execute_polite(agent, cmd_arg)
+                    if result.success:
+                        print(f"  {result.message}")
+                    else:
+                        # Usage/error — print multi-line message indented
+                        for line in result.message.splitlines():
+                            print(f"  {line}")
 
                 else:
                     print(f"  Unknown command: {user_input}")
                     print("  Type /help for available commands")
 
-               # Stay in input mode unless entering streaming mode
+                # Stay in input mode unless entering streaming mode
                 if not enter_streaming:
-                    user_input = await loop.run_in_executor(
-                        None, read_with_prompt
-                    )
+                    user_input = await loop.run_in_executor(None, read_with_prompt)
                     continue
                 # else: fall through to STREAMING MODE below
 
@@ -1235,9 +1283,7 @@ async def run_repl(
                         " at next natural boundary\n"
                     )
                 else:
-                    output_ctrl.write(
-                        "[priority] Sent \u2014 will process next\n"
-                    )
+                    output_ctrl.write("[priority] Sent \u2014 will process next\n")
             elif agent.is_idle:
                 # Agent is idle — send immediately
                 _processing_start_time = time.time()
@@ -1264,9 +1310,7 @@ async def run_repl(
                 continue
             else:
                 # Empty Enter — show prompt for input
-                user_input = await loop.run_in_executor(
-                    None, read_with_prompt
-                )
+                user_input = await loop.run_in_executor(None, read_with_prompt)
 
     except (KeyboardInterrupt, EOFError) as exc:
         is_eof = isinstance(exc, EOFError)
@@ -1292,7 +1336,7 @@ async def run_repl(
         if agent.messages:
             from agent13.persistence import save_context, get_auto_save_path
 
-            auto_path = get_auto_save_path()
+            auto_path = get_auto_save_path(session_date=agent.session_date)
             try:
                 save_context(agent, auto_path)
                 print(f"\nSession saved to {auto_path}")

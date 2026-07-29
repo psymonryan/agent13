@@ -139,7 +139,7 @@ def _try_expand(candidate: str, base_dir: Path) -> str | None:
     if len(data) > DEFAULT_MAX_EMBED_BYTES:
         return None
 
-    if not _is_probably_text(data):
+    if not is_probably_text(data):
         return None
 
     try:
@@ -150,13 +150,18 @@ def _try_expand(candidate: str, base_dir: Path) -> str | None:
     return f'<file path="{candidate}">\n{content}\n</file>'
 
 
-def _is_probably_text(data: bytes) -> bool:
-    """Heuristic: reject data with null bytes or too many non-printables."""
+def is_probably_text(data: bytes) -> bool:
+    """Heuristic: is ``data`` text or binary?
+
+    Rejects data with null bytes or a high ratio (>10%) of non-printable
+    bytes. Shared by file_injection, read_file, and edit_file so they all
+    agree on what counts as binary.
+    """
     if not data:
         return True
     if b"\x00" in data:
         return False
-    non_text = sum(1 for b in data if b <= 31 and b not in (9, 10, 11, 12, 13) or b == 127)
+    non_text = sum(1 for b in data if (b <= 31 and b not in (9, 10, 11, 12, 13)) or b == 127)
     return (non_text / len(data)) < 0.1
 
 
@@ -218,7 +223,7 @@ def build_read_message(
             )
             continue
 
-        if not _is_probably_text(data):
+        if not is_probably_text(data):
             parts.append(
                 f'\n<file_error path="{path_str}">Binary file, not embedded</file_error>'
             )

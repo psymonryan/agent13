@@ -1,6 +1,7 @@
 """Agent core class - event-driven agent implementation."""
 
 import asyncio
+import datetime
 import json
 import re
 from dataclasses import dataclass, field
@@ -11,6 +12,7 @@ from openai import AsyncOpenAI
 
 from agent13.events import AgentEvent, AgentEventData, EventHandler
 from agent13.journal import JournalManager
+from agent13.polite import PoliteLock
 from agent13.message_history import MessageHistory
 from agent13.prompts import DEFAULT_PROMPT
 from agent13.queue import AgentQueue, QueueItem
@@ -59,8 +61,11 @@ def _sanitize_json_args(tool_name: str, raw: str) -> str:
     except (json.JSONDecodeError, TypeError):
         log_error(
             Exception("malformed tool call arguments"),
-            {"context": "sanitize_json_args", "name": tool_name,
-             "arguments": raw[:200] if raw else ""},
+            {
+                "context": "sanitize_json_args",
+                "name": tool_name,
+                "arguments": raw[:200] if raw else "",
+            },
         )
         return "{}"
 
@@ -262,6 +267,10 @@ class Agent:
         self._devel_mode = devel_mode
         self._skills_mode = skills_mode
         self.execute_tool = execute_tool
+        # Session date: stable for the lifetime of the session.
+        # Used in the system prompt to prevent midnight date changes
+        # from invalidating the KV cache prefix.
+        self.session_date = datetime.date.today().isoformat()
         # Available models list (populated by caller or set_client)
         self.available_models: list[str] = []
         self.response_format = response_format
@@ -279,6 +288,9 @@ class Agent:
         self._pause_state = PauseState.RUNNING
         self._pause_event = asyncio.Event()
         self._pause_event.set()  # Not paused by default
+        # When True, run() enters PAUSING state immediately after startup
+        # (used by ESC-during-polite-wait to pause instead of cancel).
+        self._pause_on_start = False
 
         # Token usage tracking
         self.prompt_tokens = 0
@@ -294,6 +306,12 @@ class Agent:
 
         # Incomplete turn tracking (set when loading a saved incomplete context)
         self._incomplete_turn_loaded: bool = False
+        # Set by /resume to signal run() to call continue_incomplete_turn()
+        # at the next loop iteration (inside run(), not a separate task).
+        self._incomplete_turn_pending: bool = False
+
+        # Polite mode (multi-agent lock coordination); None = disabled.
+        self.polite_lock: Optional[PoliteLock] = None
 
         # Journal manager for context compaction
         self.journal = JournalManager(
@@ -403,6 +421,7 @@ class Agent:
             self.system_prompt,
             tools,
             tool_choice=tool_choice,
+            session_date=self.session_date,
         ):
             if event_type == "token_usage":
                 # Store as source of truth for context size
@@ -479,6 +498,13 @@ class Agent:
         if was_paused:
             await self.emit(AgentEvent.RESUMED, {})
 
+        # ESC-during-polite-wait: re-enter pausing state so the loop
+        # blocks at _wait_if_paused() on the very first iteration.
+        if self._pause_on_start:
+            self._pause_on_start = False
+            self._pause_state = PauseState.PAUSING
+            self._pause_event.clear()
+
         # Transition from INITIALISING to IDLE
         await self._set_status(AgentStatus.IDLE)
         await self.emit(AgentEvent.STARTED, {})
@@ -492,11 +518,62 @@ class Agent:
                 if not self._running or self._stop_event.is_set():
                     break
 
+                # Continue an incomplete turn from a loaded context.
+                # Triggered by /resume (sets _incomplete_turn_pending via
+                # request_continue_incomplete). Runs inside run() so there's
+                # exactly one agent task driving the pause state machine.
+                if self._incomplete_turn_pending:
+                    self._incomplete_turn_pending = False
+                    await self.continue_incomplete_turn()
+                    # Return to IDLE so the TUI shows "ready" after the
+                    # continued turn finishes (mirrors _process_item's
+                    # _set_status(IDLE) at its end).
+                    await self._set_status(AgentStatus.IDLE)
+                    continue
+                # Peek at the next item (without removing it) to decide
+                # whether we need the polite lock. Acquiring the lock BEFORE
+                # get_next() means the item stays in the pending queue during
+                # the wait — so /delete q N can remove it and ESC can cancel
+                # the wait cleanly without orphaning a "current" item.
+                next_item = self.queue.peek_next()
+
+                if (
+                    next_item
+                    and self.polite_lock is not None
+                    and next_item.kind not in ("clear", "load")
+                ):
+                    # Set WAITING status so the TUI knows we're busy (processing=True).
+                    # This makes ESC work and is_queued check pass during the polite wait.
+                    await self._set_status(AgentStatus.WAITING)
+                    try:
+                        await self.polite_lock.acquire()
+                    except asyncio.CancelledError:
+                        # ESC or task cancellation during polite wait.
+                        # The item is still in the pending queue (not yet
+                        # pulled as current), so nothing to clean up —
+                        # just break so the loop restarts fresh.
+                        await self._set_status(AgentStatus.IDLE)
+                        break
+                    _polite_acquired = True
+
+                    # The item may have been removed from the queue (via
+                    # /delete q N) while we were waiting for the lock.
+                    # If so, release the lock and loop back — nothing to
+                    # process.
+                    if next_item not in self.queue.items:
+                        if self.polite_lock is not None:
+                            self.polite_lock.release()
+                        _polite_acquired = False
+                        await self._set_status(AgentStatus.IDLE)
+                        continue
+                else:
+                    _polite_acquired = False
+
                 # Get next item from queue
                 current = self.queue.get_next()
 
                 if current:
-                    await self._process_item(current)
+                    await self._process_item(current, _polite_acquired)
 
                     # If a CancelledError was absorbed in _process_item,
                     # exit the loop cleanly so the ESC handler can restart
@@ -584,8 +661,7 @@ class Agent:
         Single source of truth for both REPL and TUI.
         """
         return (
-            self._pause_state == PauseState.RUNNING
-            and self._status == AgentStatus.IDLE
+            self._pause_state == PauseState.RUNNING and self._status == AgentStatus.IDLE
         )
 
     @property
@@ -597,6 +673,15 @@ class Agent:
         """Mark that the agent has an incomplete turn (called on load)."""
         self._incomplete_turn_loaded = incomplete
 
+    def request_continue_incomplete(self) -> None:
+        """Signal run() to continue an incomplete turn at the next iteration.
+
+        Called by the TUI's /resume when has_incomplete_turn is True. Sets
+        _incomplete_turn_pending so run()'s loop picks it up — no separate
+        task needed, avoiding concurrent-task races in the pause state machine.
+        """
+        self._incomplete_turn_pending = True
+
     async def continue_incomplete_turn(self) -> bool:
         """Continue an incomplete turn by executing pending tools or calling LLM.
 
@@ -604,6 +689,17 @@ class Agent:
         It handles two cases:
         1. Last message is assistant with tool_calls -> execute pending tools
         2. Last message is tool -> call LLM to process results
+
+        Polite mode (if enabled) is honoured: the shared lock is acquired
+        before any work and released in the ``finally`` safety net, mirroring
+        ``_process_item``. ``_polite_acquired`` is forwarded to ``_llm_turn``
+        so the lock is released during tool execution and re-acquired before
+        each LLM stream. Without this, a ``--continue`` + ``/resume`` of an
+        incomplete turn would silently bypass polite coordination.
+
+        Pause safe-points are checked after each tool result (mirroring
+        ``_llm_turn``'s tool loop) so ``/pause`` during the pending-tools
+        branch takes effect promptly instead of running to completion.
 
         Returns:
             True if continuation was started, False if no continuation needed.
@@ -614,71 +710,117 @@ class Agent:
         # Clear the flag first
         self._incomplete_turn_loaded = False
 
-        # Check the state of messages
-        pending_tools = self.history.get_pending_tool_calls()
+        # Ensure _running is True so _llm_turn's `while self._running` loop
+        # executes. run() normally sets this before calling us, but direct
+        # callers (e.g. tests) may not have it set.
+        self._running = True
+        self._stop_event.clear()
 
-        if pending_tools:
-            # Case 1: We have pending tool calls to execute
-            # Execute each pending tool
-            for tc in pending_tools:
-                if not self._running:
-                    break
+        # Transition to WAITING immediately so the UI reflects activity
+        # before the first LLM token arrives (mirrors _process_item).
+        # Without this, /resume on a loaded incomplete turn leaves the
+        # status at IDLE for the entire LLM latency window.
+        await self._set_status(AgentStatus.WAITING)
 
-                name = tc["name"]
-                args_str = tc["arguments"]
+        # Polite mode: acquire the shared lock before any work, mirroring
+        # run()'s acquire-before-get_next(). The turn is already loaded
+        # into self.messages (no queue item to peek), so we acquire
+        # unconditionally when polite mode is on. Cancellation-safe: on
+        # CancelledError the lock is released (via acquire()'s own
+        # BaseException handler) before propagating.
+        _polite_acquired = False
+        if self.polite_lock is not None:
+            try:
+                await self.polite_lock.acquire()
+                _polite_acquired = True
+            except asyncio.CancelledError:
+                # ESC or task cancellation during the polite wait.
+                # acquire() already released any hold; just restore IDLE
+                # and re-raise so the caller can clean up.
+                await self._set_status(AgentStatus.IDLE)
+                raise
 
-                try:
-                    import json
+        try:
+            # Check the state of messages
+            pending_tools = self.history.get_pending_tool_calls()
 
-                    arguments = json.loads(args_str) if args_str else {}
-                except json.JSONDecodeError:
-                    arguments = {}
+            if pending_tools:
+                # Case 1: We have pending tool calls to execute
+                # Execute each pending tool
+                for tc in pending_tools:
+                    if not self._running:
+                        break
 
-                # Emit tool call event
-                log_tool_call(name, arguments)
-                await self.emit(
-                    AgentEvent.TOOL_CALL,
-                    {
-                        "name": name,
-                        "arguments": arguments,
-                    },
-                )
+                    name = tc["name"]
+                    args_str = tc["arguments"]
 
-                # Execute the tool
-                result = await self._execute_tool_async(name, arguments)
+                    try:
+                        import json
 
-                # Record tool statistics
-                self.tool_stats.record(name, arguments, result)
+                        arguments = json.loads(args_str) if args_str else {}
+                    except json.JSONDecodeError:
+                        arguments = {}
 
-                # Emit result
-                log_tool_result(name, result)
-                await self.emit(
-                    AgentEvent.TOOL_RESULT,
-                    {
-                        "name": name,
-                        "result": result,
-                    },
-                )
+                    # Emit tool call event
+                    log_tool_call(name, arguments)
+                    await self.emit(
+                        AgentEvent.TOOL_CALL,
+                        {
+                            "name": name,
+                            "arguments": arguments,
+                        },
+                    )
 
-                # Add tool result to messages
-                self.messages.append(
-                    {
-                        "role": "tool",
-                        "tool_call_id": tc["id"],
-                        "content": result,
-                    }
-                )
+                    # Execute the tool
+                    result = await self._execute_tool_async(name, arguments)
 
-            # Now call LLM to continue
-            await self._llm_turn()
-            return True
+                    # Record tool statistics
+                    self.tool_stats.record(name, arguments, result)
 
-        elif self.history.has_incomplete_turn():
-            # Case 2: Last message is tool result, call LLM to process
-            await self._llm_turn()
-            return True
+                    # Emit result
+                    log_tool_result(name, result)
+                    await self.emit(
+                        AgentEvent.TOOL_RESULT,
+                        {
+                            "name": name,
+                            "result": result,
+                        },
+                    )
 
-        return False
+                    # Add tool result to messages
+                    self.messages.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": tc["id"],
+                            "content": result,
+                        }
+                    )
+
+                    # Safe pause point - check if pause requested after
+                    # each tool result (mirrors _llm_turn's tool loop).
+                    # Without this, /pause during the pending-tools branch
+                    # shows "Paused" in the TUI but the loop keeps running
+                    # until _llm_turn's own safe point.
+                    await self._wait_if_paused()
+
+                # Now call LLM to continue
+                await self._llm_turn(_polite_acquired=_polite_acquired)
+                return True
+
+            elif self.history.has_incomplete_turn():
+                # Case 2: Last message is tool result, call LLM to process
+                await self._llm_turn(_polite_acquired=_polite_acquired)
+                return True
+
+            return False
+        finally:
+            # Polite mode safety net: release the lock if still held.
+            # _llm_turn normally releases after each LLM stream (before
+            # tool execution), so on normal exit the lock is already free.
+            # This covers error/cancel paths where _llm_turn may not have
+            # had a chance to release.
+            if self.polite_lock is not None and self.polite_lock.is_held():
+                self.polite_lock.release()
 
     @property
     def status(self) -> AgentStatus:
@@ -788,7 +930,7 @@ class Agent:
         Returns:
             List of all tool definitions in OpenAI format
         """
-        from agent13.tools import name_matches
+        from agent13.tools import apply_tool_filter
         from agent13.config import get_config
 
         config = get_config()
@@ -801,12 +943,8 @@ class Agent:
             for tool_schema in mcp.get_openai_tools():
                 tool_name = tool_schema.get("function", {}).get("name", "")
                 # Apply global config filter to MCP tools
-                if enabled:
-                    if not name_matches(tool_name, enabled):
-                        continue
-                elif disabled:
-                    if name_matches(tool_name, disabled):
-                        continue
+                if not apply_tool_filter(tool_name, enabled, disabled):
+                    continue
                 all_tools.append(tool_schema)
         return all_tools
 
@@ -826,11 +964,16 @@ class Agent:
         """Get the MCP manager (may be None if not initialized)."""
         return self._mcp
 
-    async def _process_item(self, item: QueueItem) -> None:
+    async def _process_item(
+        self, item: QueueItem, _polite_acquired: bool = False
+    ) -> None:
         """Process a single queue item.
 
         Args:
             item: The queue item to process
+            _polite_acquired: Whether the polite lock was already acquired
+                by the caller (run()). The lock is released in the finally
+                below if this is True.
         """
         await self._set_status(AgentStatus.WAITING)
 
@@ -910,13 +1053,18 @@ class Agent:
                 from agent13.persistence import load_context
 
                 success, message, incomplete = load_context(self, item.text)
-                log_journal_debug("load_context", {
-                    "success": success,
-                    "message": message,
-                    "messages_count": len(self.messages),
-                    "has_tool_calls": self.history.has_tool_calls(),
-                    "first_3_roles": [m.get("role") for m in self.messages[:3]] if self.messages else [],
-                })
+                log_journal_debug(
+                    "load_context",
+                    {
+                        "success": success,
+                        "message": message,
+                        "messages_count": len(self.messages),
+                        "has_tool_calls": self.history.has_tool_calls(),
+                        "first_3_roles": [m.get("role") for m in self.messages[:3]]
+                        if self.messages
+                        else [],
+                    },
+                )
                 self.queue.complete_current()
                 log_queue_complete(item.id, "complete")
                 await self._emit_queue_update()
@@ -945,7 +1093,7 @@ class Agent:
                 self.messages.append({"role": "user", "content": item.text})
 
                 # Process with LLM (may include multiple tool call rounds)
-                await self._llm_turn()
+                await self._llm_turn(_polite_acquired=_polite_acquired)
 
                 # Stage 12: Run reflection after turn completes
                 await self.journal.maybe_reflect_after_turn()
@@ -972,8 +1120,7 @@ class Agent:
             #   - Absorbing lets the loop survive spurious cancellations
             #     (framework glitches, executor issues) transparently.
             if isinstance(e, asyncio.CancelledError):
-                log_error(e, {"context": "process_item_cancelled",
-                              "item_id": item.id})
+                log_error(e, {"context": "process_item_cancelled", "item_id": item.id})
                 # Repair message history (add [Interrupted] assistant
                 # message if needed) so role alternation is preserved.
                 self.history.repair_interrupted()
@@ -989,9 +1136,7 @@ class Agent:
                 log_queue_complete(item.id, "interrupted")
                 self._cancel_requested = True
             else:
-                llm_error = (
-                    categorize_error(e) if not isinstance(e, LLMError) else e
-                )
+                llm_error = categorize_error(e) if not isinstance(e, LLMError) else e
                 log_error(e, {"context": "process_item", "item_id": item.id})
                 await self.emit(
                     AgentEvent.ERROR,
@@ -1003,19 +1148,47 @@ class Agent:
                 )
                 self.queue.complete_current()
                 log_queue_complete(item.id, "error")
+        finally:
+            # Polite mode: release the shared lock if it's still held.
+            # _llm_turn normally releases after each LLM stream (before tool
+            # execution), so on normal exit the lock is already free. This
+            # is a safety net for error/cancel paths where _llm_turn may
+            # not have had a chance to release.
+            if self.polite_lock is not None and self.polite_lock.is_held():
+                self.polite_lock.release()
 
-        await self._set_status(AgentStatus.IDLE)
+        # Skip IDLE if there are queued items — go straight to WAITING
+        # so the TUI (and bell) never sees "ready" between queue items.
+        # Mirrors the resume path logic above.
+        if self.queue.pending_count > 0:
+            await self._set_status(AgentStatus.WAITING)
+        else:
+            await self._set_status(AgentStatus.IDLE)
 
-    async def _llm_turn(self) -> None:
+    async def _llm_turn(self, _polite_acquired: bool = False) -> None:
         """Execute one LLM turn (may include multiple tool call rounds).
 
         A turn continues until the LLM responds without tool calls.
         Uses streaming for all phases to capture reasoning tokens.
+
+        Args:
+            _polite_acquired: Whether the polite lock was acquired by run().
+                If True, the lock is released after each LLM stream (before
+                tool execution) and re-acquired before the next stream. This
+                frees the GPU for other agents during long-running tools.
         """
         if is_debug_enabled():
             log_tps_event("agent_llm_turn_start", {"note": "Starting new LLM turn"})
         while self._running:
             try:
+                # Polite mode: acquire the lock before each LLM stream (GPU).
+                # On the first iteration, run() already acquired it, so
+                # is_held() is True and we skip. On subsequent iterations
+                # (after tool execution), we re-acquire here.
+                if _polite_acquired and self.polite_lock is not None:
+                    if not self.polite_lock.is_held():
+                        await self.polite_lock.acquire()
+
                 # Stream response, capturing reasoning and tool calls
                 content = ""
                 reasoning = ""
@@ -1073,6 +1246,15 @@ class Agent:
                                     "tool_names": [tc.get("name") for tc in tool_calls],
                                 },
                             )
+
+                # Polite mode: release the lock after streaming completes.
+                # The GPU is no longer needed — tool execution (if any) runs
+                # without the lock so other agents can use the GPU. If there
+                # are no tool calls, we break below and the lock is already
+                # free for the next agent.
+                if _polite_acquired and self.polite_lock is not None:
+                    if self.polite_lock.is_held():
+                        self.polite_lock.release()
 
                 # Handle tool calls if present
                 if tool_calls:
@@ -1196,7 +1378,9 @@ class Agent:
                         interrupt_items = self.queue.pop_interrupt_items()
 
                         # Log the interruption
-                        log_queue_interrupt(self.queue.current.id if self.queue.current else None)
+                        log_queue_interrupt(
+                            self.queue.current.id if self.queue.current else None
+                        )
 
                         # Inject a fake assistant+user pair for each interrupt.
                         # The fake assistant preserves the role sequence so the
@@ -1450,9 +1634,7 @@ class Agent:
         self.model = model
         self.tool_stats.reset()  # Reset stats on model change
 
-    def set_client(
-        self, client: AsyncOpenAI, models: list[str] | None = None
-    ) -> None:
+    def set_client(self, client: AsyncOpenAI, models: list[str] | None = None) -> None:
         """Set the OpenAI client.
 
         Args:
@@ -1490,17 +1672,8 @@ class Agent:
         Args:
             enabled: True to show devel-group tools, False to hide them
         """
-        from agent13.tools import get_filtered_tools
-        from agent13.config import get_config
-
-        config = get_config()
         self._devel_mode = enabled
-        self.tools = get_filtered_tools(
-            devel=enabled,
-            skills=self._skills_mode,
-            enabled_tools=config.enabled_tools or None,
-            disabled_tools=config.disabled_tools or None,
-        )
+        self._rebuild_tools()
 
     @property
     def skills_mode(self) -> bool:
@@ -1513,14 +1686,72 @@ class Agent:
         Args:
             enabled: True to show skills-group tools, False to hide them
         """
+        self._skills_mode = enabled
+        self._rebuild_tools()
+
+    @property
+    def polite_mode(self) -> bool:
+        """Whether polite mode (multi-agent lock coordination) is enabled."""
+        return self.polite_lock is not None
+
+    def set_polite(self, interval: float, provider: Optional[str] = None) -> None:
+        """Enable polite mode with the given poll interval.
+
+        The shared lock is keyed by the backend's base URL (derived from
+        ``self.client.base_url``) so that two agents targeting the same
+        backend coordinate correctly — whether they used a provider name
+        or a raw URL. An explicit ``provider`` override is accepted for
+        testing/diagnostics.
+
+        The lock is acquired at the top of ``_process_item`` and released
+        in its ``finally``. Takes effect on the next ``_process_item``.
+
+        Args:
+            interval: Poll interval N in seconds (pseudo-priority; lower is
+                more aggressive). 0 yields to the event loop each iteration.
+            provider: Optional explicit key for the lock filename. If None,
+                ``str(self.client.base_url)`` is used.
+        """
+        key = provider if provider is not None else str(self.client.base_url)
+        # If already enabled with the same key, just update the interval
+        # (avoids recreating the lock and dropping any in-flight hold).
+        if self.polite_lock is not None and self.polite_lock.provider == key:
+            self.polite_lock.interval = interval
+            return
+        self.polite_lock = PoliteLock(
+            provider=key,
+            interval=interval,
+            emit=self.emit,
+        )
+
+    def disable_polite(self) -> None:
+        """Disable polite mode. Releases the lock if currently held.
+
+        Safe to call when polite mode was never enabled (silent no-op).
+        Takes effect on the next ``_process_item`` (a turn in flight is
+        unaffected).
+        """
+        if self.polite_lock is not None:
+            self.polite_lock.release()
+            self.polite_lock = None
+
+    def _rebuild_tools(self) -> None:
+        """Rebuild ``self.tools`` from current mode flags and config filter.
+
+        Centralizes the ``get_filtered_tools`` call that ``set_devel_mode``
+        and ``set_skills_mode`` both used, so the ``enabled_tools or None``
+        idiom and the devel/skills flag plumbing live in one place. Initial
+        construction still calls ``get_filtered_tools`` directly (via
+        repl/cli/tui) because those sites read the flags from CLI args, not
+        from ``self._devel_mode`` / ``self._skills_mode``.
+        """
         from agent13.tools import get_filtered_tools
         from agent13.config import get_config
 
         config = get_config()
-        self._skills_mode = enabled
         self.tools = get_filtered_tools(
             devel=self._devel_mode,
-            skills=enabled,
+            skills=self._skills_mode,
             enabled_tools=config.enabled_tools or None,
             disabled_tools=config.disabled_tools or None,
         )
@@ -1551,8 +1782,8 @@ class Agent:
             The queue item ID
         """
         item_id = self.queue.add(
-            "", kind="clear",
-            data={"clear_widgets": clear_widgets})
+            "", kind="clear", data={"clear_widgets": clear_widgets}
+        )
         await self._emit_queue_update()
         return item_id
 

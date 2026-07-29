@@ -5,6 +5,47 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] - 2026-07-29
+
+### Added
+
+- feat: add polite mode (--polite N) for multi-agent provider lock coordination
+- feat: enable polite mode by default (interval 10s), --polite off disables
+- feat: release polite lock during tool execution so other agents can use GPU
+- feat: /polite with no args shows current status in yellow instead of red error
+- feat: auto-show queue pane on pending items and polite lock wait
+- feat: info pane toggles open/closed on Enter - press again to reopen last message
+- feat: /snippet list re-reads snippets file before listing
+- feat: Add priming pair to journal compaction to prevent reflection priming
+- Add terminal bell feature: ring bell when turn exceeds N seconds (--bell, /bell, [bell] config)
+- Add MCP SDK 2.0 fallback: auto-inject --with mcp<2 for uvx servers that fail on startup
+- Use stable session date to prevent midnight KV cache invalidation
+- /retry in TUI now loads last message into input for editing instead of auto-requeueing
+- hide skill tool from LLM unless skills opted in
+- implemented fail fast on config files
+- added code to ensure default .env
+- updated sandbox to include ~/Library/Cache
+- added git-core to seatbelt settings
+
+### Fixed
+
+- --mcp now works in batch (-p) mode; was silently ignored outside TUI
+- (windows) replace pgrep with psutil in MCP crash-reconnect test
+- lint cleanup - fix NameError in /load, restore shadowed status tests
+- auth-fail still prompting for model; drop (1-0) from empty-range delete errors
+- fixed dur: disappearing after turn: (was last:) make turn_end() return duration, use dur: label for idle state
+- fixed --continue bug when paused
+- fixes for path traversal
+- fix for stale final token bug
+- fixed history formatting due to tool call text with newlines
+- fixed queue item numbering
+- added status bar refresh after clearing pause state
+- fix for mcp connection persistence
+- fixes for pause/continue/resume
+- fixed duplicate asyncio task when resuming
+- fix for resume when continuing a paused session
+- fixes for uvx mcp version 2 issues
+
 ## [0.2.1] - 2026-06-23
 
 ### Changed

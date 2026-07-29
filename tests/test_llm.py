@@ -38,7 +38,7 @@ class TestBuildMessagesWithSystem:
         assert result[0]["role"] == "system"
         # System prompt now includes date and working directory
         expected_date = datetime.date.today().isoformat()
-        assert result[0]["content"] == f"Today is {expected_date}\nWorking directory: {MOCK_CWD}\n\nYou are helpful."
+        assert result[0]["content"] == f"Session started {expected_date}\nWorking directory: {MOCK_CWD}\n\nYou are helpful."
 
     @patch("agent13.llm._AGENTS_MD_CACHE", None)
     @patch("agent13.llm.Path.cwd", return_value=MOCK_CWD)
@@ -56,7 +56,7 @@ class TestBuildMessagesWithSystem:
         assert result[0]["role"] == "system"
         # System prompt now includes date and working directory
         expected_date = datetime.date.today().isoformat()
-        assert result[0]["content"] == f"Today is {expected_date}\nWorking directory: {MOCK_CWD}\n\nYou are helpful."
+        assert result[0]["content"] == f"Session started {expected_date}\nWorking directory: {MOCK_CWD}\n\nYou are helpful."
         assert result[1] == {"role": "user", "content": "Hello"}
         assert result[2] == {"role": "assistant", "content": "Hi there!"}
 
@@ -71,7 +71,7 @@ class TestBuildMessagesWithSystem:
 
         # System prompt now includes date and working directory
         expected_date = datetime.date.today().isoformat()
-        assert result[0]["content"].startswith(f"Today is {expected_date}\nWorking directory: {MOCK_CWD}\n\n")
+        assert result[0]["content"].startswith(f"Session started {expected_date}\nWorking directory: {MOCK_CWD}\n\n")
         assert "tool using AI assistant" in result[0]["content"]
 
     @patch("agent13.llm._AGENTS_MD_CACHE", None)
@@ -97,7 +97,7 @@ class TestBuildMessagesWithSystem:
         assert len(result) == 1
         assert result[0]["role"] == "system"
         expected_date = datetime.date.today().isoformat()
-        expected = f"Today is {expected_date}\nWorking directory: {MOCK_CWD}\n\nYou are helpful.\n\nGuidance for this project:\n# Test Guidance\n\nSome test content."
+        expected = f"Session started {expected_date}\nWorking directory: {MOCK_CWD}\n\nYou are helpful.\n\nGuidance for this project:\n# Test Guidance\n\nSome test content."
         assert result[0]["content"] == expected
 
     @patch("agent13.llm._AGENTS_MD_CACHE", None)
@@ -112,7 +112,29 @@ class TestBuildMessagesWithSystem:
         # Should still work, just without AGENTS.md content
         assert len(result) == 1
         expected_date = datetime.date.today().isoformat()
-        assert result[0]["content"] == f"Today is {expected_date}\nWorking directory: {MOCK_CWD}\n\nYou are helpful."
+        assert result[0]["content"] == f"Session started {expected_date}\nWorking directory: {MOCK_CWD}\n\nYou are helpful."
+
+    @patch("agent13.llm._AGENTS_MD_CACHE", None)
+    @patch("agent13.llm.Path.cwd", return_value=MOCK_CWD)
+    def test_session_date_parameter(self, mock_getcwd):
+        """Should use provided session_date instead of today."""
+        messages = []
+        result = build_messages_with_system(
+            messages, "You are helpful.", session_date="2026-01-15"
+        )
+
+        assert len(result) == 1
+        assert result[0]["content"] == f"Session started 2026-01-15\nWorking directory: {MOCK_CWD}\n\nYou are helpful."
+
+    @patch("agent13.llm._AGENTS_MD_CACHE", None)
+    @patch("agent13.llm.Path.cwd", return_value=MOCK_CWD)
+    def test_session_date_defaults_to_today(self, mock_getcwd):
+        """Should use today's date when session_date is None."""
+        messages = []
+        result = build_messages_with_system(messages, "You are helpful.")
+
+        expected_date = datetime.date.today().isoformat()
+        assert f"Session started {expected_date}" in result[0]["content"]
 
 
 class TestHandleToolCalls:

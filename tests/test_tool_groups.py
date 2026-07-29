@@ -12,6 +12,7 @@ from tools import (  # noqa: E402
     get_filtered_tools,
     get_tool_groups,
     name_matches,
+    apply_tool_filter,
     _ensure_discovered,
 )
 
@@ -73,6 +74,47 @@ class TestNameMatches:
 
     def test_mixed_glob_and_regex(self):
         assert name_matches("tui_launch", ["read_*", "re:^tui.*"]) is True
+
+# --- apply_tool_filter tests ---
+
+
+class TestApplyToolFilter:
+    """Test the apply_tool_filter helper.
+
+    This is the shared filter that get_filtered_tools (built-in tools) and
+    Agent.get_all_tools (MCP tools) both use. Verifies the whitelist-takes-
+    precedence rule and that the empty/None case passes everything.
+    """
+
+    def test_no_filters_passes(self):
+        assert apply_tool_filter("read_file", None, None) is True
+        assert apply_tool_filter("read_file", [], []) is True
+
+    def test_whitelist_match_passes(self):
+        assert apply_tool_filter("read_file", ["read_*"], None) is True
+
+    def test_whitelist_non_match_excluded(self):
+        assert apply_tool_filter("write_file", ["read_*"], None) is False
+
+    def test_blacklist_match_excluded(self):
+        assert apply_tool_filter("square_number", None, ["square_*"]) is False
+
+    def test_blacklist_non_match_passes(self):
+        assert apply_tool_filter("read_file", None, ["square_*"]) is True
+
+    def test_whitelist_takes_precedence_over_blacklist(self):
+        """When both are set, whitelist wins and blacklist is ignored.
+
+        'read_file' matches the blacklist 'read_*' but is allowed because the
+        whitelist also matches. 'square_number' matches neither whitelist nor
+        blacklist-by-name but is excluded by the whitelist gate.
+        """
+        assert apply_tool_filter("read_file", ["read_*"], ["read_*"]) is True
+        assert apply_tool_filter("square_number", ["read_*"], ["square_*"]) is False
+
+    def test_regex_whitelist(self):
+        assert apply_tool_filter("tui_launch", ["re:^tui.*"], None) is True
+        assert apply_tool_filter("read_file", ["re:^tui.*"], None) is False
 
 
 # --- get_filtered_tools tests ---

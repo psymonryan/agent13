@@ -1,0 +1,9 @@
+# Default .env - copied to ~/.env on first run if none exists.
+# Edit ~/.env with your real API keys. Local ./.env overrides ~/.env.
+#
+# Keys referenced by default_config.toml providers:
+#   OPENAI_API_KEY      - studio, studio-oMLX, c144, test, green
+#   OPENROUTER_API_KEY  - openrouter
+OPENAI_API_KEY=dummy
+OPENAI_BASE_URL=http://localhost:8012/v1
+OPENROUTER_API_KEY=dummy

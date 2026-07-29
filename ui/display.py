@@ -10,7 +10,6 @@ Provides RichDisplay class that encapsulates all Rich-based output formatting,
 including spinners, markdown rendering, panels, and timing display.
 """
 
-import sys
 import time
 import json
 from typing import Optional
@@ -119,7 +118,6 @@ class RichDisplay:
         self._response_buffer = ""
         self._live_display = None
 
-
         # Add newline after reasoning if we were thinking
         if was_in_reasoning:
             self._print()  # End the thinking line
@@ -200,7 +198,6 @@ class RichDisplay:
                 pass
             finally:
                 self._live_display = None
-
 
         # Show separator in pretty mode
         if self.pretty:

@@ -2,9 +2,9 @@
 
 import os
 import time
+from enum import Enum
 from unittest import mock
 
-import pytest
 
 from agent13.status import (
     StatusData,
@@ -350,9 +350,6 @@ class TestStatusData:
         assert sd.devel_mode is False  # default
 
 # -- Tests for toggle_enum --
-
-
-from enum import Enum
 
 
 class Color(Enum):

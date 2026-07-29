@@ -212,3 +212,40 @@ class TestPromptManager:
 
         assert "PromptManager" in repr_str
         assert "prompts=2" in repr_str  # default + coder
+
+    def test_load_corrupt_file(self, temp_dir):
+        """Should raise on corrupt YAML (fail-fast)."""
+        import pytest
+        import yaml
+
+        path = os.path.join(temp_dir, "prompts.yaml")
+        with open(path, "w") as f:
+            f.write("{{{{invalid yaml")
+        with pytest.raises(yaml.YAMLError):
+            PromptManager(path)
+
+    def test_load_non_dict_file(self, temp_dir):
+        """Should raise on non-dict YAML (fail-fast)."""
+        import pytest
+
+        path = os.path.join(temp_dir, "prompts.yaml")
+        with open(path, "w") as f:
+            f.write("- item1\n- item2\n")
+        with pytest.raises(ValueError, match="Expected a YAML mapping"):
+            PromptManager(path)
+
+    def test_load_non_string_value(self, temp_dir):
+        """Should raise on non-string prompt value (fail-fast)."""
+        import pytest
+
+        path = os.path.join(temp_dir, "prompts.yaml")
+        with open(path, "w") as f:
+            f.write("default: 42\n")
+        with pytest.raises(ValueError, match="must be a string"):
+            PromptManager(path)
+
+    def test_missing_file_ok(self, temp_dir):
+        """Should return empty dict with default when file is missing."""
+        path = os.path.join(temp_dir, "nonexistent.yaml")
+        pm = PromptManager(path)
+        assert "default" in pm.prompts

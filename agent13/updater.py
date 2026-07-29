@@ -24,8 +24,10 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Optional
+from enum import Enum
+from typing import Callable, Optional
 
 import httpx
 
@@ -310,6 +312,144 @@ def format_update_notice(info: dict) -> str:
         "  of ~/.agent13/config.toml"
     )
     return "\n".join(lines)
+
+
+class UpdateStatus(Enum):
+    """Outcome of check_and_apply_update."""
+
+    UPDATED = "updated"  # Upgrade applied successfully
+    UP_TO_DATE = "up_to_date"  # No newer version available
+    CANCELLED = "cancelled"  # User declined the confirm prompt
+    COPIED = "copied"  # Manual command copied to clipboard (copy_mode)
+    FAILED = "failed"  # perform_update failed; manual_cmd is the fallback
+    UNREACHABLE = "unreachable"  # Could not reach GitHub releases API
+
+
+@dataclass
+class UpdateResult:
+    """Structured outcome of check_and_apply_update.
+
+    Attributes:
+        status: Outcome category. Callers render based on this.
+        message: Human-readable detail (success message, failure reason,
+            or "Already on latest..." etc.). Does NOT include a restart hint;
+            callers add context-appropriate hints.
+        manual_cmd: The ``uv tool install --force <wheel_url>`` command, or
+            empty string if no wheel asset was found. Present for FAILED
+            (fallback) and COPIED, and also populated for UPDATED (in case
+            the caller wants to show "or run manually").
+        remote_tag: The remote version tag, or empty string if unreachable.
+    """
+
+    status: UpdateStatus
+    message: str
+    manual_cmd: str = ""
+    remote_tag: str = ""
+
+
+def check_and_apply_update(
+    copy_mode: bool = False,
+    on_status: Optional[Callable[[str], None]] = None,
+    confirm: Optional[Callable[[str], bool]] = None,
+) -> UpdateResult:
+    """Check for an update and optionally apply it.
+
+    Centralizes the ``/upgrade`` flow used by the REPL and TUI: fetch the
+    latest release, write the last-check timestamp, compare versions, then
+    either copy the manual install command (``copy_mode``) or perform the
+    upgrade (after optional user confirmation via ``confirm``).
+
+    Args:
+        copy_mode: If True, do not apply the upgrade. Instead, the manual
+            install command is built and returned in the result with status
+            COPIED. The caller is responsible for the actual clipboard write
+            (keeps this function pure of UI concerns). ``confirm`` is not
+            called in copy mode (copying is non-destructive).
+        on_status: Optional callback for progress messages (e.g.
+            "Checking for updates...", "Downloading and installing...").
+            Called zero or more times. If None, messages are ignored.
+        confirm: Optional callback invoked with the remote tag (e.g.
+            "v0.2.0") before applying the upgrade. Returns True to proceed,
+            False to cancel. If None, the upgrade proceeds without asking.
+            Not called when ``copy_mode`` is True or when no update is
+            available.
+
+    Returns:
+        UpdateResult describing the outcome. Callers decide how to render
+        each status (plain text for REPL, Rich markup for TUI, etc.).
+    """
+    if on_status:
+        on_status("Checking for updates...")
+
+    release = fetch_latest_release()
+    if release is None:
+        return UpdateResult(
+            status=UpdateStatus.UNREACHABLE,
+            message="Could not reach GitHub releases API.",
+        )
+
+    # Record the check timestamp so the throttled startup check (cli.py)
+    # doesn't keep nagging after a /upgrade invocation. Previously the REPL
+    # path skipped this, causing repeated notices.
+    _write_last_check(datetime.now(timezone.utc))
+
+    remote_tag = release["tag_name"]
+    if not _is_newer(remote_tag, __version__):
+        return UpdateResult(
+            status=UpdateStatus.UP_TO_DATE,
+            message=f"Already on latest version ({__version__}).",
+            remote_tag=remote_tag,
+        )
+
+    wheel_url = release.get("wheel_url", "")
+    manual_cmd = _build_manual_command(wheel_url) if wheel_url else ""
+
+    if copy_mode:
+        if not manual_cmd:
+            return UpdateResult(
+                status=UpdateStatus.FAILED,
+                message=(
+                    f"No wheel asset found for {remote_tag}. "
+                    f"Cannot build install command."
+                ),
+                remote_tag=remote_tag,
+            )
+        return UpdateResult(
+            status=UpdateStatus.COPIED,
+            message=manual_cmd,
+            manual_cmd=manual_cmd,
+            remote_tag=remote_tag,
+        )
+
+    if confirm is not None:
+        if not confirm(remote_tag):
+            return UpdateResult(
+                status=UpdateStatus.CANCELLED,
+                message="Update cancelled.",
+                manual_cmd=manual_cmd,
+                remote_tag=remote_tag,
+            )
+
+    if on_status:
+        on_status(
+            f"Update available: {remote_tag} (you have {__version__}). "
+            f"Downloading and installing..."
+        )
+
+    success, message = perform_update()
+    if success:
+        return UpdateResult(
+            status=UpdateStatus.UPDATED,
+            message=message,
+            manual_cmd=manual_cmd,
+            remote_tag=remote_tag,
+        )
+    return UpdateResult(
+        status=UpdateStatus.FAILED,
+        message=message,
+        manual_cmd=manual_cmd,
+        remote_tag=remote_tag,
+    )
 
 
 def perform_update() -> tuple[bool, str]:

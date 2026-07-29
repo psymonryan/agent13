@@ -82,6 +82,41 @@ class TestAgentQueue:
         assert items[1].text == "priority 2"
         assert items[2].text == "normal"
 
+    def test_peek_next(self):
+        """Should return next item without removing it or marking as running."""
+        q = AgentQueue()
+        q.add("item 1")
+        q.add("item 2")
+
+        item = q.peek_next()
+        assert item.text == "item 1"
+        assert item.status == ItemStatus.PENDING  # not changed to RUNNING
+        assert q.current is None  # not set as current
+        assert q.pending_count == 2  # still in the queue
+
+    def test_peek_next_empty_queue(self):
+        """Should return None if queue is empty."""
+        q = AgentQueue()
+        assert q.peek_next() is None
+
+    def test_peek_next_while_running(self):
+        """Should return None if an item is already running."""
+        q = AgentQueue()
+        q.add("item 1")
+        q.add("item 2")
+
+        q.get_next()  # starts processing item 1
+        assert q.peek_next() is None  # can't peek while running
+
+    def test_peek_next_then_get_next_returns_same_item(self):
+        """peek_next and get_next should return the same item."""
+        q = AgentQueue()
+        q.add("item 1")
+
+        peeked = q.peek_next()
+        got = q.get_next()
+        assert peeked is got
+
     def test_get_next(self):
         """Should get next item and mark as running."""
         q = AgentQueue()

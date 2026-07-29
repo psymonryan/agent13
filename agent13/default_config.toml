@@ -21,6 +21,16 @@ location = "local"
 # Change at runtime with: /clipboard osc52  or  /clipboard system
 [clipboard]
 method = "osc52"
+
+# Terminal bell
+# Ring the terminal bell when a turn completes (returns to idle).
+# threshold = 0   → always ring (default)
+# threshold = 30  → only ring if turn took longer than 30 seconds
+# enabled = false → disable entirely
+# Change at runtime with: /bell 30, /bell 0, /bell off, /bell
+[bell]
+enabled = true
+threshold = 0
 # Agent13 Configuration
 # Config directory: ~/.agent13 (or $AGENT13_CONFIG_DIR)
 # Environment: ~/.env then ./.env (local overrides global)
@@ -74,11 +84,13 @@ api_key_env_var = "OPENAI_API_KEY"
 # disabled_tools = []
 
 # MCP Servers - stdio transport (local process)
+# --with mcp<2: pin MCP SDK 1.x — many MCP servers import mcp.server.fastmcp
+#   which was removed in MCP SDK 2.0. Remove once your servers support 2.x.
 [[mcp_servers]]
 name = "web_research"
 transport = "stdio"
 command = "uvx"
-args = ["web-research-assistant"]
+args = ["--with", "mcp<2", "web-research-assistant"]
 env = { "SEARXNG_BASE_URL" = "http://searxng/search" }
 enabled_tools = []
 disabled_tools = []
@@ -87,7 +99,7 @@ disabled_tools = []
 name = "fetch_server"
 transport = "stdio"
 command = "uvx"
-args = ["mcp-server-fetch", "--ignore-robots-txt"]
+args = ["--with", "mcp<2", "mcp-server-fetch", "--ignore-robots-txt"]
 env = {}
 enabled_tools = []
 disabled_tools = []

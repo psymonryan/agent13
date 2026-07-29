@@ -18,7 +18,7 @@ import argparse
 import asyncio
 
 from dotenv import load_dotenv
-from openai import AsyncOpenAI
+from openai import AsyncOpenAI, AuthenticationError
 from ui.display import RichDisplay
 
 from agent13 import (
@@ -79,6 +79,8 @@ async def run_batch_with_display(
     remove_reasoning: bool = False,
     devel_mode: bool = False,
     skills_mode: bool = False,
+    connect_mcp: bool = False,
+    polite_interval: float | None = None,
 ):
     """Run batch mode with Rich display."""
     # Initialize prompt manager
@@ -114,6 +116,24 @@ async def run_batch_with_display(
         devel_mode=devel_mode,
         skills_mode=skills_mode,
     )
+
+    # Connect to MCP servers if requested (mirrors TUI _connect_mcp_on_startup)
+    if connect_mcp and _config.mcp_servers:
+        agent.set_mcp_servers(_config.mcp_servers)
+        try:
+            mcp = await agent._ensure_mcp()
+            if mcp:
+                info = await mcp.connect_all()
+                if info:
+                    print(f"MCP connected: {list(info.keys())}", file=sys.stderr)
+                else:
+                    print("MCP: No servers connected", file=sys.stderr)
+        except Exception as e:
+            print(f"MCP connection error: {e}", file=sys.stderr)
+
+    # Enable polite mode if requested (--polite N)
+    if polite_interval is not None:
+        agent.set_polite(interval=polite_interval)
 
     # Use RichDisplay for pretty mode, simple print for non-pretty
     if pretty:
@@ -168,18 +188,25 @@ async def run_batch_with_display(
         async def on_complete():
             print()  # End response with newline
 
-    # Run batch
-    await run_batch(
-        agent,
-        prompt,
-        read_files=read_files,
-        on_token=on_token,
-        on_reasoning=on_reasoning,
-        on_tool_call=on_tool_call,
-        on_tool_result=on_tool_result,
-        on_error=on_error,
-        on_complete=on_complete,
-    )
+    # Run batch; ensure MCP servers are always disconnected on exit
+    try:
+        await run_batch(
+            agent,
+            prompt,
+            read_files=read_files,
+            on_token=on_token,
+            on_reasoning=on_reasoning,
+            on_tool_call=on_tool_call,
+            on_tool_result=on_tool_result,
+            on_error=on_error,
+            on_complete=on_complete,
+        )
+    finally:
+        if connect_mcp and agent.mcp is not None:
+            try:
+                await agent.disconnect_mcp()
+            except Exception:
+                pass
 
 
 class _HelpFormatter(
@@ -267,7 +294,7 @@ Provider names are read from ~/.agent13/config.toml
     parser.add_argument(
         "--mcp",
         action="store_true",
-        help="Connect to MCP servers on startup (TUI mode only)",
+        help="Connect to MCP servers on startup (TUI and batch modes)",
     )
     parser.add_argument(
         "--skills",
@@ -331,6 +358,25 @@ Provider names are read from ~/.agent13/config.toml
         help="Clipboard method: osc52 (terminal escape sequence) or system (OS clipboard command)",
     )
     parser.add_argument(
+        "--bell",
+        type=str,
+        default=None,
+        metavar="N|off",
+        help="Bell: N seconds threshold (0 = always ring), or 'off' to disable",
+    )
+    parser.add_argument(
+        "--polite",
+        type=str,
+        default="10",
+        metavar="N|off",
+        help=(
+            "Polite mode: wait for a shared provider lock before each turn. "
+            "N is the poll interval in seconds (pseudo-priority; lower = more aggressive). "
+            "'off' disables. Default 10. Agents targeting the same backend coordinate; "
+            "agents without --polite ignore the lock."
+        ),
+    )
+    parser.add_argument(
         "--read",
         nargs="+",
         action="append",
@@ -351,20 +397,35 @@ Provider names are read from ~/.agent13/config.toml
     if args.read:
         args.read = [f for group in args.read for f in group]
 
+    # Parse --polite: "off" -> None (disabled), otherwise float interval.
+    if args.polite is None or args.polite.lower() == "off":
+        args.polite = None
+    else:
+        try:
+            args.polite = float(args.polite)
+        except ValueError:
+            parser.error(f"--polite: expected a number or 'off', got {args.polite!r}")
+
     # --output implies --repl
     if args.output:
         if args.prompt:
-            print("Error: --output cannot be used with -p/--prompt (batch mode)", file=sys.stderr)
-            print("Hint: Use shell redirect instead: agent13 provider -p \"prompt\" > file", file=sys.stderr)
+            print(
+                "Error: --output cannot be used with -p/--prompt (batch mode)",
+                file=sys.stderr,
+            )
+            print(
+                'Hint: Use shell redirect instead: agent13 provider -p "prompt" > file',
+                file=sys.stderr,
+            )
             sys.exit(1)
         args.repl = True
-
 
     # Ensure default skills are available for new users
     ensure_default_skills()
 
     # Ensure default prompts are available for new users
     from agent13.prompts import ensure_default_prompts
+
     ensure_default_prompts()
 
     # Handle --upgrade flag (check + apply, then exit)
@@ -380,6 +441,7 @@ Provider names are read from ~/.agent13/config.toml
 
     # Clean up any stale .old Scripts dir from a previous Windows update
     from agent13.updater import cleanup_old_scripts_dir
+
     cleanup_old_scripts_dir()
 
     # Check for updates (throttled, respects config)
@@ -465,6 +527,13 @@ Provider names are read from ~/.agent13/config.toml
             # Provider is unreachable - no point continuing
             print(f"Error: Provider is unreachable: {e}", file=sys.stderr)
             sys.exit(1)
+        elif isinstance(e.__context__, AuthenticationError):
+            # Auth failed - no point continuing (e.g. invalid API key)
+            print(
+                "Error: Authentication failed. Check your API key.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
         elif args.model == "":
             # --model with no value means "list models" - can't do that without fetching
             print(f"Error: Could not fetch models: {e}", file=sys.stderr)
@@ -490,7 +559,11 @@ Provider names are read from ~/.agent13/config.toml
         model = await select_model(model_names, args.model)
 
     # Initialize prompt manager
-    prompt_manager = PromptManager()
+    try:
+        prompt_manager = PromptManager()
+    except Exception as e:
+        print(f"Error: Failed to load prompts: {e}", file=sys.stderr)
+        sys.exit(1)
     if args.system_prompt:
         if not prompt_manager.set_active(args.system_prompt):
             print(f"Error: Prompt '{args.system_prompt}' not found", file=sys.stderr)
@@ -539,6 +612,8 @@ Provider names are read from ~/.agent13/config.toml
             remove_reasoning=args.remove_reasoning,
             devel_mode=args.devel,
             skills_mode=include_skills and bool(skill_manager.skills),
+            connect_mcp=args.mcp,
+            polite_interval=args.polite,
         )
         log_session_end()
         sys.exit(0)
@@ -567,6 +642,7 @@ Provider names are read from ~/.agent13/config.toml
             output_path=args.output,
             model_names=model_names,
             read_files=args.read,
+            polite_interval=args.polite,
         )
         log_session_end()
         sys.exit(0)
@@ -587,14 +663,20 @@ Provider names are read from ~/.agent13/config.toml
         connect_mcp=args.mcp,
         skill_manager=skill_manager,
         system_prompt=system_prompt,
+        include_skills=include_skills,
         journal_mode=args.journal,
         send_reasoning=args.send_reasoning,
         remove_reasoning=args.remove_reasoning,
         continue_session=args.continue_session,
         devel_mode=args.devel,
         spinner_speed=args.spinner,
-        clipboard_method=args.clipboard if args._clipboard_explicit else cfg.clipboard_method,
+        clipboard_method=args.clipboard
+        if args._clipboard_explicit
+        else cfg.clipboard_method,
         read_files=args.read,
+        polite_interval=args.polite,
+        bell_threshold=args.bell,
+        bell_enabled=cfg.bell_enabled,
     )
 
 
@@ -626,7 +708,9 @@ def main():
         finally:
             # Auto-save on exit if there are messages
             if app is not None and hasattr(app, "agent") and app.agent.messages:
-                auto_save_path = get_auto_save_path()
+                auto_save_path = get_auto_save_path(
+                    session_date=app.agent.session_date
+                )
                 try:
                     save_context(app.agent, auto_save_path)
                     print(f"\nSession saved to {auto_save_path}")

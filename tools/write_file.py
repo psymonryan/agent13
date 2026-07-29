@@ -20,6 +20,11 @@ def write_file(filepath: str, content: str, overwrite: bool = False) -> dict:
         Dict with success status and details. When overwriting, includes
         snapshot_id for potential rollback via edit_file(mode="rollback").
     """
+    # Reject embedded null bytes early — .resolve() would crash with a
+    # confusing ValueError before validation runs.
+    if "\0" in filepath:
+        return {"error": "Invalid path: embedded null character."}
+
     # Expand ~ and resolve to absolute path — consistent with edit_file
     filepath = str(Path(filepath).expanduser().resolve())
 

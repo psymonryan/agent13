@@ -6,7 +6,6 @@ tested manually. These tests cover the deterministic edge cases.
 
 import os
 import json
-import time
 from .helpers import spawn_process
 import pytest
 import pytest_httpserver

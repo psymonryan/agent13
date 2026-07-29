@@ -104,7 +104,7 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 **From GitHub release** (recommended - latest stable):
 
 ```bash
-uv tool install https://github.com/psymonryan/agent13/releases/download/v0.2.1/agent13-0.2.1-py3-none-any.whl
+uv tool install https://github.com/psymonryan/agent13/releases/download/v0.3.0/agent13-0.3.0-py3-none-any.whl
 ```
 
 **From source** (for development):
@@ -124,13 +124,11 @@ Agent13 loads API keys from environment variables. Create `~/.env`:
 
 ```bash
 # For local servers (key can be anything)
+# For OPENAI, use the supplied key
 OPENAI_API_KEY=local
 
 # For OpenRouter
 OPENROUTER_API_KEY=sk-or-v3-...
-
-# For OpenAI directly
-OPENAI_API_KEY=sk-...
 ```
 
 Agent13 loads `~/.env` first, then `./.env` (local overrides global).
@@ -190,6 +188,9 @@ On first run with a provider, agent13 lists available models:
 # Batch mode (single prompt, exits after)
 agent13 local --model 3 -p "Write a Python script to sum numbers 1 to 100"
 
+# Batch mode with MCP tools (servers auto-disconnect on exit)
+agent13 local --mcp -p "Use the deep_research skill to investigate X and write report.md"
+
 # Specify model directly
 agent13 local --model qwen-3.5-27b
 ```
@@ -214,27 +215,32 @@ All commands accept `--help` for full option listing.
 
 ## Options
 
-| Option                      | Description                                | Default               |
-| --------------------------- | ------------------------------------------ | --------------------- |
-| `--list-providers`          | List providers from config and exit        | -                     |
-| `--version`                 | Show version number and exit               | -                     |
-| `-p, --prompt <text>`       | Batch mode with this prompt                | -                     |
-| `--model <name>`            | Select model (number or name)              | prompts interactively |
-| `--system-prompt <name>`    | System prompt to use                       | default               |
-| `--sandbox <mode>`          | Set sandbox mode for session               | permissive-open       |
-| `--pretty on\|off`          | Enable/disable markdown rendering          | on                    |
-| `--debug`                   | Enable debug mode                          | off                   |
-| `--tool-response raw\|json` | Tool output format                         | raw                   |
-| `--mcp`                     | Connect to MCP servers on startup          | off                   |
-| `--skills`                  | Include discovered skills in system prompt | off                   |
-| `--journal`                 | Enable journal mode (context compaction)   | off                   |
-| `--send-reasoning`          | Include reasoning tokens in history        | off                   |
-| `--remove-reasoning`        | Strip reasoning tokens between turns       | off                   |
-| `-c, --continue`            | Resume previous session                    | -                     |
-| `--devel`                   | Show devel-group tools to AI               | off                   |
-| `--spinner fast\|slow\|off` | Control spinner animation                  | fast                  |
-| `--upgrade`                 | Check for updates, install, exit           | -                     |
-| `--clipboard osc52\|system` | Clipboard method                           | osc52                 |
+| Option                      | Description                                                          | Default               |
+| --------------------------- | -------------------------------------------------------------------- | --------------------- |
+| `--list-providers`          | List providers from config and exit                                  | -                     |
+| `--version`                 | Show version number and exit                                         | -                     |
+| `-p, --prompt <text>`       | Batch mode with this prompt                                          | -                     |
+| `--model <name>`            | Select model (number or name)                                        | prompts interactively |
+| `--system-prompt <name>`    | System prompt to use                                                 | default               |
+| `--sandbox <mode>`          | Set sandbox mode for session                                         | permissive-open       |
+| `--pretty on\|off`          | Enable/disable markdown rendering                                    | on                    |
+| `--debug`                   | Enable debug mode                                                    | off                   |
+| `--tool-response raw\|json` | Tool output format                                                   | raw                   |
+| `--mcp`                     | Connect to MCP servers on startup                                    | off                   |
+| `--skills`                  | Include discovered skills in system prompt                           | off                   |
+| `--journal`                 | Enable journal mode (context compaction)                             | off                   |
+| `--send-reasoning`          | Include reasoning tokens in history                                  | off                   |
+| `--remove-reasoning`        | Strip reasoning tokens between turns                                 | off                   |
+| `-c, --continue`            | Resume previous session                                              | -                     |
+| `--devel`                   | Show devel-group tools to AI                                         | off                   |
+| `--spinner fast\|slow\|off` | Control spinner animation                                            | fast                  |
+| `--upgrade`                 | Check for updates, install, exit                                     | -                     |
+| `--clipboard osc52\|system` | Clipboard method                                                     | osc52                 |
+| `--bell N\|off`             | Bell threshold in seconds (0=always ring, off=disable)               | off                   |
+| `--polite N\|off`           | Polite mode: wait for shared provider lock (N=poll interval seconds) | 10                    |
+| `--read FILE`               | Read file(s) into user message before processing                     | -                     |
+| `--repl`                    | Run in REPL mode (readline-based, no TUI)                            | off                   |
+| `--output FILE`             | Write REPL chat transcript to file (implies --repl)                  | -                     |
 
 ## Key bindings
 

@@ -15,6 +15,7 @@ from tools import (
     TOOLS,
     _ensure_discovered,
     name_matches,
+    apply_tool_filter,
     get_filtered_tools,
     get_tool_groups,
 )
@@ -30,6 +31,7 @@ __all__ = [
     "TOOLS",
     "_ensure_discovered",
     "name_matches",
+    "apply_tool_filter",
     "get_filtered_tools",
     "get_tool_groups",
 ]

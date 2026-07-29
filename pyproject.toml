@@ -1,6 +1,6 @@
 [project]
 name = "agent13"
-version = "0.2.1"
+version = "0.3.0"
 description = "Context-lean AI agent - minimal VRAM fits in a small cupboard, a postbox or even a clock"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -17,6 +17,7 @@ dependencies = [
     "pydantic",
     "pyte",
     "mcp",
+    "filelock",
 ]
 
 [dependency-groups]
@@ -28,6 +29,7 @@ dev = [
     "ruff>=0.15.12",
     "pip-audit",
     "pytest-httpserver>=1.1.5",
+    "psutil",
     "pyreadline3; sys_platform == 'win32'",
 ]
 
@@ -43,6 +45,7 @@ packages = ["agent13", "ui", "tools"]
 artifacts = [
     "agent13/default_skills/**",
     "agent13/default_config.toml",
+    "agent13/default_env",
     "agent13/default_prompts.yaml",
     "agent13/sandbox_profiles/*.sb",
 ]
@@ -52,6 +55,7 @@ packages = ["agent13", "ui", "tools"]
 artifacts = [
     "agent13/default_skills/**",
     "agent13/default_config.toml",
+    "agent13/default_env",
     "agent13/default_prompts.yaml",
     "agent13/sandbox_profiles/*.sb",
 ]

@@ -9,7 +9,6 @@ string formatting, and state transitions.
 """
 
 import time
-from unittest.mock import MagicMock
 
 from agent13.timing import TokenTimingTracker
 

@@ -30,7 +30,7 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 Install package directly from github:
 
 ```
-uv tool install https://github.com/psymonryan/agent13/releases/download/v0.2.1/agent13-0.2.1-py3-none-any.whl
+uv tool install https://github.com/psymonryan/agent13/releases/download/v0.3.0/agent13-0.3.0-py3-none-any.whl
 ```
 
 Or install from source (for hacking on the agent itself):
@@ -50,16 +50,14 @@ Agent13 looks for API keys in environment variables. Create `~/.env`:
 
 ```bash
 # For local servers (key can be anything)
+# For OPENAI, use the supplied key
 OPENAI_API_KEY=local
 
 # For OpenRouter
 OPENROUTER_API_KEY=sk-or-v3-...
-
-# For OpenAI directly
-OPENAI_API_KEY=sk-...
 ```
 
-Agent13 loads `~/.env` on startup, then `./.env` (local overrides global).
+Agent13 loads `~/.env` on startup, then `./.env` (local overrides global). A default `~/.env` is auto-created on first run (just like `config.toml`), so manual creation is optional.
 
 ## Step 3: Create Your Config
 
@@ -121,7 +119,7 @@ For best results with Agent13, use models with strong tool-calling support:
 | ------------ | ------------------- | ----------------------------------------------------------------------- |
 | Qwen-3.6-27B | Local               | Excellent tool calling, good context handling                           |
 | devstral2    | Local               | Strong coding and tool use, but probably superceded by Qwen now         |
-| GLM-5.1      | Local/Remote        | Good reasoning, excellent coding, not everyone can fit this one locally |
+| GLM-5.2      | Local/Remote        | Good reasoning, excellent coding, not everyone can fit this one locally |
 | Kimi-K2.5    | Local               | Very smart reasoning model - but GLM writes better code (IMO)           |
 | GPT-4o       | OpenAI / openrouter | Cloud model, reliable tool calling (never used it myself ;-) )          |
 
@@ -203,6 +201,11 @@ I'm running out of context on this laptop, let me swap to a different provider e
 /model smartermodel  # Change models if you like
 ```
 
+### Bell and Polite Mode
+
+- **Bell**: agent13 rings the terminal bell when a turn takes longer than the threshold (default off). Configure with `/bell N` in the TUI or `--bell N` on the command line.
+- **Polite mode**: enabled by default (10s interval). When multiple agent13 instances share the same provider, polite mode coordinates access so only one sends at a time. Disable with `--polite off` or `/polite off`.
+
 ### Session Continuation
 
 Agent13 auto-saves your session on exit. Resume with:
@@ -268,7 +271,7 @@ agent13 local --sandbox permissive-closed
 /sandbox permissive-closed
 ```
 
-Available modes: `permissive-open`, `permissive-closed`, `restrictive-open`, `restrictive-closed`, `none`
+Available modes: `permissive-open`, `permissive-closed`, `restrictive-open`, `restrictive-closed`, `off`
 
 ## Common Issues
 

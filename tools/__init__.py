@@ -501,6 +501,40 @@ def name_matches(name: str, patterns: list[str]) -> bool:
     return False
 
 
+def apply_tool_filter(
+    name: str,
+    enabled_tools: list[str] | None,
+    disabled_tools: list[str] | None,
+) -> bool:
+    """Apply the config-level enabled/disabled filter to a single tool name.
+
+    This is the reusable form of the filter that ``get_filtered_tools`` applies
+    per schema and that ``Agent.get_all_tools`` applies to MCP tools (which
+    aren't in the ``TOOLS`` registry). Both call sites share this function so
+    the whitelist/blacklist semantics stay in one place.
+
+    Rules:
+    - If ``enabled_tools`` is non-empty, whitelist mode: only names matching
+      a pattern pass (``disabled_tools`` is ignored).
+    - Else if ``disabled_tools`` is non-empty, blacklist mode: names matching
+      a pattern are excluded.
+    - Otherwise (both empty/None), everything passes.
+
+    Args:
+        name: Tool name to check.
+        enabled_tools: Whitelist patterns (empty/None = no whitelist).
+        disabled_tools: Blacklist patterns (applied only if no whitelist).
+
+    Returns:
+        True if the tool passes the filter, False if it should be excluded.
+    """
+    if enabled_tools:
+        return name_matches(name, enabled_tools)
+    if disabled_tools:
+        return not name_matches(name, disabled_tools)
+    return True
+
+
 def get_filtered_tools(
     devel: bool = False,
     skills: bool = False,
@@ -541,14 +575,8 @@ def get_filtered_tools(
             continue
 
         # 3. Config-level enabled/disabled filter
-        if enabled_tools:
-            # Whitelist mode: only tools matching enabled_tools pass
-            if not name_matches(tool_name, enabled_tools):
-                continue
-        elif disabled_tools:
-            # Blacklist mode: tools matching disabled_tools are excluded
-            if name_matches(tool_name, disabled_tools):
-                continue
+        if not apply_tool_filter(tool_name, enabled_tools, disabled_tools):
+            continue
 
         result.append(schema)
 

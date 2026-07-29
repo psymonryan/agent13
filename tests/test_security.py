@@ -67,6 +67,26 @@ class TestValidatePathForRead:
             assert is_valid is False, f"Should block: {pattern}"
             assert "Path traversal" in error
 
+    def test_double_dot_in_filename_not_blocked(self):
+        """Legitimate `..` inside a filename must not be flagged as traversal.
+
+        Regression: the old substring check `if ".." in filepath` rejected
+        `foo..bar.txt`, `..hidden`, `v1..0.txt`, etc. The regex now only
+        matches `..` as a path component (bounded by `/` or string ends).
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            set_session_sandbox_mode(SandboxMode.OFF)
+            for name in [
+                "foo..bar.txt",
+                "..hidden",
+                "v1..0.txt",
+                "foo.bar..baz",
+                "..foo",
+            ]:
+                is_valid, error = validate_path_for_read(name, cwd=Path(tmpdir))
+                assert is_valid is True, f"Should allow: {name} (got: {error})"
+                assert error == ""
+
     def test_project_path_allowed_in_restrictive_mode(self):
         """Paths within project should be allowed in restrictive mode."""
         with tempfile.TemporaryDirectory() as tmpdir:

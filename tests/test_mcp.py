@@ -1,9 +1,12 @@
 """Tests for MCP (Model Context Protocol) integration."""
 
+import asyncio
+
 import pytest
 from unittest.mock import MagicMock
 from agent13.mcp import MCPManager, MCPTool, MCP_AVAILABLE
 from agent13.config import MCPServerConfig
+from agent13.events import AgentEvent
 
 
 @pytest.fixture
@@ -462,3 +465,364 @@ transport = "http"
         result = json.loads(await manager.call_tool("mcp://test_server/test_tool", {}))
         assert "error" in result
         assert "shutting down" in result["error"]
+
+
+class TestPersistentSessions:
+    """Regression tests for the persistent-session refactor.
+
+    These cover the contracts in docs_archive/mcp_connection_fix_plan.md §6.1:
+    ServerInfo defaults, connect launches a task, call_tool reuses the
+    stored session, broken sessions trigger exactly one reconnect,
+    disconnect cancels the task, reload doesn't leak.
+    """
+
+    def test_server_info_defaults_unchanged(self):
+        """New ServerInfo fields must default to None for back-compat."""
+        from agent13.mcp import ServerInfo
+
+        s = ServerInfo(config=None)
+        assert s.session is None
+        assert s.stderr_capture is None
+        assert s.session_task is None
+        assert s._stop_event is None
+        assert s._ready_event is None
+        assert s.tools == []
+        assert s.status == "disconnected"
+        assert s.last_error is None
+
+    async def test_connect_creates_session_task(self, monkeypatch, http_config):
+        """connect_server_if_needed launches _session_runner and stores the task."""
+        manager = MCPManager([http_config])
+
+        # Stub _session_runner so it does the minimum: set session, signal
+        # _ready_event, then park on _stop_event. Avoids real transport.
+        async def fake_runner(name):
+            server = manager.servers[name]
+            server.session = MagicMock()  # stand-in for live ClientSession
+            server.tools = []
+            server.status = "connected"
+            server._ready_event.set()
+            await server._stop_event.wait()
+
+        monkeypatch.setattr(manager, "_session_runner", fake_runner)
+
+        connected = await manager.connect_server_if_needed("test_server")
+        assert connected is True
+
+        server = manager.servers["test_server"]
+        assert server.session_task is not None
+        assert isinstance(server.session_task, asyncio.Task)
+        assert server.session is not None
+        assert server.status == "connected"
+
+        await manager.cleanup()
+        assert server.session_task.done()
+
+    async def test_call_tool_reuses_session(self, monkeypatch, http_config):
+        """call_tool must invoke server.session.call_tool and not open a transport."""
+        from agent13.mcp import ServerInfo
+
+        manager = MCPManager([http_config])
+
+        # Wire a fake connected server with a mock session.
+        server = manager.servers["test_server"] = ServerInfo(
+            config=http_config, status="connected"
+        )
+        server._stop_event = asyncio.Event()
+        server._ready_event = asyncio.Event()
+        mock_session = MagicMock()
+        # call_tool awaits session.call_tool(...) -> return a result with .content
+        call_tool_calls = []
+
+        async def fake_call_tool(name, args, read_timeout_seconds=None):
+            call_tool_calls.append((name, args))
+            result = MagicMock()
+            result.content = [MagicMock(text="ok")]
+            return result
+
+        mock_session.call_tool = fake_call_tool
+        server.session = mock_session
+
+        # _open_transport_cm must NOT be called — patch it to explode if it is.
+        async def explode(*a, **kw):
+            raise AssertionError("call_tool opened a transport; should reuse session")
+
+        monkeypatch.setattr(manager, "_open_transport_cm", explode)
+
+        out = await manager.call_tool("mcp://test_server/my_tool", {"x": 1})
+        assert "ok" in out
+        assert len(call_tool_calls) == 1
+        assert call_tool_calls[0] == ("my_tool", {"x": 1})
+
+        await manager.cleanup()
+
+    async def test_call_tool_reconnects_on_broken_session(
+        self, monkeypatch, http_config
+    ):
+        """A BrokenResourceError on first call triggers ONE reconnect + retry."""
+        import anyio
+
+        from agent13.mcp import ServerInfo
+
+        manager = MCPManager([http_config])
+
+        # Seed a connected server whose session raises on first call_tool.
+        server = manager.servers["test_server"] = ServerInfo(
+            config=http_config, status="connected"
+        )
+        server._stop_event = asyncio.Event()
+        server._ready_event = asyncio.Event()
+
+        call_count = {"n": 0}
+
+        async def first_session_call(name, args, read_timeout_seconds=None):
+            call_count["n"] += 1
+            raise anyio.BrokenResourceError("pipe broke")
+
+        first_session = MagicMock()
+        first_session.call_tool = first_session_call
+        server.session = first_session
+
+        # After reconnect, _connect_once must produce a fresh server/session.
+        second_session = MagicMock()
+
+        async def second_session_call(name, args, read_timeout_seconds=None):
+            call_count["n"] += 1
+            r = MagicMock()
+            r.content = [MagicMock(text="recovered")]
+            return r
+
+        second_session.call_tool = second_session_call
+
+        async def fake_connect_once(name):
+            # Replace the server with a fresh connected one holding second_session.
+            new_server = ServerInfo(config=http_config, status="connected")
+            new_server._stop_event = asyncio.Event()
+            new_server._ready_event = asyncio.Event()
+            new_server.session = second_session
+            manager.servers[name] = new_server
+            return True
+
+        monkeypatch.setattr(manager, "_connect_once", fake_connect_once)
+
+        out = await manager.call_tool("mcp://test_server/my_tool", {"x": 1})
+        # First call raised BrokenResourceError, reconnect happened, second
+        # call succeeded.
+        assert call_count["n"] == 2, f"Expected 2 calls, got {call_count['n']}"
+        assert "recovered" in out
+
+        await manager.cleanup()
+
+    async def test_disconnect_cancels_session_task(self, monkeypatch, http_config):
+        """disconnect() cancels the session_task and stops stderr_capture."""
+        manager = MCPManager([http_config])
+
+        async def fake_runner(name):
+            server = manager.servers[name]
+            try:
+                server._ready_event.set()
+                await server._stop_event.wait()
+            except asyncio.CancelledError:
+                raise
+
+        monkeypatch.setattr(manager, "_session_runner", fake_runner)
+
+        await manager.connect_server_if_needed("test_server")
+        server = manager.servers["test_server"]
+
+        # Inject a fake stderr_capture to verify stop() is called.
+        stopped = {"called": False}
+
+        class FakeCapture:
+            def stop(self):
+                stopped["called"] = True
+
+        server.stderr_capture = FakeCapture()
+
+        await manager.disconnect()
+        assert server.session_task.done()
+        assert stopped["called"] is True
+
+    async def test_reload_does_not_leak(self, monkeypatch, http_config):
+        """reload() tears down the prior session before starting a new one."""
+        manager = MCPManager([http_config])
+        teardown_calls = {"names": []}
+
+        async def spy_teardown(name):
+            teardown_calls["names"].append(name)
+            # mimic real teardown: cancel task, mark disconnected
+            server = manager.servers.get(name)
+            if server and server.session_task and not server.session_task.done():
+                server.session_task.cancel()
+                try:
+                    await asyncio.wait_for(server.session_task, timeout=1.0)
+                except (asyncio.TimeoutError, asyncio.CancelledError):
+                    pass
+            if server:
+                server.status = "disconnected"
+
+        monkeypatch.setattr(manager, "_teardown_server", spy_teardown)
+
+        async def fake_runner(name):
+            server = manager.servers[name]
+            server.session = MagicMock()
+            server.tools = []
+            server.status = "connected"
+            server._ready_event.set()
+            await server._stop_event.wait()
+
+        monkeypatch.setattr(manager, "_session_runner", fake_runner)
+
+        await manager.connect_server_if_needed("test_server")
+        first_task = manager.servers["test_server"].session_task
+
+        await manager.reload()
+        # Reload should have torn down the old server before reconnecting.
+        assert "test_server" in teardown_calls["names"]
+        assert first_task.done() or first_task.cancelled()
+
+
+class TestMCPSDK2Fallback:
+    """Tests for the MCP SDK 2.0 fallback (auto-inject --with mcp<2)."""
+
+    def test_is_uvx_needing_fallback_plain_uvx(self):
+        """Plain uvx command without mcp pin → needs fallback."""
+        config = MCPServerConfig(
+            name="srv", transport="stdio", command="uvx", args=["some-mcp"]
+        )
+        assert MCPManager._is_uvx_needing_mcp_fallback(config) is True
+
+    def test_is_uvx_needing_fallback_already_pinned(self):
+        """uvx with --with mcp<2 already present → no fallback needed."""
+        config = MCPServerConfig(
+            name="srv",
+            transport="stdio",
+            command="uvx",
+            args=["--with", "mcp<2", "some-mcp"],
+        )
+        assert MCPManager._is_uvx_needing_mcp_fallback(config) is False
+
+    def test_is_uvx_needing_fallback_other_with(self):
+        """uvx with --with for a different package → still needs fallback."""
+        config = MCPServerConfig(
+            name="srv",
+            transport="stdio",
+            command="uvx",
+            args=["--with", "httpx", "some-mcp"],
+        )
+        assert MCPManager._is_uvx_needing_mcp_fallback(config) is True
+
+    def test_is_uvx_needing_fallback_not_uvx(self):
+        """Non-uvx command → no fallback."""
+        config = MCPServerConfig(
+            name="srv", transport="stdio", command="python", args=["server.py"]
+        )
+        assert MCPManager._is_uvx_needing_mcp_fallback(config) is False
+
+    def test_is_uvx_needing_fallback_http_transport(self):
+        """HTTP transport → no fallback (only stdio/uvx)."""
+        config = MCPServerConfig(
+            name="srv", transport="http", url="http://localhost:8080"
+        )
+        assert MCPManager._is_uvx_needing_mcp_fallback(config) is False
+
+    def test_patched_config_injects_mcp_pin(self):
+        """Patched config should have --with mcp<2 prepended."""
+        config = MCPServerConfig(
+            name="srv", transport="stdio", command="uvx", args=["drawio-mcp"]
+        )
+        patched = MCPManager._patched_config_mcp1x(config)
+        assert patched.args == ["--with", "mcp<2", "drawio-mcp"]
+        # Original should be untouched.
+        assert config.args == ["drawio-mcp"]
+
+    def test_fallback_warning_message_format(self):
+        """Warning message should contain config fix and explanation."""
+        config = MCPServerConfig(
+            name="drawio",
+            transport="stdio",
+            command="uvx",
+            args=["--with", "mcp<2", "drawio-mcp"],
+        )
+        result = MCPManager._mcp_fallback_warning("drawio", config)
+        assert result["server_name"] == "drawio"
+        warning = result["warning"]
+        assert "mcp.server.fastmcp" in warning
+        assert "MCP SDK 2.0" in warning
+        assert 'args = ["--with", "mcp<2", "drawio-mcp"]' in warning
+        assert "config.toml" in warning
+
+    async def test_fallback_triggers_on_failure(self, monkeypatch):
+        """When first connect fails, fallback should retry with mcp<2."""
+        config = MCPServerConfig(
+            name="test_srv",
+            transport="stdio",
+            command="uvx",
+            args=["fake-mcp"],
+            retry_attempts=1,
+            retry_delay=0.01,
+            connect_timeout=1.0,
+        )
+        manager = MCPManager([config])
+
+        call_count = {"n": 0}
+        events = []
+
+        async def fake_connect_with_retry(cfg):
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                # First call (original config) fails.
+                return False
+            # Second call (patched config) succeeds.
+            # Simulate a connected server.
+            from agent13.mcp import ServerInfo
+
+            server = ServerInfo(config=cfg, status="connected", tools=[])
+            manager.servers[config.name] = server
+            return True
+
+        monkeypatch.setattr(manager, "_connect_with_retry", fake_connect_with_retry)
+
+        async def capture_event(event, data):
+            events.append((event, data.data))
+
+        manager.set_event_callback(capture_event)
+
+        result = await manager.connect_server_if_needed("test_srv")
+
+        assert result is True
+        assert call_count["n"] == 2  # original + fallback
+        # Config args should be persisted with the pin.
+        assert config.args == ["--with", "mcp<2", "fake-mcp"]
+        # Warning event should have been emitted.
+        warning_events = [e for e in events if e[0] == AgentEvent.MCP_SERVER_WARNING]
+        assert len(warning_events) == 1
+        assert "fake-mcp" in warning_events[0][1]["warning"]
+
+    async def test_fallback_skipped_when_already_pinned(self, monkeypatch):
+        """Server with --with mcp<2 should not trigger fallback on failure."""
+        config = MCPServerConfig(
+            name="test_srv",
+            transport="stdio",
+            command="uvx",
+            args=["--with", "mcp<2", "fake-mcp"],
+            retry_attempts=1,
+            retry_delay=0.01,
+            connect_timeout=1.0,
+        )
+        manager = MCPManager([config])
+
+        call_count = {"n": 0}
+
+        async def fake_connect_with_retry(cfg):
+            call_count["n"] += 1
+            return False  # Always fails.
+
+        monkeypatch.setattr(manager, "_connect_with_retry", fake_connect_with_retry)
+
+        result = await manager.connect_server_if_needed("test_srv")
+
+        assert result is False
+        assert call_count["n"] == 1  # No fallback retry.
+        # Config args should be unchanged.
+        assert config.args == ["--with", "mcp<2", "fake-mcp"]

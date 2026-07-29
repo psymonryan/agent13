@@ -17,7 +17,6 @@ Example:
     # Now item has ID 2, not 1!
 """
 
-import pytest
 from agent13.queue import AgentQueue
 
 
@@ -106,7 +105,7 @@ class TestSetPriorityAtPreservesID:
 
         # Add items
         first_id = queue.add("first", priority=False)
-        second_id = queue.add("second", priority=False)
+        _second_id = queue.add("second", priority=False)  # noqa: F841
 
         # Change priority of first item (index 1)
         result = queue.set_priority_at(1, priority=True)
@@ -154,7 +153,7 @@ class TestPriorityReordering:
 
         # Add normal items
         normal_id1 = queue.add("normal1", priority=False)
-        normal_id2 = queue.add("normal2", priority=False)
+        _normal_id2 = queue.add("normal2", priority=False)  # noqa: F841
 
         # Make first item priority
         queue.set_priority(normal_id1, priority=True)

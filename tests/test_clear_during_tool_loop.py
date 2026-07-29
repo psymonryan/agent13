@@ -308,6 +308,81 @@ class TestExecuteRetry:
         assert "busy" in result.message.lower()
 
 
+class TestRetrySkipsPrimingPairs:
+    """execute_retry must skip trailing priming pairs left by journal compaction.
+
+    After /journal all or /journal last, a priming pair (PRIMING_PROMPT +
+    "ok") is appended to the tail. /retry must not offer the priming prompt
+    as retry text — it should walk past priming-pair groups and operate on
+    the real last group instead.
+    """
+
+    def test_retry_skips_trailing_priming_pair(self):
+        """Single trailing priming pair is skipped; real group is retried."""
+        from agent13.prompts import PRIMING_PROMPT, PRIMING_RESPONSE
+
+        client = MagicMock()
+        agent = Agent(client, model="test-model")
+        agent._status = AgentStatus.IDLE
+        agent.messages = [
+            {"role": "user", "content": "Fix the bug"},
+            {"role": "assistant", "content": "Done"},
+            {"role": "user", "content": PRIMING_PROMPT},
+            {"role": "assistant", "content": PRIMING_RESPONSE},
+        ]
+
+        result = execute_retry(agent)
+
+        assert result.success
+        assert result.data["user_text"] == "Fix the bug"
+        # Real group deleted, priming pair remains
+        assert len(agent.messages) == 2
+        assert agent.messages[0]["content"] == PRIMING_PROMPT
+        assert agent.messages[1]["content"] == PRIMING_RESPONSE
+
+    def test_retry_skips_multiple_trailing_priming_pairs(self):
+        """Multiple trailing priming pairs are all skipped."""
+        from agent13.prompts import PRIMING_PROMPT, PRIMING_RESPONSE
+
+        client = MagicMock()
+        agent = Agent(client, model="test-model")
+        agent._status = AgentStatus.IDLE
+        agent.messages = [
+            {"role": "user", "content": "What is 2+2?"},
+            {"role": "assistant", "content": "4"},
+            {"role": "user", "content": PRIMING_PROMPT},
+            {"role": "assistant", "content": PRIMING_RESPONSE},
+            {"role": "user", "content": PRIMING_PROMPT},
+            {"role": "assistant", "content": PRIMING_RESPONSE},
+        ]
+
+        result = execute_retry(agent)
+
+        assert result.success
+        assert result.data["user_text"] == "What is 2+2?"
+        # Real group deleted, both priming pairs remain
+        assert len(agent.messages) == 4
+
+    def test_retry_only_priming_pairs_returns_failure(self):
+        """If only priming pairs exist, /retry reports no messages."""
+        from agent13.prompts import PRIMING_PROMPT, PRIMING_RESPONSE
+
+        client = MagicMock()
+        agent = Agent(client, model="test-model")
+        agent._status = AgentStatus.IDLE
+        agent.messages = [
+            {"role": "user", "content": PRIMING_PROMPT},
+            {"role": "assistant", "content": PRIMING_RESPONSE},
+        ]
+
+        result = execute_retry(agent)
+
+        assert not result.success
+        assert "No messages" in result.message
+        # Nothing deleted
+        assert len(agent.messages) == 2
+
+
 class TestExecutePrioritise:
     """Test the execute_prioritise shared command."""
 

@@ -270,7 +270,11 @@ Briefly acknowledge the skill is loaded. Do not summarize or explain it."""
         return skills
 
     def _try_load_skill(self, skill_path: Path) -> SkillInfo | None:
-        """Parse a SKILL.md file, returning None on error."""
+        """Parse a SKILL.md file, returning None on error.
+
+        Prints parse errors to stderr so the user sees them, but does
+        not exit — a broken skill shouldn't block access to other skills.
+        """
         try:
             content = skill_path.read_text(encoding="utf-8")
             frontmatter, _ = parse_frontmatter(content)
@@ -279,14 +283,20 @@ Briefly acknowledge the skill is loaded. Do not summarize or explain it."""
             # Warn if name doesn't match directory
             dir_name = skill_path.parent.name
             if metadata.name != dir_name:
-                logger.warning(
-                    "Skill name '%s' doesn't match directory '%s' at %s",
-                    metadata.name,
-                    dir_name,
-                    skill_path,
+                import sys
+
+                print(
+                    f"Warning: Skill name '{metadata.name}' doesn't match "
+                    f"directory '{dir_name}' at {skill_path}",
+                    file=sys.stderr,
                 )
 
             return SkillInfo.from_metadata(metadata, skill_path)
         except Exception as e:
-            logger.warning("Failed to parse skill at %s: %s", skill_path, e)
+            import sys
+
+            print(
+                f"Warning: Failed to parse skill at {skill_path}: {e}",
+                file=sys.stderr,
+            )
             return None

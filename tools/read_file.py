@@ -9,19 +9,12 @@ from typing import Optional, Dict, List
 
 from tools import tool
 from tools.security import validate_path_for_read, get_current_sandbox_mode
+from agent13.file_injection import is_probably_text
 
 
 # =============================================================================
 # Helpers
 # =============================================================================
-
-
-def _is_binary_file(content: bytes) -> bool:
-    """Check if content appears to be binary (non-text).
-
-    Simple check: look for null bytes.
-    """
-    return b"\x00" in content
 
 
 # =============================================================================
@@ -610,6 +603,11 @@ def read_file(
     Returns:
         Dict with filepath, total_lines, view type, and content
     """
+    # Reject embedded null bytes early — .resolve() would crash with a
+    # confusing ValueError before validation runs.
+    if "\0" in filepath:
+        return {"error": "Invalid path: embedded null character."}
+
     # Expand ~ and resolve to absolute path — consistent with edit_file/write_file
     filepath = str(Path(filepath).expanduser().resolve())
 
@@ -647,7 +645,7 @@ def read_file(
         return {"error": f"Failed to read file: {e}"}
 
     # Check for binary content
-    if _is_binary_file(raw_content):
+    if not is_probably_text(raw_content):
         return {"error": f"Binary file not supported: {filepath}"}
 
     # Decode and split into lines

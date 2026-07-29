@@ -3,6 +3,7 @@
 import pytest
 from unittest.mock import AsyncMock, patch
 from agent13 import Agent, AgentEvent
+from agent13.prompts import PRIMING_PROMPT, PRIMING_RESPONSE
 
 
 class MockClient:
@@ -573,10 +574,13 @@ class TestImmediateCompaction:
         await agent.journal.maybe_reflect_after_turn()
 
         # Messages should be compacted immediately (not deferred)
-        assert len(agent.messages) == 2
+        # Plus priming pair appended at tail (+2)
+        assert len(agent.messages) == 4
         assert agent.messages[0]["role"] == "user"
         assert agent.messages[1]["role"] == "assistant"
         assert "Reflected summary" in agent.messages[1]["content"]
+        assert agent.messages[2]["content"] == PRIMING_PROMPT
+        assert agent.messages[3]["content"] == PRIMING_RESPONSE
 
         # JOURNAL_COMPACT should have been emitted
         compact_events = [e for e in events if e.event == AgentEvent.JOURNAL_COMPACT]
@@ -634,9 +638,11 @@ class TestImmediateCompaction:
         success, message = await agent.journal.journal_last_turn()
 
         assert success is True
-        # Messages should be compacted
-        assert len(agent.messages) == 2
+        # Messages should be compacted, plus priming pair at tail (+2)
+        assert len(agent.messages) == 4
         assert "Summary of tools" in agent.messages[1]["content"]
+        assert agent.messages[2]["content"] == PRIMING_PROMPT
+        assert agent.messages[3]["content"] == PRIMING_RESPONSE
 
     @pytest.mark.asyncio
     async def test_journal_status_during_reflection(self):
@@ -995,7 +1001,7 @@ class TestJournalAll:
 
     @pytest.mark.asyncio
     async def test_no_tool_calls(self):
-        """Returns failure when no tool-using turns exist."""
+        """Sweeps priming pairs and appends one even with no tool-using turns."""
         client = MockClient()
         agent = Agent(client, model="test-model")
         agent.messages = [
@@ -1004,8 +1010,10 @@ class TestJournalAll:
         ]
 
         success, message = await agent.journal.journal_all()
-        assert success is False
+        assert success is True
         assert "No tool-using turns" in message
+        # A fresh priming pair should be at the tail
+        assert agent.history.is_priming_pair_at_tail()
 
     @pytest.mark.asyncio
     async def test_single_turn(self):
@@ -1031,8 +1039,8 @@ class TestJournalAll:
         success, message = await agent.journal.journal_all()
         assert success is True
         assert "1 turn" in message
-        # After compaction: user message + compacted assistant
-        assert len(agent.messages) == 2
+        # After compaction: user message + compacted assistant + priming pair
+        assert len(agent.messages) == 4
         assert agent.messages[0]["role"] == "user"
         assert agent.messages[1]["role"] == "assistant"
         assert "read_file" in agent.messages[1]["content"]
@@ -1076,8 +1084,9 @@ class TestJournalAll:
         assert success is True
         assert "2 turn" in message
         assert reflect_count == 2
-        # After compacting both turns: user1 + assistant1 + user2 + assistant2
-        assert len(agent.messages) == 4
+        # After compacting both turns + sweep + fresh priming pair:
+        # user1 + asst1 + user2 + asst2 + priming_user + priming_asst = 6
+        assert len(agent.messages) == 6
         assert not agent.history.has_tool_calls()
 
     @pytest.mark.asyncio
@@ -1108,7 +1117,8 @@ class TestJournalAll:
         assert "1 turn" in message
         # Non-tool turn preserved: user + assistant (2 msgs)
         # Tool turn compacted: user + assistant (2 msgs)
-        assert len(agent.messages) == 4
+        # Plus priming pair at tail (+2)
+        assert len(agent.messages) == 6
         assert agent.messages[0]["content"] == "Hello"
         assert agent.messages[1]["content"] == "Hi there"
         assert not agent.history.has_tool_calls()
@@ -1246,7 +1256,7 @@ class TestJournalAll:
 
     @pytest.mark.asyncio
     async def test_already_compacted_history(self):
-        """Returns failure when history has already been fully compacted."""
+        """Returns success (priming pair appended) when history already compacted."""
         client = MockClient()
         agent = Agent(client, model="test-model")
         agent.messages = [
@@ -1258,8 +1268,9 @@ class TestJournalAll:
         ]
 
         success, message = await agent.journal.journal_all()
-        assert success is False
+        assert success is True
         assert "No tool-using turns" in message
+        assert agent.history.is_priming_pair_at_tail()
 
 
 class TestJournalingViaQueue:
@@ -1425,11 +1436,15 @@ class TestJournalAllIterative:
         assert snapshots[0]["roles"] == ["user", "assistant", "tool", "assistant"]
         assert snapshots[0]["has_tool_calls"] is True
 
-        # Second reflection: first turn compacted, messages are
-        # [user_A, compacted_A, user_B, asst_tool, tool, asst_final]
+        # Second reflection: first turn compacted + priming pair from iter 1,
+        # then tail restored. Messages are:
+        # [user_A, compacted_A, priming_user, priming_asst, user_B,
+        #  asst_tool, tool, asst_final] = 8
         assert snapshots[1]["call"] == 2
-        assert snapshots[1]["msg_count"] == 6
+        assert snapshots[1]["msg_count"] == 8
         assert snapshots[1]["roles"] == [
+            "user",
+            "assistant",
             "user",
             "assistant",
             "user",
@@ -1439,8 +1454,9 @@ class TestJournalAllIterative:
         ]
         assert snapshots[1]["has_tool_calls"] is True
 
-        # Final state: both turns compacted
-        assert len(agent.messages) == 4
+        # Final state: both turns compacted, all priming pairs swept,
+        # one fresh priming pair at tail = 6 messages
+        assert len(agent.messages) == 6
         assert not agent.history.has_tool_calls()
 
     @pytest.mark.asyncio
@@ -1488,8 +1504,8 @@ class TestJournalAllIterative:
         assert success is True
         assert reflect_count == 3
         assert "3 turn" in message
-        # user1 + asst1 + user2 + asst2 + user3 + asst3 = 6 messages
-        assert len(agent.messages) == 6
+        # user1 + asst1 + user2 + asst2 + user3 + asst3 + priming pair = 8 messages
+        assert len(agent.messages) == 8
         assert not agent.history.has_tool_calls()
 
     @pytest.mark.asyncio
@@ -1535,8 +1551,8 @@ class TestJournalAllIterative:
         assert success is True
         assert reflect_count == 2  # Multi-round counts as one turn
         assert "2 turn" in message
-        # user1 + asst1 + user2 + asst2 = 4 messages
-        assert len(agent.messages) == 4
+        # user1 + asst1 + user2 + asst2 + priming pair = 6 messages
+        assert len(agent.messages) == 6
         assert not agent.history.has_tool_calls()
 
 

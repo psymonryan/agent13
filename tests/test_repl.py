@@ -18,6 +18,7 @@ Features tested:
 """
 
 import asyncio
+import datetime
 import io
 import sys
 from contextlib import ExitStack
@@ -107,6 +108,7 @@ class MockAgent:
         self._calls = []
         self.available_models = []
         self.model = kwargs.get("model", "test-model")
+        self.session_date = datetime.date.today().isoformat()
         # Provide pause_state and status like real Agent
         from agent13.core import PauseState, AgentStatus
         self.pause_state = PauseState.RUNNING
@@ -2095,7 +2097,7 @@ class TestMcpCommand:
             )
 
         output = captured_stdout.getvalue()
-        agent = created_agents[0]
+        _agent = created_agents[0]  # noqa: F841
         assert "test-server" in output
         assert "2 tools" in output
 

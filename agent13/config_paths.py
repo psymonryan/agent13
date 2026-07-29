@@ -42,10 +42,12 @@ def ensure_config_dir() -> Path:
     return config_dir
 
 
-def get_saves_dir() -> Path:
-    """Return the saves directory path (~/.agent13/saves/).
+def get_global_saves_dir() -> Path:
+    """Return the global saves directory path (~/.agent13/saves/).
 
-    Creates the directory if it doesn't exist.
+    Creates the directory if it doesn't exist. This is the "central" save
+    location used for auto-saves when ``[saves] location = "central"`` in
+    config, and the default home for all cross-project saves.
     """
     saves_dir = get_config_dir() / "saves"
     saves_dir.mkdir(parents=True, exist_ok=True)

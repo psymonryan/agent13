@@ -664,6 +664,9 @@ Provider names are read from ~/.agent13/config.toml
             model_names=model_names,
             read_files=args.read,
             polite_interval=args.polite,
+            bell_threshold=args.bell,
+            bell_enabled=cfg.bell_enabled,
+            bell_command=args.bell_command if args.bell_command is not None else cfg.bell_command,
             priming_enabled=args.priming_prompt,
         )
         log_session_end()

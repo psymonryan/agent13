@@ -35,6 +35,7 @@ from agent13 import (
 from ui.display import RichDisplay
 from agent13.timing import TokenTimingTracker
 from agent13.file_injection import expand_file_mentions
+from agent13.bell import BellManager
 from agent13.models import fetch_models, resolve_model_selection
 from agent13.config import (
     resolve_provider_arg,
@@ -89,6 +90,8 @@ COMMANDS = {
     "/model": "Switch model: /model [name|number] (no args lists available models)",
     "/provider": "Switch provider: /provider <name|url>",
     "/sandbox": "Show or set sandbox mode: /sandbox [off|permissive-open|permissive-closed|strict]",
+    "/bell": "Bell on idle: /bell [N|off] (0=always, N=threshold seconds)",
+    "/bell-command": "Set external bell command: /bell-command [cmd|off]",
     "/devel": "Toggle devel mode: /devel [on|off|status]",
     "/tools": "Show tool usage statistics",
     "/mcp": "Show MCP server status: /mcp [connect|disconnect|reload]",
@@ -225,6 +228,9 @@ async def run_repl(
     model_names: Optional[list[str]] = None,
     read_files: list[str] | None = None,
     polite_interval: float | None = None,
+    bell_threshold: float | str | None = None,
+    bell_enabled: bool = True,
+    bell_command: str = "",
     priming_enabled: bool = False,
 ):
     """Run the agent in interactive REPL mode.
@@ -350,6 +356,19 @@ async def run_repl(
     if polite_interval is not None:
         agent.set_polite(interval=polite_interval)
 
+    # Bell manager — shared logic with TUI. REPL writes \a to stdout
+    # as the fallback (terminal bell) instead of Textual's self.bell().
+    def _ring_terminal_bell():
+        sys.stdout.write("\a")
+        sys.stdout.flush()
+
+    bell = BellManager(
+        threshold=bell_threshold,
+        enabled=bell_enabled,
+        command=bell_command,
+        fallback_ring=_ring_terminal_bell,
+    )
+
     # Load previous session if --continue
     if continue_session:
         from agent13.persistence import find_latest_auto_save, load_context
@@ -392,9 +411,11 @@ async def run_repl(
         status = event.data.get("status", "")
         if status == "paused":
             output_ctrl.write("[paused]\n")
+            bell.on_pause()
             return
         if status == "idle" and agent.messages:
             tracker.turn_end()
+            bell.on_turn_end()
             # Duration notification
             if _processing_start_time:
                 elapsed = time.time() - _processing_start_time
@@ -411,6 +432,7 @@ async def run_repl(
                 output_ctrl.freeze()
         elif status in ("waiting", "thinking", "processing", "tooling"):
             tracker.turn_start()
+            bell.on_turn_start()
 
     @agent.on_event
     async def on_item_started(event):
@@ -753,6 +775,10 @@ async def run_repl(
                     print(f"    skills:            {'on' if sd.skills_mode else 'off'}")
                     print(
                         f"    journal:           {'on' if sd.journal_mode else 'off'}"
+                    )
+                    print(f"    bell:              {bell.status_text()}")
+                    print(
+                        f"    bell-cmd:          {bell.command if bell.command else '(terminal bell)'}"
                     )
                     print()
 
@@ -1271,6 +1297,58 @@ async def run_repl(
                         for line in result.message.splitlines():
                             print(f"  {line}")
 
+                elif cmd == "/bell":
+                    args = cmd_arg.strip().lower()
+                    if not args:
+                        st = bell.status_text()
+                        if st == "off":
+                            print("  Bell: off")
+                        elif st == "always":
+                            print("  Bell: on (always)")
+                        else:
+                            print(f"  Bell: on ({st})")
+                    elif args == "off":
+                        bell.disable()
+                        print("  Bell: off")
+                    else:
+                        try:
+                            val = float(args)
+                            if val < 0:
+                                raise ValueError("negative")
+                            bell.set_threshold(val)
+                            if val == 0:
+                                print("  Bell: on (always)")
+                            else:
+                                print(f"  Bell: on ({val:.0f}s)")
+                        except ValueError:
+                            print("  Usage: /bell [N|off]")
+                            print("    /bell 30  - Ring bell after 30s")
+                            print("    /bell 0   - Always ring on idle")
+                            print("    /bell off - Disable bell")
+                            print("    /bell     - Show current status")
+
+                elif cmd == "/bell-command":
+                    args = cmd_arg.strip()
+                    if not args:
+                        if bell.command:
+                            print(f"  Bell command: {bell.command}")
+                        else:
+                            print("  Bell command: (terminal bell)")
+                    elif args.lower() == "off":
+                        bell.clear_command()
+                        print("  Bell command: cleared (terminal bell)")
+                    else:
+                        # Strip surrounding quotes if present
+                        if len(args) >= 2 and args[0] in "\"'" and args[-1] == args[0]:
+                            args = args[1:-1]
+                        if not bell.set_command(args):
+                            print(f"  Error: '{args.split()[0]}' is not executable")
+                            print("  The first token must be found in PATH.")
+                            print("  /bell-command off - Revert to terminal bell")
+                            print("  /bell-command     - Show current status")
+                        else:
+                            print(f"  Bell command: {args}")
+
                 else:
                     print(f"  Unknown command: {user_input}")
                     print("  Type /help for available commands")
@@ -1362,6 +1440,9 @@ async def run_repl(
 
         # ── Cleanup ──────────────────────────────────────────────
         shutting_down = True  # Stop event handlers from writing
+
+        # Cancel any pending bell timer so it can't fire after teardown.
+        bell.cancel()
 
         # Auto-save session
         if agent.messages:

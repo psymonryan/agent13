@@ -1191,3 +1191,124 @@ class TestMcpExperience:
             wait_for_prompt(proc)
         finally:
             proc.close()
+
+
+# -- Test: /bell experience ------------------------------------------------
+
+
+class TestBellExperience:
+    """User interacts with /bell in the REPL."""
+
+    def test_bell_no_args_shows_status(self, repl_env):
+        """User types /bell with no args — sees current state (always)."""
+        proc = spawn_repl(repl_env)
+        try:
+            proc.sendline("/bell")
+            proc.expect("Bell: on \\(always\\)", timeout=10)
+            wait_for_prompt(proc)
+        finally:
+            proc.close()
+
+    def test_bell_set_threshold(self, repl_env):
+        """User types /bell 30 — sees confirmation."""
+        proc = spawn_repl(repl_env)
+        try:
+            proc.sendline("/bell 30")
+            proc.expect("Bell: on \\(30s\\)", timeout=10)
+            wait_for_prompt(proc)
+        finally:
+            proc.close()
+
+    def test_bell_off(self, repl_env):
+        """User types /bell off — sees disabled confirmation."""
+        proc = spawn_repl(repl_env)
+        try:
+            proc.sendline("/bell off")
+            proc.expect("Bell: off", timeout=10)
+            wait_for_prompt(proc)
+        finally:
+            proc.close()
+
+    def test_bell_invalid_value(self, repl_env):
+        """User types /bell abc — sees usage."""
+        proc = spawn_repl(repl_env)
+        try:
+            proc.sendline("/bell abc")
+            proc.expect("Usage:", timeout=10)
+            wait_for_prompt(proc)
+        finally:
+            proc.close()
+
+    def test_status_shows_bell(self, repl_env):
+        """/status shows bell in Settings section."""
+        proc = spawn_repl(repl_env)
+        try:
+            proc.sendline("/status")
+            proc.expect("bell:", timeout=10)
+            proc.expect("always", timeout=5)
+            wait_for_prompt(proc)
+        finally:
+            proc.close()
+
+    def test_bell_toggle_off_then_on(self, repl_env):
+        """User toggles bell off then back on."""
+        proc = spawn_repl(repl_env)
+        try:
+            proc.sendline("/bell off")
+            proc.expect("Bell: off", timeout=10)
+            wait_for_prompt(proc)
+            proc.sendline("/bell 0")
+            proc.expect("Bell: on \\(always\\)", timeout=10)
+            wait_for_prompt(proc)
+        finally:
+            proc.close()
+
+
+# -- Test: /bell-command experience ----------------------------------------
+
+
+class TestBellCommandExperience:
+    """User interacts with /bell-command in the REPL."""
+
+    def test_bell_command_no_args_shows_terminal(self, repl_env):
+        """User types /bell-command with no args — sees terminal bell."""
+        proc = spawn_repl(repl_env)
+        try:
+            proc.sendline("/bell-command")
+            proc.expect("Bell command: \\(terminal bell\\)", timeout=10)
+            wait_for_prompt(proc)
+        finally:
+            proc.close()
+
+    def test_bell_command_set_valid(self, repl_env):
+        """User sets a valid bell command."""
+        import sys
+
+        exe = os.path.basename(sys.executable)
+        proc = spawn_repl(repl_env)
+        try:
+            proc.sendline(f"/bell-command {exe} -c pass")
+            proc.expect("Bell command:", timeout=10)
+            wait_for_prompt(proc)
+        finally:
+            proc.close()
+
+    def test_bell_command_off(self, repl_env):
+        """User clears bell command."""
+        proc = spawn_repl(repl_env)
+        try:
+            proc.sendline("/bell-command off")
+            proc.expect("cleared", timeout=10)
+            wait_for_prompt(proc)
+        finally:
+            proc.close()
+
+    def test_bell_command_invalid(self, repl_env):
+        """User sets an invalid bell command — sees error."""
+        proc = spawn_repl(repl_env)
+        try:
+            proc.sendline("/bell-command nonexistent_xyz_123")
+            proc.expect("not executable", timeout=10)
+            wait_for_prompt(proc)
+        finally:
+            proc.close()

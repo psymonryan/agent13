@@ -1691,49 +1691,48 @@ def test_tool_result_preview_long_message_truncated():
 
 
 class TestBellCommandValidation:
-    """Tests for _validate_bell_command logic."""
+    """Tests for BellManager.validate_command logic."""
 
     def test_valid_command(self):
         """A known executable validates successfully (cross-platform)."""
         import sys
         import os
-        from ui.tui import AgentTUI
+        from agent13.bell import BellManager
 
         exe = os.path.basename(sys.executable)
-        assert AgentTUI._validate_bell_command(None, f"{exe} hello") is True
+        assert BellManager.validate_command(f"{exe} hello") is True
 
     def test_invalid_command(self):
         """A nonexistent executable fails validation."""
-        from ui.tui import AgentTUI
+        from agent13.bell import BellManager
 
-        assert AgentTUI._validate_bell_command(None, "nonexistent_xyz_123") is False
+        assert BellManager.validate_command("nonexistent_xyz_123") is False
 
     def test_empty_command(self):
         """Empty string fails validation."""
-        from ui.tui import AgentTUI
+        from agent13.bell import BellManager
 
-        assert AgentTUI._validate_bell_command(None, "") is False
+        assert BellManager.validate_command("") is False
 
     def test_whitespace_only(self):
         """Whitespace-only string fails validation."""
-        from ui.tui import AgentTUI
+        from agent13.bell import BellManager
 
-        assert AgentTUI._validate_bell_command(None, "   ") is False
+        assert BellManager.validate_command("   ") is False
 
     def test_command_with_args(self):
         """Command with arguments validates on first token only."""
         import sys
         import os
-        from ui.tui import AgentTUI
+        from agent13.bell import BellManager
 
         exe = os.path.basename(sys.executable)
-        assert AgentTUI._validate_bell_command(None, f"{exe} --flag value") is True
+        assert BellManager.validate_command(f"{exe} --flag value") is True
 
     def test_unquoted_path_not_stripped(self):
         """An unquoted path like ./script is not modified."""
-        # This test just confirms the validator itself doesn't choke on ./
-        from ui.tui import AgentTUI
+        from agent13.bell import BellManager
 
         # ./echo doesn't exist but the validator should handle it gracefully
-        result = AgentTUI._validate_bell_command(None, "./nonexistent_script")
+        result = BellManager.validate_command("./nonexistent_script")
         assert result is False

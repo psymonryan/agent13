@@ -42,6 +42,7 @@ from agent13.models import (
 )
 from agent13.timing import TokenTimingTracker
 from agent13.file_injection import expand_file_mentions
+from agent13.bell import BellManager
 
 
 from agent13 import (
@@ -797,35 +798,15 @@ class AgentTUI(App):
         # Clipboard method (osc52 or system)
         self._clipboard_method = clipboard_method
 
-        # Bell: _bell_enabled gates whether active; _bell_threshold is seconds
-        # (0 = always ring on idle). CLI --bell can override: "off" disables,
-        # a number sets threshold, None falls back to config.
-        # _bell_armed: only ring on idle after a turn has actually started
-        # (prevents bell on startup idle).
-        self._bell_enabled = bell_enabled
-        self._bell_threshold: float = 0.0
-        self._bell_armed = False
-        if bell_threshold is not None:
-            if isinstance(bell_threshold, str) and bell_threshold.lower() == "off":
-                self._bell_enabled = False
-            else:
-                try:
-                    self._bell_threshold = float(bell_threshold)
-                except (ValueError, TypeError):
-                    pass  # Fall back to default
-        self._bell_task: asyncio.Task | None = None  # Pending bell timer
-
-        # Bell command: if set, runs an external command instead of terminal
-        # bell. Validated on startup; invalid commands warn and are cleared.
-        self._bell_command = bell_command
+        # Bell: BellManager encapsulates threshold timer, command validation,
+        # and ringing. TUI passes self.bell as the fallback (terminal bell).
         self._cursor_blink = cursor_blink
-        if self._bell_command and not self._validate_bell_command(self._bell_command):
-            print(
-                f"Warning: bell-command '{self._bell_command}' is not executable, "
-                "falling back to terminal bell",
-                file=sys.stderr,
-            )
-            self._bell_command = ""
+        self._bell = BellManager(
+            threshold=bell_threshold,
+            enabled=bell_enabled,
+            command=bell_command,
+            fallback_ring=self.bell,
+        )
 
         # State
         self._history = (
@@ -2122,7 +2103,7 @@ class AgentTUI(App):
         self._shutting_down = True
 
         # Cancel any pending bell timer so it can't fire after teardown.
-        self._cancel_bell_timer()
+        self._bell.cancel()
 
         # Stop the sequential token processor
         if self._token_queue:
@@ -2629,17 +2610,13 @@ class AgentTUI(App):
             if self._elapsed_start_time is None:
                 self._elapsed_start_time = time.time()
             # Start bell timer if threshold is set and not already running
-            self._bell_armed = True
-            self._start_bell_timer()
+            self._bell.on_turn_start()
         elif status == "idle":
             self.processing = False
             # Bell: cancel any pending timer, and if threshold is 0 (always
             # ring), ring immediately on return to idle — but only if a
             # turn actually started (not the initial startup idle).
-            self._cancel_bell_timer()
-            if self._bell_armed and self._bell_enabled and self._bell_threshold == 0:
-                self._ring_bell()
-            self._bell_armed = False
+            self._bell.on_turn_end()
             # Clear polite-waiting overlay — covers ESC cancel and /delete q N
             # during polite wait (status goes IDLE without POLITE_ACQUIRED).
             if self._polite_wait_elapsed is not None:
@@ -2654,14 +2631,13 @@ class AgentTUI(App):
                 self._elapsed_start_time = None
         elif status == "paused":
             self.processing = False
-            # Bell: cancel the pending timer and clear _bell_armed so the
+            # Bell: cancel the pending timer and clear _armed so the
             # momentary IDLE emitted on resume (before the agent re-enters
             # processing) doesn't ring. When the turn actually resumes and
-            # hits the processing branch, _bell_armed is re-set and a fresh
+            # hits the processing branch, _armed is re-set and a fresh
             # timer starts — so the bell still rings when the resumed turn
             # genuinely completes (including threshold=0 on idle).
-            self._cancel_bell_timer()
-            self._bell_armed = False
+            self._bell.on_pause()
 
     def _set_running(self, running: bool) -> None:
         """Set running state (called when agent stops)."""
@@ -2669,62 +2645,10 @@ class AgentTUI(App):
             self.processing = False
             self.status = "Stopped"
 
-    def _start_bell_timer(self) -> None:
-        """Start a bell timer for the current turn (if threshold > 0).
-
-        Schedules a single bell after _bell_threshold seconds. If the turn
-        completes before then, _cancel_bell_timer cancels it. Only one timer
-        is active per turn (guarded by checking _bell_task).
-
-        When threshold is 0 (always ring), no timer is needed — the bell
-        rings immediately on idle in _update_status.
-        """
-        if not self._bell_enabled or self._bell_threshold <= 0:
-            return
-        if self._bell_task is not None:
-            return
-        threshold = self._bell_threshold
-
-        async def _bell_after_delay():
-            try:
-                await asyncio.sleep(threshold)
-                self._ring_bell()
-            except asyncio.CancelledError:
-                pass
-
-        self._bell_task = asyncio.create_task(_bell_after_delay())
-
-    def _cancel_bell_timer(self) -> None:
-        """Cancel the pending bell timer (turn ended within threshold)."""
-        if self._bell_task is not None:
-            self._bell_task.cancel()
-            self._bell_task = None
-
-    def _validate_bell_command(self, command: str) -> bool:
-        """Check that the first token of command is executable via PATH."""
-        first_token = command.strip().split()[0] if command.strip() else ""
-        if not first_token:
-            return False
-        return shutil.which(first_token) is not None
-
-    def _ring_bell(self) -> None:
-        """Ring the terminal bell via Textual's driver, or run external command."""
-        self._bell_task = None
-        if self._bell_command:
-            try:
-                subprocess.Popen(
-                    self._bell_command,
-                    shell=True,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                )
-            except Exception:
-                pass  # Fire-and-forget; ignore failures
-        else:
-            try:
-                self.bell()
-            except Exception:
-                pass  # Ignore errors during shutdown
+    @staticmethod
+    def _validate_bell_command(command: str) -> bool:
+        """Backwards-compatible shim — delegates to BellManager.validate_command."""
+        return BellManager.validate_command(command)
 
     def _update_token_usage(
         self, data: dict, first_token_time: float = None, last_token_time: float = None
@@ -3553,8 +3477,8 @@ class AgentTUI(App):
             f"  tool-response: [yellow]{escape_markup(self.tool_response_format)}[/]\n"
             f"  spinner: [yellow]{self._spinner_speed}[/]\n"
             f"  clipboard: [yellow]{self._clipboard_method}[/]\n"
-            f"  bell: [yellow]{'off' if not self._bell_enabled else 'always' if self._bell_threshold == 0 else f'{self._bell_threshold:.0f}s'}[/]\n"
-            f"  bell-cmd: [yellow]{escape_markup(self._bell_command) if self._bell_command else '(terminal bell)'}[/]\n"
+            f"  bell: [yellow]{self._bell.status_text()}[/]\n"
+            f"  bell-cmd: [yellow]{escape_markup(self._bell.command) if self._bell.command else '(terminal bell)'}[/]\n"
             f"  remove-reasoning: [yellow]{'on' if sd.remove_reasoning else 'off'}[/]\n"
             f"  devel: [yellow]{'on' if sd.devel_mode else 'off'}[/]\n"
             f"  skills: [yellow]{'on' if sd.skills_mode else 'off'}[/]\n"
@@ -4630,32 +4554,26 @@ class AgentTUI(App):
         args = args.strip().lower()
         if not args:
             # Show current status
-            if not self._bell_enabled:
+            st = self._bell.status_text()
+            if st == "off":
                 self._update_info_content("[red]Bell: off[/]")
-            elif self._bell_threshold == 0:
+            elif st == "always":
                 self._update_info_content("[green]Bell: on (always)[/]")
             else:
-                self._update_info_content(
-                    f"[green]Bell: on ({self._bell_threshold:.0f}s)[/]"
-                )
+                self._update_info_content(f"[green]Bell: on ({st})[/]")
         elif args == "off":
-            self._bell_enabled = False
-            self._cancel_bell_timer()
+            self._bell.disable()
             self._update_info_content("[red]Bell: off[/]")
         else:
             try:
                 val = float(args)
                 if val < 0:
                     raise ValueError("negative")
-                self._bell_enabled = True
-                self._bell_threshold = val
+                self._bell.set_threshold(val)
                 if val == 0:
-                    self._cancel_bell_timer()
                     self._update_info_content("[green]Bell: on (always)[/]")
                 else:
-                    self._update_info_content(
-                        f"[green]Bell: on ({val:.0f}s)[/]"
-                    )
+                    self._update_info_content(f"[green]Bell: on ({val:.0f}s)[/]")
             except ValueError:
                 self._update_info_content(
                     "[red]Usage: /bell [N|off][/]\n"
@@ -4675,20 +4593,20 @@ class AgentTUI(App):
         args = args.strip()
         if not args:
             # Show current status
-            if self._bell_command:
+            if self._bell.command:
                 self._update_info_content(
-                    f"[green]Bell command: {escape_markup(self._bell_command)}[/]"
+                    f"[green]Bell command: {escape_markup(self._bell.command)}[/]"
                 )
             else:
                 self._update_info_content("[yellow]Bell command: (terminal bell)[/]")
         elif args.lower() == "off":
-            self._bell_command = ""
+            self._bell.clear_command()
             self._update_info_content("[green]Bell command: cleared (terminal bell)[/]")
         else:
             # Strip surrounding quotes if present (single or double)
             if len(args) >= 2 and args[0] in "\"'" and args[-1] == args[0]:
                 args = args[1:-1]
-            if not self._validate_bell_command(args):
+            if not self._bell.set_command(args):
                 self._update_info_content(
                     f"[red]Error: '{escape_markup(args.split()[0])}' is not executable[/]\n"
                     "  The first token must be found in PATH.\n"
@@ -4696,7 +4614,6 @@ class AgentTUI(App):
                     "  [yellow]/bell-command[/] - Show current status"
                 )
                 return
-            self._bell_command = args
             self._update_info_content(
                 f"[green]Bell command: {escape_markup(args)}[/]"
             )

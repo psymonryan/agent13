@@ -334,3 +334,75 @@ async def test_n_zero_acquires_quickly(config_dir):
     await asyncio.wait_for(lock.acquire(), timeout=1.0)
     assert lock.is_held()
     lock.release()
+    # ---------------------------------------------------------------------------
+
+
+# set_client re-keys the polite lock on provider switch
+# ---------------------------------------------------------------------------
+
+
+class _MockClient:
+    """Minimal mock client with a settable base_url."""
+
+    def __init__(self, base_url: str):
+        self.base_url = base_url
+
+
+def test_set_client_rekeys_polite_lock(config_dir):
+    """set_client with a new base_url rebuilds the polite lock."""
+    from agent13.core import Agent
+
+    agent = Agent(_MockClient("http://old.local/v1"), model="m")
+    agent.set_polite(interval=2.5)
+    old_path = agent.polite_lock.path
+    assert agent.polite_lock.interval == 2.5
+
+    agent.set_client(_MockClient("http://new.local/v1"))
+
+    assert agent.polite_lock is not None
+    assert agent.polite_lock.provider == "http://new.local/v1"
+    assert agent.polite_lock.path != old_path
+    assert agent.polite_lock.interval == 2.5  # preserved
+
+
+def test_set_client_same_base_url_no_rekey(config_dir):
+    """set_client with the same base_url leaves the lock unchanged."""
+    from agent13.core import Agent
+
+    client = _MockClient("http://same.local/v1")
+    agent = Agent(client, model="m")
+    agent.set_polite(interval=1.0)
+    lock_obj = agent.polite_lock
+
+    agent.set_client(_MockClient("http://same.local/v1"))
+
+    assert agent.polite_lock is lock_obj  # same object, not rebuilt
+
+
+def test_set_client_no_polite_no_crash(config_dir):
+    """set_client is safe when polite mode is not enabled."""
+    from agent13.core import Agent
+
+    agent = Agent(_MockClient("http://old.local/v1"), model="m")
+    assert agent.polite_lock is None
+
+    agent.set_client(_MockClient("http://new.local/v1"))
+    assert agent.polite_lock is None
+
+
+async def test_set_client_skips_rekey_when_held(config_dir):
+    """Lock held mid-turn is not swapped (avoid orphaning the hold)."""
+    from agent13.core import Agent
+
+    agent = Agent(_MockClient("http://old.local/v1"), model="m")
+    agent.set_polite(interval=0.01)
+    await agent.polite_lock.acquire()
+    assert agent.polite_lock.is_held()
+    held_obj = agent.polite_lock
+
+    agent.set_client(_MockClient("http://new.local/v1"))
+
+    # Lock unchanged — still the old one, still held
+    assert agent.polite_lock is held_obj
+    assert agent.polite_lock.is_held()
+    agent.polite_lock.release()

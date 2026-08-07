@@ -291,6 +291,29 @@ class TestExecuteRetry:
         assert result.data["user_text"] == "Hello"
         assert len(agent.messages) == 0
 
+    def test_retry_strips_journal_prefix(self):
+        """execute_retry strips the journal anti-priming prefix from retried text.
+
+        After journal compaction, the last user message is rewritten to
+        '[previous user message] "<original>"'.  /retry should return the
+        original text without the prefix so the user edits clean content.
+        """
+        from agent13.prompts import JOURNAL_USER_MESSAGE
+
+        client = MagicMock()
+        agent = Agent(client, model="test-model")
+        agent._status = AgentStatus.IDLE
+        wrapped = JOURNAL_USER_MESSAGE.format(original="Fix the bug")
+        agent.messages = [
+            {"role": "user", "content": wrapped},
+            {"role": "assistant", "content": "Done"},
+        ]
+
+        result = execute_retry(agent)
+
+        assert result.success
+        assert result.data["user_text"] == "Fix the bug"
+
     def test_retry_busy_agent(self):
         """execute_retry returns failure when agent is not idle."""
         client = MagicMock()

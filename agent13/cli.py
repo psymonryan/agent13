@@ -81,6 +81,7 @@ async def run_batch_with_display(
     skills_mode: bool = False,
     connect_mcp: bool = False,
     polite_interval: float | None = None,
+    priming_enabled: bool = False,
 ):
     """Run batch mode with Rich display."""
     # Initialize prompt manager
@@ -115,6 +116,7 @@ async def run_batch_with_display(
         remove_reasoning=remove_reasoning,
         devel_mode=devel_mode,
         skills_mode=skills_mode,
+        priming_enabled=priming_enabled,
     )
 
     # Connect to MCP servers if requested (mirrors TUI _connect_mcp_on_startup)
@@ -312,6 +314,11 @@ Provider names are read from ~/.agent13/config.toml
         help="Include reasoning_content in message history",
     )
     parser.add_argument(
+        "--priming-prompt",
+        action="store_true",
+        help="Enable priming prompt pair after journal compaction (default: off)",
+    )
+    parser.add_argument(
         "--remove-reasoning",
         action="store_true",
         help="Strip reasoning tokens between turns",
@@ -363,6 +370,13 @@ Provider names are read from ~/.agent13/config.toml
         default=None,
         metavar="N|off",
         help="Bell: N seconds threshold (0 = always ring), or 'off' to disable",
+    )
+    parser.add_argument(
+        "--bell-command",
+        type=str,
+        default=None,
+        metavar="CMD",
+        help="External command to run instead of terminal bell (overrides config)",
     )
     parser.add_argument(
         "--polite",
@@ -432,7 +446,11 @@ Provider names are read from ~/.agent13/config.toml
     if args.upgrade:
         from agent13.updater import perform_update
 
-        success, message = perform_update()
+        def _cli_on_status(msg: str) -> None:
+            print(f"  {msg}", file=sys.stderr)
+
+        _cli_on_status("Checking for updates...")
+        success, message = perform_update(on_status=_cli_on_status)
         if success:
             print(f"OK {message}")
         else:
@@ -463,7 +481,9 @@ Provider names are read from ~/.agent13/config.toml
                 except (EOFError, KeyboardInterrupt):
                     choice = ""
                 if choice in ("y", "yes"):
-                    success, message = perform_update()
+                    success, message = perform_update(
+                        on_status=lambda msg: print(f"  {msg}", file=sys.stderr)
+                    )
                     if success:
                         print(f"OK {message}")
                     else:
@@ -614,6 +634,7 @@ Provider names are read from ~/.agent13/config.toml
             skills_mode=include_skills and bool(skill_manager.skills),
             connect_mcp=args.mcp,
             polite_interval=args.polite,
+            priming_enabled=args.priming_prompt,
         )
         log_session_end()
         sys.exit(0)
@@ -643,6 +664,7 @@ Provider names are read from ~/.agent13/config.toml
             model_names=model_names,
             read_files=args.read,
             polite_interval=args.polite,
+            priming_enabled=args.priming_prompt,
         )
         log_session_end()
         sys.exit(0)
@@ -677,6 +699,9 @@ Provider names are read from ~/.agent13/config.toml
         polite_interval=args.polite,
         bell_threshold=args.bell,
         bell_enabled=cfg.bell_enabled,
+        bell_command=args.bell_command if args.bell_command is not None else cfg.bell_command,
+        priming_enabled=args.priming_prompt,
+        cursor_blink=cfg.cursor_blink,
     )
 
 

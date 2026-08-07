@@ -51,3 +51,13 @@ mentor: |
   - Point out common mistakes and misconceptions proactively
   - Encourage experimentation — suggest variations they can try
   - Never just give the answer; teach the thinking process
+
+compaction: |
+  Summarize our conversation so far into a concise but complete context summary.
+  Preserve:
+  - All key decisions, their rationale, and current status
+  - Important code, file paths, and technical details
+  - Open questions and unresolved issues
+  - The current direction/next steps
+  Skip pleasantries and hedging. Write as a direct reference document
+  that lets you continue the work seamlessly.

@@ -573,3 +573,55 @@ def log_tps_calculation(
             "tps_value": tps_value,
         },
     )
+
+
+def log_session_restore(
+    path: str,
+    message_count: int,
+    session_date: str,
+    incomplete_turn: bool,
+) -> None:
+    """Log a session restore event for KV cache analysis.
+
+    Logged when --continue loads a saved session. Compare the
+    api_hash entries that follow against the last api_hash from the
+    previous session to find where the cache prefix breaks.
+
+    Args:
+        path: Path to the loaded context file
+        message_count: Number of messages restored
+        session_date: Session date string from the saved context
+        incomplete_turn: Whether the restored session had an incomplete turn
+    """
+    log_event(
+        "session_restore",
+        {
+            "path": path,
+            "message_count": message_count,
+            "session_date": session_date,
+            "incomplete_turn": incomplete_turn,
+        },
+    )
+
+
+def log_compact_start(
+    message_count_before: int,
+    tokens_before: int,
+) -> None:
+    """Log the start of a /compact operation for KV cache analysis.
+
+    The next api_request/api_hash entries after this event are the
+    compaction LLM call. Compare sys= and tools= hashes against the
+    last normal-turn api_hash to verify the cache prefix is preserved.
+
+    Args:
+        message_count_before: Number of messages before compaction prompt appended
+        tokens_before: Word count of messages before compaction
+    """
+    log_event(
+        "compact_start",
+        {
+            "message_count_before": message_count_before,
+            "tokens_before": tokens_before,
+        },
+    )

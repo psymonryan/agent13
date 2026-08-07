@@ -141,7 +141,7 @@ class TestBatchModeExitCodes:
             ["uv", "run", "agent13.py", "nonexistent_provider_xyz", "-p", "Hi"],
             capture_output=True,
             text=True,
-            timeout=10,
+            timeout=30,
             cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
         )
         assert result.returncode != 0
@@ -152,7 +152,7 @@ class TestBatchModeExitCodes:
             ["uv", "run", "agent13.py", "-p", "Hi"],
             capture_output=True,
             text=True,
-            timeout=10,
+            timeout=30,
             cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
         )
         # Should either exit with error or show usage

@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from agent13.config_paths import get_global_saves_dir
+from agent13.debug_log import is_debug_enabled, log_session_restore
 
 if TYPE_CHECKING:
     from agent13.core import Agent
@@ -365,6 +366,14 @@ def load_context(agent: "Agent", path: Path | str) -> tuple[bool, str, bool]:
     incomplete_turn = context.get("incomplete_turn", False)
     if incomplete_turn:
         agent.mark_incomplete_turn(True)
+
+    if is_debug_enabled():
+        log_session_restore(
+            path=str(path),
+            message_count=len(context["messages"]),
+            session_date=context.get("session_date", ""),
+            incomplete_turn=incomplete_turn,
+        )
 
     return True, f"Loaded context from {path}", incomplete_turn
 

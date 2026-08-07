@@ -74,6 +74,7 @@ class JournalManager:
         journal_mode_fn: Callable[[], bool],
         status_journaling: object,
         status_idle: object,
+        priming_enabled: bool = False,
     ):
         self.history = history
         self._stream = stream_fn
@@ -85,6 +86,7 @@ class JournalManager:
         self._journal_mode = journal_mode_fn
         self._JOURNALING = status_journaling
         self._IDLE = status_idle
+        self._priming_enabled = priming_enabled
 
     # ------------------------------------------------------------------
     # Public API — called from Agent._process_item
@@ -241,7 +243,8 @@ class JournalManager:
             # priming pairs left behind by journal-on's tail-tracking,
             # then leave one fresh pair at the tail.
             removed = self.history.remove_all_priming_pairs()
-            self.history.append_priming_pair()
+            if self._priming_enabled:
+                self.history.append_priming_pair()
             if removed:
                 return True, (
                     f"No tool-using turns to journal "
@@ -325,7 +328,8 @@ class JournalManager:
         # Sweep all priming pairs left scattered through history by
         # journal-on's tail-tracking, then append one fresh pair.
         removed = self.history.remove_all_priming_pairs()
-        self.history.append_priming_pair()
+        if self._priming_enabled:
+            self.history.append_priming_pair()
 
         savings = total_tokens_before - total_tokens_after
         removed_note = f" (swept {removed} priming pair(s))" if removed else ""
@@ -537,6 +541,7 @@ class JournalManager:
 
         # Append a fresh priming pair at the tail to re-prime the model
         # toward tool-calling after the journal summary.
-        self.history.append_priming_pair()
+        if self._priming_enabled:
+            self.history.append_priming_pair()
 
         return True, tool_summary, tokens_before, tokens_after

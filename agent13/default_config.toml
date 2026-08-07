@@ -31,6 +31,12 @@ method = "osc52"
 [bell]
 enabled = true
 threshold = 0
+
+# UI settings
+# cursor_blink = false  → solid cursor, no periodic terminal output (default, tmux-friendly)
+# cursor_blink = true   → blinking cursor (causes periodic output, triggers tmux activity)
+[ui]
+cursor_blink = false
 # Agent13 Configuration
 # Config directory: ~/.agent13 (or $AGENT13_CONFIG_DIR)
 # Environment: ~/.env then ./.env (local overrides global)

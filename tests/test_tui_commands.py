@@ -539,7 +539,6 @@ class MockAgentTUI:
 
     COMMANDS = [
         "/help",
-        "/quit",
         "/exit",
         "/clear",
         "/hist",
@@ -650,6 +649,29 @@ def test_command_completion_prioritise_variants():
 
     matches = tui._get_completions("/depri")
     assert "/deprioritise" in matches
+
+
+def test_command_completion_quit_not_suggested():
+    """Test /quit is hidden from completions in favour of /exit.
+
+    Regression: /quit is too similar to /queue and users accidentally quit
+    when tab-completing /qu. /exit is the completion offered instead.
+    """
+    tui = MockAgentTUI()
+
+    # /qu should not complete to /quit (only /queue matches)
+    matches = tui._get_completions("/qu")
+    assert "/quit" not in matches
+    assert "/queue" in matches
+
+    # /ex completes to /exit
+    matches = tui._get_completions("/ex")
+    assert "/exit" in matches
+    assert "/quit" not in matches
+
+    # /q only matches /queue now
+    matches = tui._get_completions("/q")
+    assert set(matches) == {"/queue"}
 
 
 def test_history_completion_empty_history():
@@ -1663,3 +1685,55 @@ def test_tool_result_preview_long_message_truncated():
     result = AgentTUI._format_tool_result_preview(content)
     assert result.endswith("...")
     assert "\n" not in result
+
+
+# ============== Bell Command Tests ==============
+
+
+class TestBellCommandValidation:
+    """Tests for _validate_bell_command logic."""
+
+    def test_valid_command(self):
+        """A known executable validates successfully (cross-platform)."""
+        import sys
+        import os
+        from ui.tui import AgentTUI
+
+        exe = os.path.basename(sys.executable)
+        assert AgentTUI._validate_bell_command(None, f"{exe} hello") is True
+
+    def test_invalid_command(self):
+        """A nonexistent executable fails validation."""
+        from ui.tui import AgentTUI
+
+        assert AgentTUI._validate_bell_command(None, "nonexistent_xyz_123") is False
+
+    def test_empty_command(self):
+        """Empty string fails validation."""
+        from ui.tui import AgentTUI
+
+        assert AgentTUI._validate_bell_command(None, "") is False
+
+    def test_whitespace_only(self):
+        """Whitespace-only string fails validation."""
+        from ui.tui import AgentTUI
+
+        assert AgentTUI._validate_bell_command(None, "   ") is False
+
+    def test_command_with_args(self):
+        """Command with arguments validates on first token only."""
+        import sys
+        import os
+        from ui.tui import AgentTUI
+
+        exe = os.path.basename(sys.executable)
+        assert AgentTUI._validate_bell_command(None, f"{exe} --flag value") is True
+
+    def test_unquoted_path_not_stripped(self):
+        """An unquoted path like ./script is not modified."""
+        # This test just confirms the validator itself doesn't choke on ./
+        from ui.tui import AgentTUI
+
+        # ./echo doesn't exist but the validator should handle it gracefully
+        result = AgentTUI._validate_bell_command(None, "./nonexistent_script")
+        assert result is False

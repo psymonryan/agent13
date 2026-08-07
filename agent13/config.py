@@ -198,6 +198,7 @@ class Config:
         update_check_interval_hours: Minimum hours between update checks
         clipboard_method: Clipboard method - "osc52" or "system"
         saves_location: Auto-save location - "central" (global) or "local" (project dir)
+        cursor_blink: Whether the input cursor blinks (default false for tmux activity silence)
     """
 
     providers: list[ProviderConfig] = field(default_factory=list)
@@ -212,6 +213,8 @@ class Config:
     saves_location: str = "local"
     bell_threshold: float = 0.0  # Seconds before bell on long turns (0 = always)
     bell_enabled: bool = True  # Whether bell is active
+    bell_command: str = ""  # External command to run instead of terminal bell
+    cursor_blink: bool = False  # Whether input cursor blinks (false = tmux-friendly)
 
     @classmethod
     def from_file(cls, path: Optional[Path] = None) -> "Config":
@@ -369,6 +372,16 @@ class Config:
             be = bell_data.get("enabled", True)
             if isinstance(be, bool):
                 config.bell_enabled = be
+            bc = bell_data.get("command", "")
+            if isinstance(bc, str):
+                config.bell_command = bc
+
+        # Parse [ui] section
+        ui_data = data.get("ui", {})
+        if isinstance(ui_data, dict):
+            cb = ui_data.get("cursor_blink", False)
+            if isinstance(cb, bool):
+                config.cursor_blink = cb
 
         config.validate()
         return config

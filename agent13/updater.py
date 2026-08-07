@@ -432,11 +432,10 @@ def check_and_apply_update(
 
     if on_status:
         on_status(
-            f"Update available: {remote_tag} (you have {__version__}). "
-            f"Downloading and installing..."
+            f"Update available: {remote_tag} (you have {__version__})."
         )
 
-    success, message = perform_update()
+    success, message = perform_update(on_status=on_status)
     if success:
         return UpdateResult(
             status=UpdateStatus.UPDATED,
@@ -452,7 +451,55 @@ def check_and_apply_update(
     )
 
 
-def perform_update() -> tuple[bool, str]:
+def _download_with_progress(
+    url: str,
+    dest_path: str,
+    on_progress: Optional[Callable[[str], None]] = None,
+) -> Optional[int]:
+    """Download a file with streaming progress reporting.
+
+    Args:
+        url: URL to download from.
+        dest_path: Local path to write the file.
+        on_progress: Optional callback called with progress messages.
+
+    Returns:
+        None on success. On HTTP failure (non-200), the HTTP status code.
+        On network/OS errors, raises (httpx.HTTPError or OSError).
+    """
+    with httpx.stream("GET", url, follow_redirects=True, timeout=60) as resp:
+        if resp.status_code != 200:
+            return resp.status_code
+
+        # Try to get content length for progress
+        content_length = resp.headers.get("content-length")
+        try:
+            total = int(content_length) if content_length else None
+        except ValueError:
+            total = None
+
+        downloaded = 0
+        last_pct = -1
+
+        with open(dest_path, "wb") as f:
+            for chunk in resp.iter_bytes(chunk_size=64 * 1024):
+                if chunk:
+                    f.write(chunk)
+                    downloaded += len(chunk)
+                    if total and total > 0:
+                        pct = int((downloaded / total) * 100)
+                        # Report every 10% to avoid spam
+                        if pct >= last_pct + 10:
+                            last_pct = pct
+                            if on_progress:
+                                on_progress(f"Downloading: {pct}%")
+
+        return None
+
+
+def perform_update(
+    on_status: Optional[Callable[[str], None]] = None,
+) -> tuple[bool, str]:
     """Attempt an in-place upgrade by downloading the wheel from GitHub.
 
     Downloads the .whl from the latest GitHub release and installs it
@@ -464,11 +511,20 @@ def perform_update() -> tuple[bool, str]:
     this), then run uv tool install, which creates a fresh Scripts dir.
     If install fails, we roll back the rename.
 
+    Args:
+        on_status: Optional callback for progress messages. Called with
+            plain text strings (no formatting). If None, messages are
+            silently dropped.
+
     Returns:
         Tuple of (success: bool, message: str).
         On success the message does NOT include a restart hint -- callers
         add context-appropriate hints (TUI vs CLI vs --upgrade).
     """
+    def _say(msg: str):
+        if on_status:
+            on_status(msg)
+
     # Step 1: Fetch latest release info
     release = fetch_latest_release()
     if release is None:
@@ -486,15 +542,41 @@ def perform_update() -> tuple[bool, str]:
             f"on GitHub release. Install manually."
         )
 
-    # Step 2: Download the wheel to a temp file
+    # Step 2: Download the wheel to a temp file (streaming with progress).
+    #   Use the real wheel filename from the URL: uv validates wheel filenames
+    #   against PEP 427, which requires
+    #   {distribution}-{version}-{python}-{abi}-{platform}.whl -- a bare
+    #   tmpXXXX.whl would be rejected.  Extract the real filename so the temp
+    #   path passes validation.
+    wheel_name = wheel_url.rsplit("/", 1)[-1]
+    tmp_dir = tempfile.gettempdir()
+    tmp_path = os.path.join(tmp_dir, wheel_name)
+
+    if os.name == "nt":
+        _say("Downloading update (may take a moment)...")
+    else:
+        _say("Downloading update...")
+
     try:
-        resp = httpx.get(wheel_url, follow_redirects=True, timeout=60)
-        if resp.status_code != 200:
+        status = _download_with_progress(
+            wheel_url, tmp_path, on_progress=on_status,
+        )
+        if status is not None:
+            # Clean up any partial file
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
             return False, (
-                f"Failed to download wheel (HTTP {resp.status_code}). "
+                f"Failed to download wheel (HTTP {status}). "
                 f"Try manually: {_build_manual_command(wheel_url)}"
             )
     except (httpx.HTTPError, OSError) as e:
+        # Clean up partial file
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
         return False, (
             f"Failed to download wheel: {e}. "
             f"Try manually: {_build_manual_command(wheel_url)}"
@@ -504,18 +586,13 @@ def perform_update() -> tuple[bool, str]:
     scripts_dir = _find_scripts_dir()
     renamed_old = _rename_locked_scripts_dir()
 
-    # Step 4: Write wheel to temp file and install
-    #   uv validates wheel filenames against PEP 427, which requires
-    #   {distribution}-{version}-{python}-{abi}-{platform}.whl -- a bare
-    #   tmpXXXX.whl will be rejected.  Extract the real filename from
-    #   the URL so the temp path passes validation.
-    try:
-        wheel_name = wheel_url.rsplit("/", 1)[-1]
-        tmp_dir = tempfile.gettempdir()
-        tmp_path = os.path.join(tmp_dir, wheel_name)
-        with open(tmp_path, "wb") as f:
-            f.write(resp.content)
+    # Step 4: Install via uv
+    if os.name == "nt":
+        _say("Installing update (may take a few minutes on Windows)...")
+    else:
+        _say("Installing update...")
 
+    try:
         result = subprocess.run(
             ["uv", "tool", "install", "--force", tmp_path],
             capture_output=True,
@@ -570,8 +647,8 @@ def perform_update() -> tuple[bool, str]:
             f"Try manually: {_build_manual_command(wheel_url)}"
         )
     finally:
-        # Clean up temp wheel file
+        # Clean up temp wheel file (always defined by this point)
         try:
             os.unlink(tmp_path)
-        except (OSError, NameError):
+        except OSError:
             pass

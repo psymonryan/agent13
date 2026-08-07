@@ -297,7 +297,19 @@ def execute_retry(agent) -> CommandResult:
 
     Returns CommandResult with data["user_text"] on success.
     """
-    from agent13.prompts import PRIMING_PROMPT, PRIMING_RESPONSE
+    from agent13.prompts import PRIMING_PROMPT, PRIMING_RESPONSE, JOURNAL_USER_MESSAGE_PREFIX
+
+    def _strip_journal_prefix(text: str) -> str:
+        """Remove the journal anti-priming prefix if present.
+
+        After journal compaction, the last user message is rewritten to
+        '[previous user message] "<original>"'.  /retry should offer the
+        user their original text for editing, not the prefixed wrapper.
+        """
+        prefix = JOURNAL_USER_MESSAGE_PREFIX + ' "'
+        if text.startswith(prefix) and text.endswith('"') and len(text) > len(prefix):
+            return text[len(prefix):-1]
+        return text
 
     if not agent.is_idle:
         return CommandResult(False, "Agent is busy")
@@ -332,7 +344,9 @@ def execute_retry(agent) -> CommandResult:
 
     last_group = groups[target_idx]
     first_msg_idx = last_group[0]
-    user_text = agent.messages[first_msg_idx].get("content", "")
+    user_text = _strip_journal_prefix(
+        agent.messages[first_msg_idx].get("content", "")
+    )
 
     for idx in sorted(last_group, reverse=True):
         del agent.messages[idx]

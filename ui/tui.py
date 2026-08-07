@@ -13,6 +13,8 @@ import sys
 import os
 import asyncio
 import json
+import shutil
+import subprocess
 
 from dotenv import load_dotenv
 from openai import AsyncOpenAI
@@ -533,7 +535,6 @@ class AgentTUI(App):
     # Built-in slash commands (base list, skills added in __init__)
     _BUILTIN_SLASH_COMMANDS = [
         "/help",
-        "/quit",
         "/exit",
         "/clear",
         "/history",
@@ -554,6 +555,7 @@ class AgentTUI(App):
         "/tools",
         "/skills",
         "/journal",
+        "/compact",
         "/remove-reasoning",
         "/save",
         "/load",
@@ -566,6 +568,7 @@ class AgentTUI(App):
         "/cwd",
         "/polite",
         "/bell",
+        "/bell-command",
     ]
     # Class-level attribute for type checking (instance copy created in __init__)
     SLASH_COMMANDS = _BUILTIN_SLASH_COMMANDS
@@ -583,6 +586,7 @@ class AgentTUI(App):
         "tool-response": ["raw", "json"],
         "provider": "_get_provider_completions",  # Method to get provider names
         "prompt": "_get_prompt_completions",  # Method to get prompt names
+        "compact": "_get_prompt_completions",  # Same completions as /prompt
         "delete": "_get_delete_completions",  # Delete from history, queue, or saves
         "journal": ["on", "off", "last", "all", "status"],
         "remove-reasoning": ["on", "off"],
@@ -655,6 +659,9 @@ class AgentTUI(App):
         polite_interval: float | None = None,
         bell_threshold: float | str | None = None,
         bell_enabled: bool = True,
+        bell_command: str = "",
+        priming_enabled: bool = False,
+        cursor_blink: bool = False,
     ):
         """Initialize the TUI.
 
@@ -686,6 +693,10 @@ class AgentTUI(App):
                 None = use config value. "off" = disable.
             bell_enabled: Whether bell is active (from config). Overridden if
                 bell_threshold is "off".
+            bell_command: External command to run instead of terminal bell.
+                Validated on startup; invalid commands warn and fall back.
+            cursor_blink: Whether the input cursor blinks. Default False
+                (no periodic terminal output, tmux-friendly).
         """
         super().__init__()
         self.client = client
@@ -762,6 +773,7 @@ class AgentTUI(App):
             remove_reasoning=remove_reasoning,
             devel_mode=devel_mode,
             skills_mode=skills_mode,
+            priming_enabled=priming_enabled,
         )
 
         # Store available models on agent (single source of truth)
@@ -802,6 +814,18 @@ class AgentTUI(App):
                 except (ValueError, TypeError):
                     pass  # Fall back to default
         self._bell_task: asyncio.Task | None = None  # Pending bell timer
+
+        # Bell command: if set, runs an external command instead of terminal
+        # bell. Validated on startup; invalid commands warn and are cleared.
+        self._bell_command = bell_command
+        self._cursor_blink = cursor_blink
+        if self._bell_command and not self._validate_bell_command(self._bell_command):
+            print(
+                f"Warning: bell-command '{self._bell_command}' is not executable, "
+                "falling back to terminal bell",
+                file=sys.stderr,
+            )
+            self._bell_command = ""
 
         # State
         self._history = (
@@ -2005,7 +2029,9 @@ class AgentTUI(App):
             for error in sandbox_errors:
                 print(f"Warning: {error}", file=sys.stderr)
 
-        self.query_one("#input-field", ChatTextArea).focus()
+        input_field = self.query_one("#input-field", ChatTextArea)
+        input_field.cursor_blink = self._cursor_blink
+        input_field.focus()
         self._info_pane = self.query_one("#info-pane", Vertical)
         self._info_content = self.query_one("#info-content", Static)
         self._chat = self.query_one("#chat", VerticalScroll)
@@ -2584,13 +2610,14 @@ class AgentTUI(App):
             "processing": "Processing",
             "tooling": "Tooling",
             "journaling": "Journaling",
+            "compacting": "Compacting",
             "paused": "Paused",
         }
         display_status = status_map.get(status, status.capitalize())
         self.status = display_status
 
         # Update processing state for spinner
-        if status in ("waiting", "thinking", "processing", "tooling", "journaling"):
+        if status in ("waiting", "thinking", "processing", "tooling", "journaling", "compacting"):
             self.processing = True
             # Note: TPS timing reset is handled by STREAM_START event only
             # (see on_stream_start handler). Do NOT reset here - status changes
@@ -2673,13 +2700,31 @@ class AgentTUI(App):
             self._bell_task.cancel()
             self._bell_task = None
 
+    def _validate_bell_command(self, command: str) -> bool:
+        """Check that the first token of command is executable via PATH."""
+        first_token = command.strip().split()[0] if command.strip() else ""
+        if not first_token:
+            return False
+        return shutil.which(first_token) is not None
+
     def _ring_bell(self) -> None:
-        """Ring the terminal bell via Textual's driver."""
+        """Ring the terminal bell via Textual's driver, or run external command."""
         self._bell_task = None
-        try:
-            self.bell()
-        except Exception:
-            pass  # Ignore errors during shutdown
+        if self._bell_command:
+            try:
+                subprocess.Popen(
+                    self._bell_command,
+                    shell=True,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+            except Exception:
+                pass  # Fire-and-forget; ignore failures
+        else:
+            try:
+                self.bell()
+            except Exception:
+                pass  # Ignore errors during shutdown
 
     def _update_token_usage(
         self, data: dict, first_token_time: float = None, last_token_time: float = None
@@ -3111,6 +3156,8 @@ class AgentTUI(App):
             self._handle_skills_command(args)
         elif command == "journal":
             self._handle_journal_command(args)
+        elif command == "compact":
+            self._handle_compact_command(args)
         elif command == "remove-reasoning":
             self._handle_remove_reasoning_command(args)
         elif command == "devel":
@@ -3131,6 +3178,8 @@ class AgentTUI(App):
             self._handle_polite_command(args)
         elif command == "bell":
             self._handle_bell_command(args)
+        elif command == "bell-command":
+            self._handle_bell_command_command(args)
         elif command in ("quit", "exit"):
             self.agent.stop()
             self.exit()
@@ -3327,6 +3376,7 @@ class AgentTUI(App):
             "  [yellow]/deprioritise N[/] - Remove priority from item\n"
             "\n[bold]Journal mode:[/]\n"
             "  [yellow]/journal [on|off|last|all|status][/] - Context compaction via reflection\n"
+            "  [yellow]/compact [prompt name][/] - Compact entire history into one summary pair\n"
             "\n[bold]Reasoning:[/]\n"
             "  [yellow]/remove-reasoning [on|off][/] - Strip reasoning tokens between turns\n"
             "\n[bold]Spinner:[/]\n"
@@ -3343,6 +3393,10 @@ class AgentTUI(App):
             "  [yellow]/bell 0[/] - Always ring on return to idle\n"
             "  [yellow]/bell off[/] - Disable bell\n"
             "  [yellow]/bell[/] - Show current status\n"
+            "\n[bold]Bell command:[/]\n"
+            "  [yellow]/bell-command <cmd>[/] - Run external command instead of terminal bell\n"
+            "  [yellow]/bell-command off[/] - Revert to terminal bell\n"
+            "  [yellow]/bell-command[/] - Show current command\n"
             "\n[bold]Keyboard shortcuts:[/]\n"
             "  [yellow]ESC[/] - Cancel request (use /resume to continue)\n"
             "  [yellow]Ctrl+C[/] - Clear input or quit\n"
@@ -3500,6 +3554,7 @@ class AgentTUI(App):
             f"  spinner: [yellow]{self._spinner_speed}[/]\n"
             f"  clipboard: [yellow]{self._clipboard_method}[/]\n"
             f"  bell: [yellow]{'off' if not self._bell_enabled else 'always' if self._bell_threshold == 0 else f'{self._bell_threshold:.0f}s'}[/]\n"
+            f"  bell-cmd: [yellow]{escape_markup(self._bell_command) if self._bell_command else '(terminal bell)'}[/]\n"
             f"  remove-reasoning: [yellow]{'on' if sd.remove_reasoning else 'off'}[/]\n"
             f"  devel: [yellow]{'on' if sd.devel_mode else 'off'}[/]\n"
             f"  skills: [yellow]{'on' if sd.skills_mode else 'off'}[/]\n"
@@ -3804,6 +3859,11 @@ class AgentTUI(App):
         When the agent is actively processing (in the middle of tool calls),
         this requests a pause at the next safe point and shows 'Pausing' status.
         When the pause takes effect, status changes to 'paused'.
+
+        During polite wait (waiting for multi-agent lock), the agent is idle —
+        nothing is running — so we pause immediately via the same cancel-and-
+        restart path used by ESC-during-polite-wait. The queue item stays
+        pending so /resume re-enters the polite wait.
         """
         if self.agent.is_paused:
             self._update_info_content("[yellow]Already paused[/]")
@@ -3811,6 +3871,11 @@ class AgentTUI(App):
 
         if self.agent.is_pausing:
             self._update_info_content("[yellow]Already pausing[/]")
+            return
+
+        # Polite wait: nothing is running, so pause immediately.
+        if self._polite_wait_elapsed is not None:
+            asyncio.create_task(self._pause_during_polite_wait())
             return
 
         if self.processing:
@@ -3822,6 +3887,36 @@ class AgentTUI(App):
             # Agent is idle - pause immediately
             self.agent.stop()
             self._update_info_content("[yellow]Agent paused[/]")
+
+    async def _pause_during_polite_wait(self) -> None:
+        """Pause immediately while waiting for the polite lock.
+
+        Cancels the blocked acquire(), clears the polite overlay, and restarts
+        run() in PAUSING state so it blocks at the top-of-loop
+        _wait_if_paused(). The queue item stays pending (never pulled as
+        current) so /resume re-enters the polite wait.
+        """
+        if self._agent_task and not self._agent_task.done():
+            self._agent_task.cancel()
+            try:
+                await self._agent_task
+            except asyncio.CancelledError:
+                pass  # Expected
+
+        # Clear polite overlay
+        self._polite_wait_elapsed = None
+
+        # Restart the loop in paused state — item stays in queue.
+        self.agent._pause_on_start = True
+        self._agent_task = asyncio.create_task(self.agent.run())
+
+        self.update_status()
+        self._update_info_content(
+            "[yellow]Agent paused[/]\n"
+            "Queue item retained.\n"
+            "[green]/resume[/] to continue, "
+            "[red]/delete q N[/] to remove."
+        )
 
     def _handle_resume_command(self) -> None:
         """Handle /resume command - resume agent processing.
@@ -4241,14 +4336,14 @@ class AgentTUI(App):
         args = args.strip().lower()
         if args == "on":
             self.agent.journal_mode = True
-            self._update_status(self.status)
+            self.update_status()
             self._update_info_content(
                 "[green]Journal mode enabled[/]\n"
                 "Context will be compacted via reflection before each new message."
             )
         elif args == "off":
             self.agent.journal_mode = False
-            self._update_status(self.status)
+            self.update_status()
             self._update_info_content("[yellow]Journal mode disabled[/]")
         elif args == "last":
             # Journal the most recent tool-using turn via the agent queue
@@ -4273,6 +4368,36 @@ class AgentTUI(App):
                 "  [yellow]/journal all[/] - Journal all tool-using turns iteratively\n"
                 "  [yellow]/journal status[/] - Show current state"
             )
+
+    def _handle_compact_command(self, args: str) -> None:
+        """Handle /compact command - compact entire history into one pair."""
+        from agent13.prompts import DEFAULT_COMPACT_PROMPT
+
+        prompt_name = args.strip()
+        if prompt_name:
+            prompt_text = self.prompt_manager.get_prompt(prompt_name)
+            if (
+                prompt_text == self.prompt_manager.get_prompt("default")
+                and prompt_name != "default"
+            ):
+                self._update_info_content(
+                    f"[red]Prompt '{prompt_name}' not found[/]\n"
+                    f"Available: {', '.join(self.prompt_manager.prompts.keys())}"
+                )
+                return
+        else:
+            prompt_text = self.prompt_manager.prompts.get(
+                "compaction", DEFAULT_COMPACT_PROMPT
+            )
+
+        display = f"/compact {prompt_name}" if prompt_name else "/compact"
+        asyncio.create_task(
+            self.agent.add_message(
+                display,
+                kind="compact",
+                data={"compact_prompt": prompt_text},
+            )
+        )
 
     def _handle_remove_reasoning_command(self, args: str) -> None:
         """Handle /remove-reasoning command - control reasoning token stripping."""
@@ -4308,12 +4433,14 @@ class AgentTUI(App):
         args = args.strip().lower()
         if args == "on":
             self.agent.set_devel_mode(True)
+            self.update_status()
             self._update_info_content(
                 "[green]Devel mode enabled[/]\n"
                 "Devel-group tools (e.g. TUI viewer) are now visible to the AI."
             )
         elif args == "off":
             self.agent.set_devel_mode(False)
+            self.update_status()
             self._update_info_content(
                 "[yellow]Devel mode disabled[/]\n"
                 "Devel-group tools are now hidden from the AI."
@@ -4537,6 +4664,42 @@ class AgentTUI(App):
                     "  [yellow]/bell off[/] - Disable bell\n"
                     "  [yellow]/bell[/] - Show current status"
                 )
+
+    def _handle_bell_command_command(self, args: str) -> None:
+        """Handle /bell-command - set or show the external bell command.
+
+        /bell-command <cmd> - Run external command instead of terminal bell
+        /bell-command off   - Clear command, revert to terminal bell
+        /bell-command       - Show current command
+        """
+        args = args.strip()
+        if not args:
+            # Show current status
+            if self._bell_command:
+                self._update_info_content(
+                    f"[green]Bell command: {escape_markup(self._bell_command)}[/]"
+                )
+            else:
+                self._update_info_content("[yellow]Bell command: (terminal bell)[/]")
+        elif args.lower() == "off":
+            self._bell_command = ""
+            self._update_info_content("[green]Bell command: cleared (terminal bell)[/]")
+        else:
+            # Strip surrounding quotes if present (single or double)
+            if len(args) >= 2 and args[0] in "\"'" and args[-1] == args[0]:
+                args = args[1:-1]
+            if not self._validate_bell_command(args):
+                self._update_info_content(
+                    f"[red]Error: '{escape_markup(args.split()[0])}' is not executable[/]\n"
+                    "  The first token must be found in PATH.\n"
+                    "  [yellow]/bell-command off[/] - Revert to terminal bell\n"
+                    "  [yellow]/bell-command[/] - Show current status"
+                )
+                return
+            self._bell_command = args
+            self._update_info_content(
+                f"[green]Bell command: {escape_markup(args)}[/]"
+            )
 
     def _handle_save_command(self, args: str) -> None:
         """Handle /save command - save context to file."""

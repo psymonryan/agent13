@@ -85,6 +85,7 @@ COMMANDS = {
     "/deprioritise": "Remove priority from queue item: /deprioritise N",
     "/delete": "Delete items: /delete h N (history group), /delete q N (queue item), /delete s NAME (save)",
     "/journal": "Control journal mode: /journal [on|off|last|all|status]",
+    "/compact": "Compact entire history: /compact [optional prompt name]",
     "/model": "Switch model: /model [name|number] (no args lists available models)",
     "/provider": "Switch provider: /provider <name|url>",
     "/sandbox": "Show or set sandbox mode: /sandbox [off|permissive-open|permissive-closed|strict]",
@@ -224,6 +225,7 @@ async def run_repl(
     model_names: Optional[list[str]] = None,
     read_files: list[str] | None = None,
     polite_interval: float | None = None,
+    priming_enabled: bool = False,
 ):
     """Run the agent in interactive REPL mode.
 
@@ -334,6 +336,7 @@ async def run_repl(
         devel_mode=devel_mode,
         skills_mode=skills_mode,
         journal_mode=journal_mode,
+        priming_enabled=priming_enabled,
     )
 
     # Store available models on agent
@@ -977,6 +980,29 @@ async def run_repl(
                         )
                         print("    /journal status  - Show current state")
 
+                elif cmd == "/compact":
+                    from agent13.prompts import DEFAULT_COMPACT_PROMPT
+
+                    prompt_name = cmd_arg.strip()
+                    if prompt_name:
+                        prompt_text = prompt_manager.get_prompt(prompt_name)
+                        if prompt_text == prompt_manager.get_prompt("default") and prompt_name != "default":
+                            print(f"  Prompt '{prompt_name}' not found")
+                            print(f"  Available: {', '.join(prompt_manager.prompts.keys())}")
+                        else:
+                            await agent.add_message(
+                                f"/compact {prompt_name}",
+                                kind="compact",
+                                data={"compact_prompt": prompt_text},
+                            )
+                    else:
+                        prompt_text = prompt_manager.prompts.get("compaction", DEFAULT_COMPACT_PROMPT)
+                        await agent.add_message(
+                            "/compact",
+                            kind="compact",
+                            data={"compact_prompt": prompt_text},
+                        )
+
                 elif cmd == "/model":
                     if not cmd_arg:
                         # List available models
@@ -1206,7 +1232,12 @@ async def run_repl(
                                 return False
                             return c.strip().lower() in ("y", "yes")
 
-                        result = check_and_apply_update(confirm=_confirm)
+                        def _on_status(msg: str) -> None:
+                            print(f"  {msg}")
+
+                        result = check_and_apply_update(
+                            confirm=_confirm, on_status=_on_status
+                        )
 
                         if result.status is UpdateStatus.UPDATED:
                             print(f"  {result.message}")

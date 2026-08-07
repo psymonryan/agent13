@@ -5,7 +5,35 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.3.0] - 2026-07-29
+## [0.3.1] - 2026-08-07
+
+### Added
+
+- Add [ui] cursor_blink config to stop idle terminal output (tmux activity)
+- Add progress feedback to upgrade process (CLI + REPL)
+- feat: make priming prompt optional via --priming-prompt flag (default off)
+- Add --bell-command for external bell script, with /bell-command TUI command
+- Add session_restore and compact_start debug events for KV cache analysis
+- Add /compact command to collapse history into single summary pair
+
+### Fixed
+
+- Fix Windows Proactor pipe-closed ValueError during MCP shutdown
+- Fix double checking message and restore HTTP status in upgrade download errors
+- fix: re-key polite lock on /provider switch so coordination targets the new backend
+- fix(tui): refresh status bar immediately on /journal and /devel toggle
+- fix: suppress THINKING status for whitespace-only reasoning tokens
+- strip journal anti-priming prefix from /retry text
+
+### Changed
+
+- upgraded libraries prior to release to avoid new CVEs
+- Harden upgrade download against malformed content-length, restore PEP 427 comment
+- Hide /quit from tab completions in favour of /exit
+- /pause during polite wait pauses immediately instead of showing "next safe point"
+- Rewrote journalled user messages with [previous user message] prefix to break reflection priming pattern
+  
+  ## [0.3.0] - 2026-07-29
 
 ### Added
 

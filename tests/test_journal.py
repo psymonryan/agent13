@@ -38,7 +38,10 @@ class TestCompactPreviousTurn:
         assert agent.messages[1]["role"] == "assistant"
         assert agent.messages[1]["content"] == "First answer"
         assert agent.messages[2]["role"] == "user"
-        assert agent.messages[2]["content"] == "Second question"
+        assert (
+            agent.messages[2]["content"]
+            == '[previous user message] "Second question"'
+        )
         # After last user message, the summary replaces the old assistant response
         assert agent.messages[3]["role"] == "assistant"
         assert agent.messages[3]["content"] == "Summary of previous turn"
@@ -101,7 +104,9 @@ class TestCompactPreviousTurn:
         agent.history.compact("Summary")
 
         assert len(agent.messages) == 2
-        assert agent.messages[0]["content"] == "Question"
+        assert (
+            agent.messages[0]["content"] == '[previous user message] "Question"'
+        )
         assert agent.messages[1]["content"] == "Summary"
 
 
@@ -459,7 +464,9 @@ class TestJournalModeIntegration:
         # After compaction, should have: Q1, summary + final_message, Q2
         assert len(agent.messages) == 3
         assert agent.messages[0]["role"] == "user"
-        assert agent.messages[0]["content"] == "Q1"
+        assert (
+            agent.messages[0]["content"] == '[previous user message] "Q1"'
+        )
         assert agent.messages[1]["role"] == "assistant"
         # The compaction combines tool summary with the final assistant message
         assert (
@@ -548,7 +555,7 @@ class TestImmediateCompaction:
     async def test_maybe_reflect_compacts_immediately(self):
         """_maybe_reflect_after_turn applies compaction immediately."""
         client = MockClient()
-        agent = Agent(client, model="test-model", journal_mode=True)
+        agent = Agent(client, model="test-model", journal_mode=True, priming_enabled=True)
         agent.messages = [
             {"role": "user", "content": "Hello"},
             {
@@ -616,7 +623,7 @@ class TestImmediateCompaction:
     async def test_journal_last_turn_compacts_immediately(self):
         """journal_last_turn applies compaction immediately."""
         client = MockClient()
-        agent = Agent(client, model="test-model")
+        agent = Agent(client, model="test-model", priming_enabled=True)
 
         agent.messages = [
             {"role": "user", "content": "Hello"},
@@ -1003,7 +1010,7 @@ class TestJournalAll:
     async def test_no_tool_calls(self):
         """Sweeps priming pairs and appends one even with no tool-using turns."""
         client = MockClient()
-        agent = Agent(client, model="test-model")
+        agent = Agent(client, model="test-model", priming_enabled=True)
         agent.messages = [
             {"role": "user", "content": "Hello"},
             {"role": "assistant", "content": "Hi"},
@@ -1019,7 +1026,7 @@ class TestJournalAll:
     async def test_single_turn(self):
         """Journals a single tool-using turn."""
         client = MockClient()
-        agent = Agent(client, model="test-model")
+        agent = Agent(client, model="test-model", priming_enabled=True)
         agent.messages = [
             {"role": "user", "content": "Read the file"},
             {
@@ -1051,7 +1058,7 @@ class TestJournalAll:
     async def test_multiple_turns(self):
         """Iteratively journals multiple tool-using turns."""
         client = MockClient()
-        agent = Agent(client, model="test-model")
+        agent = Agent(client, model="test-model", priming_enabled=True)
         agent.messages = [
             {"role": "user", "content": "Read file A"},
             {
@@ -1093,7 +1100,7 @@ class TestJournalAll:
     async def test_mixed_tool_and_non_tool_turns(self):
         """Only compacts tool-using turns, preserves non-tool turns."""
         client = MockClient()
-        agent = Agent(client, model="test-model")
+        agent = Agent(client, model="test-model", priming_enabled=True)
         agent.messages = [
             {"role": "user", "content": "Hello"},
             {"role": "assistant", "content": "Hi there"},
@@ -1258,7 +1265,7 @@ class TestJournalAll:
     async def test_already_compacted_history(self):
         """Returns success (priming pair appended) when history already compacted."""
         client = MockClient()
-        agent = Agent(client, model="test-model")
+        agent = Agent(client, model="test-model", priming_enabled=True)
         agent.messages = [
             {"role": "user", "content": "Read the file"},
             {
@@ -1387,7 +1394,7 @@ class TestJournalAllIterative:
     async def test_two_turns_message_state_between_iterations(self):
         """Verify message state is correct between iterations."""
         client = MockClient()
-        agent = Agent(client, model="test-model")
+        agent = Agent(client, model="test-model", priming_enabled=True)
         agent.messages = [
             {"role": "user", "content": "Read file A"},
             {
@@ -1463,7 +1470,7 @@ class TestJournalAllIterative:
     async def test_three_turns_all_compacted(self):
         """Verify three tool-using turns are all compacted."""
         client = MockClient()
-        agent = Agent(client, model="test-model")
+        agent = Agent(client, model="test-model", priming_enabled=True)
         agent.messages = [
             {"role": "user", "content": "Read A"},
             {
@@ -1512,7 +1519,7 @@ class TestJournalAllIterative:
     async def test_multi_round_tool_use_in_first_turn(self):
         """First turn has multi-round tool use (2 tool calls), second has single."""
         client = MockClient()
-        agent = Agent(client, model="test-model")
+        agent = Agent(client, model="test-model", priming_enabled=True)
         agent.messages = [
             {"role": "user", "content": "Read and edit file A"},
             {

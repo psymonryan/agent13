@@ -24,6 +24,27 @@ PRIMING_PROMPT = (
 
 PRIMING_RESPONSE = "ok"
 
+JOURNAL_USER_MESSAGE_PREFIX = "[previous user message]"
+JOURNAL_USER_MESSAGE = f'{JOURNAL_USER_MESSAGE_PREFIX} "{{original}}"'
+
+# Default compaction prompt for /compact command.
+# Users can override by adding a "compaction" entry to prompts.yaml
+# or by passing a named prompt: /compact <prompt_name>
+DEFAULT_COMPACT_PROMPT = (
+    "Summarize our conversation so far into a concise but complete context summary.\n"
+    "Preserve:\n"
+    "- All key decisions, their rationale, and current status\n"
+    "- Important code, file paths, and technical details\n"
+    "- Open questions and unresolved issues\n"
+    "- The current direction/next steps\n"
+    "Skip pleasantries and hedging. Write as a direct reference document\n"
+    "that lets you continue the work seamlessly."
+)
+
+# The lightweight user message that replaces the full compaction prompt
+# in history after compaction. Small so it doesn't re-bloat context.
+COMPACT_REPLACEMENT_MESSAGE = "Give me a summary of our previous session"
+
 # Default prompts bundled with the package
 DEFAULT_PROMPTS_FILE = Path(__file__).parent / "default_prompts.yaml"
 

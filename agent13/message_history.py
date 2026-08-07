@@ -601,6 +601,17 @@ class MessageHistory:
         # Keep messages up to and including the last non-interrupt user message
         self.messages = self.messages[: last_user_idx + 1]
 
+        # Rewrite the user message so it's visually distinct from real requests.
+        # This prevents the model from pattern-matching "normal user message ->
+        # journal summary" and getting stuck in reflection mode.
+        from agent13.prompts import JOURNAL_USER_MESSAGE
+
+        original_content = self.messages[last_user_idx].get("content") or ""
+        self.messages[last_user_idx] = {
+            "role": "user",
+            "content": JOURNAL_USER_MESSAGE.format(original=original_content),
+        }
+
         # Insert preserved skill messages before the summary
         # Convert from raw API format (assistant+tool_calls + tool result)
         # to text-only assistant messages. This prevents find_earliest_tool_turn

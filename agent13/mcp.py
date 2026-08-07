@@ -577,9 +577,23 @@ class MCPManager:
         except asyncio.CancelledError:
             raise
         except Exception as e:
-            server.status = "error"
-            server.last_error = str(e)
-            log_error(e, {"context": "mcp_session_runner", "server": server_name})
+            # On Windows (Proactor event loop), closing subprocess stdio
+            # transports can raise ValueError("I/O operation on closed
+            # pipe") during shutdown — the transport closes pipes while
+            # pending async I/O is still in flight.  When _stop_event is
+            # set we know this is an intentional disconnect, so suppress
+            # the noise rather than alarming the user.
+            if (
+                isinstance(e, ValueError)
+                and "closed pipe" in str(e).lower()
+                and server._stop_event
+                and server._stop_event.is_set()
+            ):
+                pass  # expected on Windows during shutdown
+            else:
+                server.status = "error"
+                server.last_error = str(e)
+                log_error(e, {"context": "mcp_session_runner", "server": server_name})
         finally:
             server.session = None
             # Always release the connect path even on error.
@@ -599,10 +613,20 @@ class MCPManager:
         if server._stop_event:
             server._stop_event.set()
         if server.session_task and not server.session_task.done():
-            server.session_task.cancel()
+            # Graceful first: let the _session_runner unwind its async-with
+            # stack (closing ClientSession and transport) naturally.  This
+            # avoids the Windows Proactor "I/O operation on closed pipe"
+            # error that occurs when cancel() interrupts mid-close.
             try:
-                await asyncio.wait_for(server.session_task, timeout=2.0)
-            except (asyncio.TimeoutError, asyncio.CancelledError):
+                await asyncio.wait_for(server.session_task, timeout=3.0)
+            except asyncio.TimeoutError:
+                # Graceful shutdown didn't finish in time — force cancel.
+                server.session_task.cancel()
+                try:
+                    await asyncio.wait_for(server.session_task, timeout=2.0)
+                except (asyncio.TimeoutError, asyncio.CancelledError):
+                    pass
+            except asyncio.CancelledError:
                 pass
         if server.stderr_capture:
             server.stderr_capture.stop()

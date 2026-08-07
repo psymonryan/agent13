@@ -781,6 +781,36 @@ api_base = "http://localhost:8012/v1"
         assert config.bell_threshold == 0.0
         assert config.bell_enabled is True
 
+    def test_bell_command_default(self):
+        """Default config: bell_command is empty string."""
+        config = Config()
+        assert config.bell_command == ""
+
+    def test_bell_command_from_file(self, tmp_path):
+        """Parse [bell] command from TOML."""
+        config_file = tmp_path / "config.toml"
+        config_file.write_text("""
+[[providers]]
+name = "test"
+api_base = "http://localhost:8012/v1"
+
+[bell]
+command = "afplay ~/done.mp3"
+""")
+        config = Config.from_file(config_file)
+        assert config.bell_command == "afplay ~/done.mp3"
+
+    def test_bell_command_no_section(self, tmp_path):
+        """Config without [bell] section: bell_command stays empty."""
+        config_file = tmp_path / "config.toml"
+        config_file.write_text("""
+[[providers]]
+name = "test"
+api_base = "http://localhost:8012/v1"
+""")
+        config = Config.from_file(config_file)
+        assert config.bell_command == ""
+
 
 class TestGetProviderNames:
     """Tests for get_provider_names function."""

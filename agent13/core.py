@@ -32,6 +32,7 @@ from agent13.debug_log import (
     log_tool_call,
     log_tool_result,
     log_journal_debug,
+    log_compact_start,
     # TPS debug logging
     is_debug_enabled,
     log_tps_event,
@@ -162,6 +163,7 @@ class AgentStatus(Enum):
     PROCESSING = "processing"
     TOOLING = "tooling"
     JOURNALING = "journaling"
+    COMPACTING = "compacting"
     PAUSED = "paused"
 
 
@@ -233,6 +235,7 @@ class Agent:
         remove_reasoning: bool = False,
         devel_mode: bool = False,
         skills_mode: bool = False,
+        priming_enabled: bool = False,
     ):
         """Initialize the agent.
 
@@ -266,6 +269,7 @@ class Agent:
         self.remove_reasoning = remove_reasoning
         self._devel_mode = devel_mode
         self._skills_mode = skills_mode
+        self.priming_enabled = priming_enabled
         self.execute_tool = execute_tool
         # Session date: stable for the lifetime of the session.
         # Used in the system prompt to prevent midnight date changes
@@ -325,6 +329,7 @@ class Agent:
             journal_mode_fn=lambda: self.journal_mode,
             status_journaling=AgentStatus.JOURNALING,
             status_idle=AgentStatus.IDLE,
+            priming_enabled=priming_enabled,
         )
 
     @property
@@ -449,6 +454,7 @@ class Agent:
         priority: bool = False,
         interrupt: bool = False,
         kind: str = "prompt",
+        data: dict = None,
     ) -> int:
         """Add a user message to the queue.
 
@@ -456,13 +462,15 @@ class Agent:
             text: The message text
             priority: Whether to process with high priority (front of queue)
             interrupt: Whether to interrupt the agent loop (implies priority)
-            kind: Item kind - "prompt", "journal_last", or "journal_all"
+            kind: Item kind - "prompt", "journal_last", "journal_all",
+                  "compact", "clear", or "load"
+            data: Optional metadata dict (e.g. {"compact_prompt": "..."})
 
         Returns:
             The queue item ID
         """
         item_id = self.queue.add(
-            text, priority=priority, interrupt=interrupt, kind=kind
+            text, priority=priority, interrupt=interrupt, kind=kind, data=data
         )
 
         # Log user message
@@ -1034,6 +1042,28 @@ class Agent:
                 self.queue.complete_current()
                 log_queue_complete(item.id, "complete")
                 await self._emit_queue_update()
+            elif item.kind == "compact":
+                compact_prompt = (item.data or {}).get("compact_prompt", "")
+                success, message = await self.compact_history(compact_prompt)
+                if success:
+                    await self.emit(
+                        AgentEvent.JOURNAL_RESULT,
+                        {
+                            "success": True,
+                            "message": message,
+                        },
+                    )
+                else:
+                    await self.emit(
+                        AgentEvent.JOURNAL_RESULT,
+                        {
+                            "success": False,
+                            "message": message,
+                        },
+                    )
+                self.queue.complete_current()
+                log_queue_complete(item.id, "complete")
+                await self._emit_queue_update()
             elif item.kind == "clear":
                 # Deferred /clear — safe at this boundary between items
                 count = self.clear_messages()
@@ -1225,7 +1255,7 @@ class Agent:
                     elif event_type == "reasoning":
                         reasoning += data
                         # Transition to THINKING on first reasoning token
-                        if _first_reasoning:
+                        if _first_reasoning and data.strip():
                             _first_reasoning = False
                             await self._set_status(AgentStatus.THINKING)
                         await self.emit(
@@ -1637,6 +1667,12 @@ class Agent:
     def set_client(self, client: AsyncOpenAI, models: list[str] | None = None) -> None:
         """Set the OpenAI client.
 
+        If polite mode is enabled, the lock is re-keyed to the new
+        provider's base URL so coordination targets the correct backend
+        after a ``/provider`` switch. The interval is preserved. The swap
+        is skipped when the lock is held mid-turn (the in-flight turn
+        releases it in its ``finally``; the next ``/polite`` re-keys).
+
         Args:
             client: The AsyncOpenAI client to use
             models: Optional list of available model names to store
@@ -1644,6 +1680,13 @@ class Agent:
         self.client = client
         if models is not None:
             self.available_models = models
+        # Re-key the polite lock to the new provider's base URL.
+        if self.polite_lock is not None:
+            new_key = str(client.base_url)
+            if self.polite_lock.provider != new_key and not self.polite_lock.is_held():
+                old_interval = self.polite_lock.interval
+                self.polite_lock.release()
+                self.set_polite(interval=old_interval, provider=new_key)
 
     def set_system_prompt(self, prompt: str) -> None:
         """Set the system prompt.
@@ -1809,3 +1852,132 @@ class Agent:
         self.prompt_tokens = 0
         self.completion_tokens = 0
         self.total_tokens = 0
+
+    async def compact_history(self, compact_prompt: str) -> tuple[bool, str]:
+        """Compact the entire message history into a single user/assistant pair.
+
+        1. Appends the compaction prompt directly to self.messages
+        2. Streams the LLM response (visible to user via ASSISTANT_TOKEN events)
+        3. Replaces entire history with a lightweight user/assistant pair
+
+        The compaction prompt is appended to self.messages (not a copy) and
+        streamed with the default tool_choice="auto". This preserves the KV
+        cache prefix — same tools schema, same tool_choice as normal turns.
+        Using a separate list or tool_choice="none" would alter the prompt
+        structure and cause a full cache miss.
+
+        The compaction prompt is transient — it elicits the summary then is
+        discarded. The replacement user message is a small generic line so
+        the summary reads as a natural response without re-bloating context.
+
+        Args:
+            compact_prompt: The full compaction prompt text to send to the LLM.
+
+        Returns:
+            Tuple of (success: bool, message: str) describing the outcome.
+        """
+        from agent13.prompts import COMPACT_REPLACEMENT_MESSAGE, DEFAULT_COMPACT_PROMPT
+        from agent13.journal import _count_message_words
+
+        if not compact_prompt:
+            compact_prompt = DEFAULT_COMPACT_PROMPT
+
+        if not self.messages:
+            return False, "No messages in context"
+
+        tokens_before = _count_message_words(self.messages)
+
+        if is_debug_enabled():
+            log_compact_start(len(self.messages), tokens_before)
+
+        # Append compaction prompt directly to self.messages.
+        # This preserves the KV cache prefix: same tools schema, same
+        # tool_choice ("auto") as normal turns. Using a separate list or
+        # changing tool_choice to "none" would alter the prompt structure
+        # and cause a full cache miss.
+        original_len = len(self.messages)
+        self.messages.append({"role": "user", "content": compact_prompt})
+
+        await self._set_status(AgentStatus.COMPACTING)
+
+        content_parts: list[str] = []
+        _first_content = True
+
+        try:
+            async for event_type, data in self._stream_and_emit(
+                self.messages,
+                source="compact",
+            ):
+                if event_type == "content":
+                    content_parts.append(data)
+                    if _first_content:
+                        _first_content = False
+                        await self._set_status(AgentStatus.PROCESSING)
+                    await self.emit(
+                        AgentEvent.ASSISTANT_TOKEN,
+                        {"text": data},
+                    )
+                elif event_type == "reasoning":
+                    await self.emit(
+                        AgentEvent.ASSISTANT_REASONING,
+                        {"text": data, "source": "compact"},
+                    )
+
+            summary = "".join(content_parts).strip()
+            if not summary:
+                # Remove the compaction prompt we appended
+                del self.messages[original_len:]
+                if self._status == AgentStatus.COMPACTING:
+                    await self._set_status(AgentStatus.IDLE)
+                return False, "Compaction produced no summary"
+
+            tokens_after = len(summary.split())
+
+            # Replace entire history with the lightweight pair
+            self.messages = [
+                {"role": "user", "content": COMPACT_REPLACEMENT_MESSAGE},
+                {"role": "assistant", "content": summary},
+            ]
+
+            # Emit ASSISTANT_COMPLETE to signal stream end
+            await self.emit(AgentEvent.ASSISTANT_COMPLETE, {"text": summary})
+
+            # Emit JOURNAL_COMPACT for UI notification (consistent with journal)
+            await self.emit(
+                AgentEvent.JOURNAL_COMPACT,
+                {
+                    "summary": summary,
+                    "tokens_before": tokens_before,
+                    "tokens_after": tokens_after,
+                },
+            )
+
+            # Emit TOKEN_USAGE so the TUI refreshes its Ctx counter
+            await self.emit(
+                AgentEvent.TOKEN_USAGE,
+                {
+                    "prompt_tokens": self.prompt_tokens,
+                    "completion_tokens": 0,
+                    "total_tokens": self.prompt_tokens,
+                    "source": "compact",
+                },
+            )
+
+            return True, f"Compacted {tokens_before}\u2192{tokens_after} words"
+
+        except Exception as e:
+            # Remove the compaction prompt we appended on failure
+            del self.messages[original_len:]
+            log_error(e, {"context": "compact_history"})
+            llm_error = categorize_error(e) if not isinstance(e, LLMError) else e
+            await self.emit(
+                AgentEvent.ERROR,
+                {
+                    "message": str(llm_error),
+                    "error_type": llm_error.error_type,
+                    "exception": e,
+                },
+            )
+            if self._status == AgentStatus.COMPACTING:
+                await self._set_status(AgentStatus.IDLE)
+            return False, str(llm_error)

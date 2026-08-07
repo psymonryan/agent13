@@ -24,6 +24,40 @@ from agent13.updater import (
 from agent13.clipboard import copy_via_system
 
 
+class _MockStreamResponse:
+    """Mock httpx streaming response for tests."""
+
+    def __init__(self, content=b"fake-wheel-bytes", status_code=200, content_length=None):
+        self.status_code = status_code
+        self._content = content
+        self._content_length = content_length or str(len(content))
+
+    @property
+    def headers(self):
+        return {"content-length": self._content_length}
+
+    def iter_bytes(self, chunk_size=64 * 1024):
+        # Yield content in chunks
+        start = 0
+        while start < len(self._content):
+            yield self._content[start:start + chunk_size]
+            start += chunk_size
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        pass
+
+
+def _mock_stream_factory(content=b"fake-wheel-bytes", status_code=200, content_length=None):
+    """Create a mock for httpx.stream that returns a streaming response."""
+    mock_stream = MagicMock(return_value=_MockStreamResponse(
+        content=content, status_code=status_code, content_length=content_length
+    ))
+    return mock_stream
+
+
 class TestParseVersion:
     def test_simple_version(self):
         assert _parse_version("0.1.8") == (0, 1, 8)
@@ -221,14 +255,10 @@ class TestPerformUpdate:
 
     def test_download_then_install_success(self):
         """Should download wheel and install via uv tool."""
-        mock_response = MagicMock()
-        mock_response.status_code = 200
-        mock_response.content = b"fake-wheel-bytes"
-
         with (
             patch("agent13.updater.fetch_latest_release") as mock_fetch,
             patch("agent13.updater.__version__", "0.1.8"),
-            patch("agent13.updater.httpx.get", return_value=mock_response),
+            patch("agent13.updater.httpx.stream", _mock_stream_factory()),
             patch("agent13.updater.subprocess.run") as mock_run,
         ):
             mock_fetch.return_value = {
@@ -250,13 +280,10 @@ class TestPerformUpdate:
 
     def test_download_fails(self):
         """Should fail and suggest manual command when download fails."""
-        mock_response = MagicMock()
-        mock_response.status_code = 403
-
         with (
             patch("agent13.updater.fetch_latest_release") as mock_fetch,
             patch("agent13.updater.__version__", "0.1.8"),
-            patch("agent13.updater.httpx.get", return_value=mock_response),
+            patch("agent13.updater.httpx.stream", _mock_stream_factory(status_code=403)),
         ):
             mock_fetch.return_value = {
                 "tag_name": "0.1.9", "html_url": "",
@@ -265,18 +292,15 @@ class TestPerformUpdate:
             success, msg = perform_update()
         assert success is False
         assert "Failed to download" in msg
+        assert "HTTP 403" in msg
         assert "uv tool install --force" in msg
 
     def test_install_fails_with_manual_fallback(self):
         """Should suggest manual command when install subprocess fails."""
-        mock_response = MagicMock()
-        mock_response.status_code = 200
-        mock_response.content = b"fake-wheel-bytes"
-
         with (
             patch("agent13.updater.fetch_latest_release") as mock_fetch,
             patch("agent13.updater.__version__", "0.1.8"),
-            patch("agent13.updater.httpx.get", return_value=mock_response),
+            patch("agent13.updater.httpx.stream", _mock_stream_factory()),
             patch("agent13.updater.subprocess.run") as mock_run,
         ):
             mock_fetch.return_value = {
@@ -295,14 +319,10 @@ class TestPerformUpdate:
         """Should handle subprocess timeout with manual fallback."""
         import subprocess
 
-        mock_response = MagicMock()
-        mock_response.status_code = 200
-        mock_response.content = b"fake-wheel-bytes"
-
         with (
             patch("agent13.updater.fetch_latest_release") as mock_fetch,
             patch("agent13.updater.__version__", "0.1.8"),
-            patch("agent13.updater.httpx.get", return_value=mock_response),
+            patch("agent13.updater.httpx.stream", _mock_stream_factory()),
             patch("agent13.updater.subprocess.run") as mock_run,
         ):
             mock_fetch.return_value = {
@@ -472,14 +492,10 @@ class TestPerformUpdateWindowsDirRename:
 
     def test_rename_called_on_windows(self):
         """Should rename Scripts dir before install on Windows."""
-        mock_response = MagicMock()
-        mock_response.status_code = 200
-        mock_response.content = b"fake-wheel-bytes"
-
         with (
             patch("agent13.updater.fetch_latest_release") as mock_fetch,
             patch("agent13.updater.__version__", "0.1.8"),
-            patch("agent13.updater.httpx.get", return_value=mock_response),
+            patch("agent13.updater.httpx.stream", _mock_stream_factory()),
             patch("agent13.updater.subprocess.run") as mock_run,
             patch("agent13.updater._rename_locked_scripts_dir", return_value="/tmp/agent13-scripts-123.old"),
             patch("agent13.updater._find_scripts_dir", return_value=r"C:\Scripts"),
@@ -496,14 +512,10 @@ class TestPerformUpdateWindowsDirRename:
 
     def test_rollback_on_install_failure_windows(self):
         """Should restore from temp dir when install fails on Windows."""
-        mock_response = MagicMock()
-        mock_response.status_code = 200
-        mock_response.content = b"fake-wheel-bytes"
-
         with (
             patch("agent13.updater.fetch_latest_release") as mock_fetch,
             patch("agent13.updater.__version__", "0.1.8"),
-            patch("agent13.updater.httpx.get", return_value=mock_response),
+            patch("agent13.updater.httpx.stream", _mock_stream_factory()),
             patch("agent13.updater.subprocess.run") as mock_run,
             patch("agent13.updater._rename_locked_scripts_dir", return_value="/tmp/agent13-scripts-123.old"),
             patch("agent13.updater._find_scripts_dir", return_value=r"C:\Scripts"),
@@ -524,14 +536,10 @@ class TestPerformUpdateWindowsDirRename:
 
     def test_no_rename_on_posix(self):
         """Should not try to rename Scripts dir on POSIX."""
-        mock_response = MagicMock()
-        mock_response.status_code = 200
-        mock_response.content = b"fake-wheel-bytes"
-
         with (
             patch("agent13.updater.fetch_latest_release") as mock_fetch,
             patch("agent13.updater.__version__", "0.1.8"),
-            patch("agent13.updater.httpx.get", return_value=mock_response),
+            patch("agent13.updater.httpx.stream", _mock_stream_factory()),
             patch("agent13.updater.subprocess.run") as mock_run,
             patch("agent13.updater._rename_locked_scripts_dir", return_value=None) as mock_rename,
         ):
@@ -546,14 +554,10 @@ class TestPerformUpdateWindowsDirRename:
 
     def test_entrypoint_copy_failure_treated_as_success(self):
         """Should treat entrypoint copy failure as success on Windows."""
-        mock_response = MagicMock()
-        mock_response.status_code = 200
-        mock_response.content = b"fake-wheel-bytes"
-
         with (
             patch("agent13.updater.fetch_latest_release") as mock_fetch,
             patch("agent13.updater.__version__", "0.1.8"),
-            patch("agent13.updater.httpx.get", return_value=mock_response),
+            patch("agent13.updater.httpx.stream", _mock_stream_factory()),
             patch("agent13.updater.subprocess.run") as mock_run,
             patch("agent13.updater._rename_locked_scripts_dir", return_value="/tmp/agent13-scripts-123.old"),
             patch("agent13.updater._find_scripts_dir", return_value=r"C:\Scripts"),
@@ -729,9 +733,9 @@ class TestCheckAndApplyUpdate:
         ):
             mock_fetch.return_value = self._release(tag="0.2.0")
             check_and_apply_update(on_status=messages.append)
-        # At least: "Checking for updates..." and "Update available... Downloading..."
+        # At least: "Checking for updates..." and "Update available..."
         assert any("Checking" in m for m in messages)
-        assert any("Downloading" in m for m in messages)
+        assert any("Update available" in m for m in messages)
 
     def test_on_status_not_called_when_up_to_date_apply(self, tmp_path):
         """on_status 'Downloading' message should not fire when up-to-date."""

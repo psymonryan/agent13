@@ -58,6 +58,7 @@ async def run_headless(
     debug: bool = False,
     journal_mode: bool = False,
     continue_session: bool = False,
+    priming_enabled: bool = False,
 ):
     """Run the agent in headless mode, reading commands from stdin.
 
@@ -103,6 +104,7 @@ async def run_headless(
         tools=get_tools(),
         execute_tool=execute_tool,
         journal_mode=journal_mode,
+        priming_enabled=priming_enabled,
     )
 
     # Load MCP server configs
@@ -433,6 +435,32 @@ async def run_headless(
                                 print(f"LOADED: {path} ({msg})", flush=True)
                             else:
                                 print(f"LOAD_ERROR: {msg}", flush=True)
+                elif cmd.startswith("/compact"):
+                    from agent13.prompts import DEFAULT_COMPACT_PROMPT
+
+                    parts = line.split(maxsplit=1)
+                    prompt_name = parts[1].strip() if len(parts) > 1 else ""
+                    pm = PromptManager()
+                    if prompt_name:
+                        prompt_text = pm.get_prompt(prompt_name)
+                        if (
+                            prompt_text == pm.get_prompt("default")
+                            and prompt_name != "default"
+                        ):
+                            print(f"COMPACT_ERROR: Prompt '{prompt_name}' not found", flush=True)
+                        else:
+                            await agent.add_message(
+                                f"/compact {prompt_name}",
+                                kind="compact",
+                                data={"compact_prompt": prompt_text},
+                            )
+                    else:
+                        prompt_text = pm.prompts.get("compaction", DEFAULT_COMPACT_PROMPT)
+                        await agent.add_message(
+                            "/compact",
+                            kind="compact",
+                            data={"compact_prompt": prompt_text},
+                        )
                 else:
                     print(f"UNKNOWN_COMMAND: {line}", flush=True)
             else:
@@ -491,6 +519,11 @@ Commands: /pause, /resume, /status, /quit
         "--journal",
         action="store_true",
         help="Enable journal mode (context compaction)"
+    )
+    parser.add_argument(
+        "--priming-prompt",
+        action="store_true",
+        help="Enable priming prompt pair after journal compaction (default: off)",
     )
     parser.add_argument(
         "-c", "--continue",
@@ -554,6 +587,7 @@ Commands: /pause, /resume, /status, /quit
         debug=args.debug,
         journal_mode=args.journal,
         continue_session=args.continue_session,
+        priming_enabled=args.priming_prompt,
     )
 
 

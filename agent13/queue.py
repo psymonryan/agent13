@@ -25,7 +25,7 @@ class QueueItem:
         "prompt"  # "prompt", "journal_last", "journal_all", "clear", "load", "retry"
     )
     status: ItemStatus = ItemStatus.PENDING
-    data: dict = None  # Optional metadata (e.g. {"clear_widgets": True})
+    data: dict = None  # Optional metadata (e.g. {"mode": "all", "keep_turns": 3})
 
 
 class AgentQueue:

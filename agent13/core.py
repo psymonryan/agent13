@@ -81,6 +81,9 @@ class ToolStats:
     # Mode tracking (for tools with 'mode' parameter)
     modes: dict[str, dict[str, int]] = field(default_factory=dict)
     mode_successes: dict[str, dict[str, int]] = field(default_factory=dict)
+    # Param combo tracking — sorted tuple of non-None argument names
+    param_combos: dict[str, dict[str, int]] = field(default_factory=dict)
+    param_combo_successes: dict[str, dict[str, int]] = field(default_factory=dict)
 
     def record(self, name: str, arguments: dict, result: str) -> None:
         """Record a tool call and its result."""
@@ -111,6 +114,21 @@ class ToolStats:
                     self.mode_successes[name].get(mode, 0) + 1
                 )
 
+        # Track param combo (sorted tuple of non-None argument names)
+        combo = ",".join(
+            sorted(k for k, v in arguments.items() if v is not None)
+        )
+        if name not in self.param_combos:
+            self.param_combos[name] = {}
+            self.param_combo_successes[name] = {}
+        self.param_combos[name][combo] = (
+            self.param_combos[name].get(combo, 0) + 1
+        )
+        if is_success:
+            self.param_combo_successes[name][combo] = (
+                self.param_combo_successes[name].get(combo, 0) + 1
+            )
+
     @property
     def total_calls(self) -> int:
         """Total number of tool calls."""
@@ -127,6 +145,8 @@ class ToolStats:
         self.successes.clear()
         self.modes.clear()
         self.mode_successes.clear()
+        self.param_combos.clear()
+        self.param_combo_successes.clear()
 
     def summary(self) -> dict:
         """Get a summary for display."""
@@ -139,6 +159,8 @@ class ToolStats:
                     "successes": self.successes.get(name, 0),
                     "modes": self.modes.get(name, {}),
                     "mode_successes": self.mode_successes.get(name, {}),
+                    "param_combos": self.param_combos.get(name, {}),
+                    "param_combo_successes": self.param_combo_successes.get(name, {}),
                 }
                 for name in self.calls
             },
@@ -983,7 +1005,10 @@ class Agent:
                 by the caller (run()). The lock is released in the finally
                 below if this is True.
         """
-        await self._set_status(AgentStatus.WAITING)
+        # Clear and load are instant housekeeping operations — skip
+        # WAITING status so the bell doesn't arm/ring for them.
+        if item.kind not in ("clear", "load"):
+            await self._set_status(AgentStatus.WAITING)
 
         # Log queue processing start
         log_queue_start(item.text, item.id)
@@ -1066,8 +1091,12 @@ class Agent:
                 await self._emit_queue_update()
             elif item.kind == "clear":
                 # Deferred /clear — safe at this boundary between items
-                count = self.clear_messages()
-                clear_widgets = (item.data or {}).get("clear_widgets", False)
+                mode = (item.data or {}).get("mode", "all")
+                keep_turns = (item.data or {}).get("keep_turns", 0)
+                if mode == "trim":
+                    count = self.trim_messages(keep_turns)
+                else:
+                    count = self.clear_messages()
                 self.queue.complete_current()
                 log_queue_complete(item.id, "complete")
                 await self._emit_queue_update()
@@ -1075,7 +1104,7 @@ class Agent:
                     AgentEvent.MESSAGES_CLEARED,
                     {
                         "count": count,
-                        "clear_widgets": clear_widgets,
+                        "mode": mode,
                     },
                 )
             elif item.kind == "load":
@@ -1810,22 +1839,54 @@ class Agent:
         self.reset_token_usage()
         return count
 
-    async def request_clear(self, clear_widgets: bool = False) -> int:
-        """Request a clear of message history via the queue.
+    def trim_messages(self, keep_turns: int) -> int:
+        """Trim message history to keep only the last N turns.
+
+        A turn = one user message + the assistant response + any intervening
+        tool calls/results. Walks backwards counting role=="user" messages.
+
+        Args:
+            keep_turns: Number of turns to keep
+
+        Returns:
+            Number of messages removed
+        """
+        if keep_turns <= 0 or not self.messages:
+            return self.clear_messages()
+
+        user_indices = [
+            i for i, m in enumerate(self.messages) if m.get("role") == "user"
+        ]
+        if len(user_indices) <= keep_turns:
+            # Not enough turns to trim — nothing to do
+            return 0
+
+        cut_index = user_indices[-keep_turns]
+        removed = len(self.messages[:cut_index])
+        self.messages = self.messages[cut_index:]
+        self.reset_token_usage()
+        return removed
+
+    async def request_clear(
+        self, mode: str = "all", keep_turns: int = 0
+    ) -> int:
+        """Request a clear/trim of message history via the queue.
 
         Adds a kind="clear" item to the queue so the clear happens at a
         safe boundary between items, not mid-loop. This prevents the race
         condition where /clear wipes messages while _llm_turn is iterating.
 
         Args:
-            clear_widgets: If True, also clear the TUI chat window widgets
-                (i.e. /clear all). Default False preserves scrollback.
+            mode: "all" to wipe entire history, "trim" to keep last N turns.
+            keep_turns: Number of turns to keep (only used when mode="trim").
 
         Returns:
             The queue item ID
         """
         item_id = self.queue.add(
-            "", kind="clear", data={"clear_widgets": clear_widgets}
+            "",
+            kind="clear",
+            data={"mode": mode, "keep_turns": keep_turns},
         )
         await self._emit_queue_update()
         return item_id

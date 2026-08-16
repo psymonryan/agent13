@@ -195,22 +195,27 @@ async def stream_response(
     stream = await client.chat.completions.create(**api_params)
 
     chunk_count = 0
-    async for chunk in stream:
-        delta = chunk.choices[0].delta
+    try:
+        async for chunk in stream:
+            delta = chunk.choices[0].delta
 
-        # Handle reasoning content (for models that support it)
-        if hasattr(delta, "reasoning_content") and delta.reasoning_content:
-            chunk_count += 1
-            yield ("reasoning", delta.reasoning_content)
+            # Handle reasoning content (for models that support it)
+            if hasattr(delta, "reasoning_content") and delta.reasoning_content:
+                chunk_count += 1
+                yield ("reasoning", delta.reasoning_content)
 
-        # Handle regular content
-        if delta.content:
-            chunk_count += 1
-            yield ("content", delta.content)
+            # Handle regular content
+            if delta.content:
+                chunk_count += 1
+                yield ("content", delta.content)
 
-        # Log chunk summary every 100 tokens
-        if chunk_count > 0 and chunk_count % 100 == 0:
-            log_stream_chunk(chunk_count)
+            # Log chunk summary every 100 tokens
+            if chunk_count > 0 and chunk_count % 100 == 0:
+                log_stream_chunk(chunk_count)
+    finally:
+        _close = getattr(stream, "close", None)
+        if _close:
+            await _close()
 
     # Log stream end
     log_stream_end(chunk_count)
@@ -599,59 +604,64 @@ async def stream_response_with_tools(
     chunk_count = 0
     last_chunk = None
 
-    async for chunk in stream:
-        last_chunk = chunk
-        delta = chunk.choices[0].delta if chunk.choices else None
-        if not delta:
-            continue
+    try:
+        async for chunk in stream:
+            last_chunk = chunk
+            delta = chunk.choices[0].delta if chunk.choices else None
+            if not delta:
+                continue
 
-        # Handle reasoning content (for models that support it)
-        if hasattr(delta, "reasoning_content") and delta.reasoning_content:
-            chunk_count += 1
-            yield ("reasoning", delta.reasoning_content)
+            # Handle reasoning content (for models that support it)
+            if hasattr(delta, "reasoning_content") and delta.reasoning_content:
+                chunk_count += 1
+                yield ("reasoning", delta.reasoning_content)
 
-        # Handle regular content
-        if delta.content:
-            chunk_count += 1
-            yield ("content", delta.content)
+            # Handle regular content
+            if delta.content:
+                chunk_count += 1
+                yield ("content", delta.content)
 
-        # Handle tool call chunks
-        if hasattr(delta, "tool_calls") and delta.tool_calls:
-            for tc_chunk in delta.tool_calls:
-                tc_index = tc_chunk.index
-                tc_id = tc_chunk.id
-                tc_func = tc_chunk.function
+            # Handle tool call chunks
+            if hasattr(delta, "tool_calls") and delta.tool_calls:
+                for tc_chunk in delta.tool_calls:
+                    tc_index = tc_chunk.index
+                    tc_id = tc_chunk.id
+                    tc_func = tc_chunk.function
 
-                # Initialize new tool call at this index
-                if tc_index not in tool_calls_accum:
-                    tool_calls_accum[tc_index] = {
-                        "id": tc_id or f"tc_{tc_index}",
-                        "name": "",
-                        "arguments": "",
-                    }
+                    # Initialize new tool call at this index
+                    if tc_index not in tool_calls_accum:
+                        tool_calls_accum[tc_index] = {
+                            "id": tc_id or f"tc_{tc_index}",
+                            "name": "",
+                            "arguments": "",
+                        }
 
-                # Update ID if provided (first chunk has it)
-                if tc_id and tool_calls_accum[tc_index]["id"] != tc_id:
-                    tool_calls_accum[tc_index]["id"] = tc_id
+                    # Update ID if provided (first chunk has it)
+                    if tc_id and tool_calls_accum[tc_index]["id"] != tc_id:
+                        tool_calls_accum[tc_index]["id"] = tc_id
 
-                # Accumulate name and arguments
-                if tc_func:
-                    if tc_func.name:
-                        tool_calls_accum[tc_index]["name"] = tc_func.name
-                        yield (
-                            "tool_call",
-                            {
-                                "name": tc_func.name,
-                                "id": tool_calls_accum[tc_index]["id"],
-                            },
-                        )
+                    # Accumulate name and arguments
+                    if tc_func:
+                        if tc_func.name:
+                            tool_calls_accum[tc_index]["name"] = tc_func.name
+                            yield (
+                                "tool_call",
+                                {
+                                    "name": tc_func.name,
+                                    "id": tool_calls_accum[tc_index]["id"],
+                                },
+                            )
 
-                    if tc_func.arguments:
-                        tool_calls_accum[tc_index]["arguments"] += tc_func.arguments
+                        if tc_func.arguments:
+                            tool_calls_accum[tc_index]["arguments"] += tc_func.arguments
 
-        # Log chunk summary every 100 tokens
-        if chunk_count > 0 and chunk_count % 100 == 0:
-            log_stream_chunk(chunk_count)
+            # Log chunk summary every 100 tokens
+            if chunk_count > 0 and chunk_count % 100 == 0:
+                log_stream_chunk(chunk_count)
+    finally:
+        _close = getattr(stream, "close", None)
+        if _close:
+            await _close()
 
     # Log stream end
     log_stream_end(chunk_count)
@@ -692,3 +702,33 @@ def format_context_size(messages: list[dict]) -> str:
         return f"{size_bytes / 1e3:.1f}k"
     else:
         return f"{size_bytes:.0f}"
+
+
+async def close_tracked_asyncgens() -> None:
+    """Close all event-loop-tracked async generators.
+
+    The OpenAI SDK's AsyncStream creates a chain of internal async generators
+    (__stream__, _iter_events, SSEDecoder, httpx Response.aiter_bytes/raw,
+    httpcore2 PoolByteStream, HTTP11ConnectionByteStream, etc). When the stream
+    is consumed to completion, the outer generator finishes but the inner ones
+    remain suspended at yield points - the SDK never calls aclose() on them.
+    They stay tracked by the event loop.
+
+    During loop.shutdown_asyncgens() (called by asyncio.run() on exit), Python
+    throws GeneratorExit into each tracked generator. httpcore2's
+    HTTP11ConnectionByteStream.__aiter__ catches BaseException (which includes
+    GeneratorExit) and does async cleanup work, which causes safe_async_iterate's
+    context manager to raise RuntimeError: generator didn't stop after athrow().
+
+    This function proactively closes all tracked generators before shutdown,
+    suppressing the expected httpcore2 errors. Safe to call after the client is
+    closed and no more streaming is expected (batch/REPL exit).
+    """
+    import asyncio
+
+    loop = asyncio.get_running_loop()
+    for gen in list(loop._asyncgens):
+        try:
+            await gen.aclose()
+        except (RuntimeError, GeneratorExit, StopAsyncIteration):
+            pass

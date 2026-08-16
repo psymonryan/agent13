@@ -569,6 +569,8 @@ class TestToolStats:
         assert stats.calls == {}
         assert stats.modes == {}
         assert stats.mode_successes == {}
+        assert stats.param_combos == {}
+        assert stats.param_combo_successes == {}
 
     def test_summary(self):
         """Summary returns expected structure."""
@@ -582,6 +584,65 @@ class TestToolStats:
         assert "read_file" in summary["by_tool"]
         assert summary["by_tool"]["read_file"]["modes"]["skim"] == 1
         assert summary["by_tool"]["read_file"]["mode_successes"]["skim"] == 1
+        assert "param_combos" in summary["by_tool"]["read_file"]
+
+    def test_param_combo_tracking(self):
+        """Param combos track sorted non-None argument names."""
+        from agent13.core import ToolStats
+
+        stats = ToolStats()
+        # Normal replace: find + content
+        stats.record(
+            "edit_file",
+            {"filepath": "x.py", "find": "old", "content": "new", "mode": "replace"},
+            '{"success": true}',
+        )
+        # Inferred replace: no find
+        stats.record(
+            "edit_file",
+            {"filepath": "x.py", "content": "new", "mode": "replace"},
+            '{"success": true}',
+        )
+        # Inferred replace that failed
+        stats.record(
+            "edit_file",
+            {"filepath": "x.py", "content": "new", "mode": "replace"},
+            '{"error": "not found"}',
+        )
+
+        combos = stats.param_combos["edit_file"]
+        assert "content,filepath,find,mode" in combos
+        assert combos["content,filepath,find,mode"] == 1
+        assert "content,filepath,mode" in combos
+        assert combos["content,filepath,mode"] == 2
+
+        # Successes tracked per combo
+        combo_s = stats.param_combo_successes["edit_file"]
+        assert combo_s["content,filepath,find,mode"] == 1
+        assert combo_s["content,filepath,mode"] == 1  # 1 success, 1 failure
+
+    def test_param_combo_excludes_none_values(self):
+        """None-valued arguments are excluded from the combo."""
+        from agent13.core import ToolStats
+
+        stats = ToolStats()
+        stats.record(
+            "edit_file",
+            {"filepath": "x.py", "find": None, "content": "new", "mode": "replace"},
+            '{"success": true}',
+        )
+        combo = list(stats.param_combos["edit_file"].keys())[0]
+        assert "find" not in combo
+
+    def test_param_combo_reset(self):
+        """Reset clears param combo tracking."""
+        from agent13.core import ToolStats
+
+        stats = ToolStats()
+        stats.record("read_file", {"filepath": "a.py"}, '{"content": ""}')
+        stats.reset()
+        assert stats.param_combos == {}
+        assert stats.param_combo_successes == {}
 
     def test_agent_has_tool_stats(self):
         """Agent initializes with ToolStats."""

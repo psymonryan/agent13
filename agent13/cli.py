@@ -35,9 +35,10 @@ from agent13 import (
     skill_manager_ctx,
     __version__,
 )
+from agent13.llm import close_tracked_asyncgens
 from agent13.persistence import save_context, get_auto_save_path
 from agent13.models import fetch_models, select_model, print_model_list
-from agent13.sandbox import parse_sandbox_mode
+from agent13.sandbox import parse_sandbox_mode, get_pinned_sandbox_mode
 from agent13.skills import SkillManager, ensure_default_skills
 from agent13.prompts import get_skills_section
 from tools.security import set_session_sandbox_mode
@@ -601,6 +602,11 @@ Provider names are read from ~/.agent13/config.toml
         except ValueError as e:
             print(f"Error: {e}", file=sys.stderr)
             sys.exit(1)
+    else:
+        # No explicit flag — check for a pinned mode for this project
+        pinned = get_pinned_sandbox_mode()
+        if pinned is not None:
+            set_session_sandbox_mode(pinned)
 
     # Create skill manager (needed for both batch and TUI if skills enabled)
     skill_manager = SkillManager(lambda: get_config())
@@ -618,24 +624,28 @@ Provider names are read from ~/.agent13/config.toml
         # Set skill manager context for skill tool
         if include_skills and skill_manager.skills:
             skill_manager_ctx.set(skill_manager)
-        await run_batch_with_display(
-            client=client,
-            model=model,
-            prompt=args.prompt,
-            read_files=args.read,
-            pretty=args.pretty == "on",
-            debug=args.debug,
-            tool_response_format=args.tool_response,
-            prompt_manager=prompt_manager,
-            system_prompt=system_prompt,
-            send_reasoning=args.send_reasoning,
-            remove_reasoning=args.remove_reasoning,
-            devel_mode=args.devel,
-            skills_mode=include_skills and bool(skill_manager.skills),
-            connect_mcp=args.mcp,
-            polite_interval=args.polite,
-            priming_enabled=args.priming_prompt,
-        )
+        try:
+            await run_batch_with_display(
+                client=client,
+                model=model,
+                prompt=args.prompt,
+                read_files=args.read,
+                pretty=args.pretty == "on",
+                debug=args.debug,
+                tool_response_format=args.tool_response,
+                prompt_manager=prompt_manager,
+                system_prompt=system_prompt,
+                send_reasoning=args.send_reasoning,
+                remove_reasoning=args.remove_reasoning,
+                devel_mode=args.devel,
+                skills_mode=include_skills and bool(skill_manager.skills),
+                connect_mcp=args.mcp,
+                polite_interval=args.polite,
+                priming_enabled=args.priming_prompt,
+            )
+        finally:
+            await client.close()
+            await close_tracked_asyncgens()
         log_session_end()
         sys.exit(0)
 
@@ -645,30 +655,34 @@ Provider names are read from ~/.agent13/config.toml
 
         if include_skills and skill_manager.skills:
             skill_manager_ctx.set(skill_manager)
-        await run_repl(
-            client=client,
-            model=model,
-            provider=provider_name,
-            pretty=args.pretty == "on",
-            debug=args.debug,
-            prompt_manager=prompt_manager,
-            system_prompt=system_prompt,
-            journal_mode=args.journal,
-            send_reasoning=args.send_reasoning,
-            remove_reasoning=args.remove_reasoning,
-            devel_mode=args.devel,
-            skills_mode=include_skills and bool(skill_manager.skills),
-            skill_manager=skill_manager,
-            continue_session=args.continue_session,
-            output_path=args.output,
-            model_names=model_names,
-            read_files=args.read,
-            polite_interval=args.polite,
-            bell_threshold=args.bell,
-            bell_enabled=cfg.bell_enabled,
-            bell_command=args.bell_command if args.bell_command is not None else cfg.bell_command,
-            priming_enabled=args.priming_prompt,
-        )
+        try:
+            await run_repl(
+                client=client,
+                model=model,
+                provider=provider_name,
+                pretty=args.pretty == "on",
+                debug=args.debug,
+                prompt_manager=prompt_manager,
+                system_prompt=system_prompt,
+                journal_mode=args.journal,
+                send_reasoning=args.send_reasoning,
+                remove_reasoning=args.remove_reasoning,
+                devel_mode=args.devel,
+                skills_mode=include_skills and bool(skill_manager.skills),
+                skill_manager=skill_manager,
+                continue_session=args.continue_session,
+                output_path=args.output,
+                model_names=model_names,
+                read_files=args.read,
+                polite_interval=args.polite,
+                bell_threshold=args.bell,
+                bell_enabled=cfg.bell_enabled,
+                bell_command=args.bell_command if args.bell_command is not None else cfg.bell_command,
+                priming_enabled=args.priming_prompt,
+            )
+        finally:
+            await client.close()
+            await close_tracked_asyncgens()
         log_session_end()
         sys.exit(0)
 

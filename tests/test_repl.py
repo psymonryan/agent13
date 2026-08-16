@@ -155,8 +155,8 @@ class MockAgent:
         self.messages.clear()
         return count
 
-    async def request_clear(self, clear_widgets=False):
-        self._calls.append(("request_clear", clear_widgets))
+    async def request_clear(self, mode="all", keep_turns=0):
+        self._calls.append(("request_clear", mode, keep_turns))
 
     def pause(self):
         self._calls.append(("pause",))
@@ -663,42 +663,38 @@ class TestClearCommand:
     """User clears message history."""
 
     async def test_clear_idle(self):
-        """/clear when agent is truly idle (no prior messages) — clears."""
-        # Using /clear without sending a message first, so processing_done
-        # is still set from initialisation (idle state).
+        """/clear when idle — preserves history, prints message."""
         output, agent = await run_scenario(["/clear", "/quit"])
 
         call = find_call(agent, "clear_messages")
-        assert call is not None
-        assert "Cleared 0" in output
+        assert call is None
+        assert "History preserved" in output
 
     async def test_clear_while_processing(self):
-        """/clear after sending a message — queues the clear.
-
-        After sending, processing_done is cleared. Without real agent
-        events firing, /clear sees the agent as 'busy' and queues.
-        """
+        """/clear while processing — preserves history, prints message."""
         output, agent = await run_scenario(
             ["hello", "", "/clear", "/quit"]
         )
 
         call = find_call(agent, "request_clear")
-        assert call is not None
-        assert "queued" in output.lower()
+        assert call is None
+        assert "History preserved" in output
 
     async def test_clear_no_messages(self):
-        """/clear with no messages — clears zero."""
+        """/clear with no messages — preserves history, prints message."""
         output, agent = await run_scenario(["/clear", "/quit"])
+
+        call = find_call(agent, "clear_messages")
+        assert call is None
+        assert "History preserved" in output
+
+    async def test_clear_all(self):
+        """/clear all — clears history in REPL."""
+        output, agent = await run_scenario(["/clear all", "/quit"])
 
         call = find_call(agent, "clear_messages")
         assert call is not None
         assert "Cleared 0" in output
-
-    async def test_clear_all(self):
-        """/clear all — notes that it has no extra effect in REPL."""
-        output, agent = await run_scenario(["/clear all", "/quit"])
-
-        assert "no effect in REPL" in output
 
 
 # ── Feature: /history command ──────────────────────────────────────

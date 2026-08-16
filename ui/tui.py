@@ -99,6 +99,9 @@ from agent13.sandbox import (
     parse_sandbox_mode,
     get_default_sandbox_mode,
     validate_sandbox_profiles,
+    get_pinned_sandbox_mode,
+    pin_sandbox_mode,
+    unpin_sandbox_mode,
 )
 from tools.security import (
     set_session_sandbox_mode,
@@ -538,6 +541,7 @@ class AgentTUI(App):
         "/help",
         "/exit",
         "/clear",
+        "/rebuild",
         "/history",
         "/delete",
         "/model",
@@ -583,6 +587,7 @@ class AgentTUI(App):
         "model": "_get_model_completions",  # Method to get model names
         "mcp": ["connect", "disconnect", "reload"],  # MCP subcommands
         "sandbox": None,  # Will use _get_sandbox_completions method
+        "clear": ["all"],
         "pretty": ["on", "off"],
         "tool-response": ["raw", "json"],
         "provider": "_get_provider_completions",  # Method to get provider names
@@ -1123,14 +1128,14 @@ class AgentTUI(App):
         return [opt for opt in options if opt.lower().startswith(partial_lower)]
 
     def _get_sandbox_completions(self, partial: str) -> list[str]:
-        """Get completions for sandbox modes."""
+        """Get completions for sandbox modes and subcommands."""
         from agent13.sandbox import SandboxMode
 
-        modes = [mode.value for mode in SandboxMode]
+        options = [mode.value for mode in SandboxMode] + ["pin", "unpin"]
         if not partial:
-            return modes
+            return options
         partial_lower = partial.lower()
-        return [m for m in modes if m.lower().startswith(partial_lower)]
+        return [m for m in options if m.lower().startswith(partial_lower)]
 
     def _get_provider_completions(self, partial: str, full_text: str = "") -> list[str]:
         """Get completions for provider names from config.
@@ -1811,13 +1816,10 @@ class AgentTUI(App):
         async def on_messages_cleared(event: AgentEventData):
             if event.event != AgentEvent.MESSAGES_CLEARED:
                 return
-            # Deferred /clear completed at safe boundary
+            # Deferred /clear or /clear all completed at safe boundary
             count = event.data.get("count", 0)
-            clear_widgets = event.data.get("clear_widgets", False)
-            # Only clear chat window widgets if user explicitly
-            # requested /clear all — default /clear preserves
-            # scrollback so users can review prior results
-            if clear_widgets and self._chat_ready():
+            # Both "all" and "trim" modes clear the display
+            if self._chat_ready():
                 await self._chat.remove_children()
             # Reset TUI token counters to match agent
             self.prompt_tokens = 0
@@ -1899,7 +1901,8 @@ class AgentTUI(App):
             if line.strip():
                 asyncio.create_task(
                     self._write_system(
-                        f"[dim yellow]MCP {server_name}:[/] [dim]{line}[/]",
+                        f"[dim yellow]MCP {escape_markup(server_name)}:[/] "
+                        f"[dim]{escape_markup(line)}[/]",
                         escape_text=False,
                     )
                 )
@@ -1912,7 +1915,7 @@ class AgentTUI(App):
             if warning:
                 asyncio.create_task(
                     self._write_system(
-                        f"[yellow]⚠ MCP WARNING:[/]\n{warning}",
+                        f"[yellow]⚠ MCP WARNING:[/]\n{escape_markup(warning)}",
                         escape_text=False,
                     )
                 )
@@ -2057,7 +2060,8 @@ class AgentTUI(App):
                 info = await mcp.connect_all()
                 if info:
                     await self._write_system(
-                        f"[dim]MCP connected: {list(info.keys())}[/]", escape_text=False
+                        f"[dim]MCP connected: {escape_markup(str(list(info.keys())))}[/]",
+                        escape_text=False,
                     )
                 else:
                     await self._write_system("[dim]MCP: No servers connected[/]")
@@ -2148,6 +2152,59 @@ class AgentTUI(App):
         return (
             not self._shutting_down and hasattr(self, "_chat") and self._chat.is_mounted
         )
+
+    async def _clear_chat_display(self) -> None:
+        """Clear chat window widgets only (display-only /clear).
+
+        Does not touch message history. Safe to call from sync context
+        via asyncio.create_task.
+        """
+        if not self._chat_ready():
+            return
+        try:
+            await self._chat.remove_children()
+        except Exception:
+            pass
+
+    async def _clear_and_show_last_n(self, keep_turns: int) -> None:
+        """Clear chat window and rebuild showing only last N turns.
+
+        Does not touch message history. A turn = one user message +
+        the assistant response + any intervening tool calls/results.
+        """
+        if not self._chat_ready():
+            return
+        messages = self.agent.messages
+        if not messages:
+            try:
+                await self._chat.remove_children()
+            except Exception:
+                pass
+            return
+
+        # Find the index of the first message in the last N turns
+        user_indices = [
+            i for i, m in enumerate(messages) if m.get("role") == "user"
+        ]
+        if len(user_indices) <= keep_turns:
+            # Not enough turns to trim — show everything
+            await self._rebuild_chat()
+            return
+
+        cut_index = user_indices[-keep_turns]
+        recent = messages[cut_index:]
+
+        try:
+            await self._chat.remove_children()
+        except Exception:
+            pass
+        await self._rebuild_from_messages(recent)
+        await self._write_system(
+            f"Showing last {keep_turns} turns ({len(recent)} messages, "
+            f"history untouched)"
+        )
+        self._chat.scroll_end(animate=False)
+        self._chat.anchor()
 
     async def _write_system(self, text: str, escape_text: bool = True) -> None:
         """Write a system message (non-streaming).
@@ -2299,9 +2356,42 @@ class AgentTUI(App):
         messages = self.agent.messages
 
         if not messages:
-            await self._write_system("[dim]No messages in loaded context[/]")
+            await self._write_system("[dim]No messages in history[/]")
             return
 
+        await self._rebuild_from_messages(messages)
+
+    async def _rebuild_chat(self) -> None:
+        """Rebuild the chat window from message history (/rebuild command).
+
+        Clears the chat window and repopulates it from agent.messages,
+        reconstructing user messages, assistant content (with markdown),
+        tool calls/results, and reasoning blocks.
+        """
+        if not self._chat_ready():
+            return
+        await self._chat.remove_children()
+
+        messages = self.agent.messages
+
+        if not messages:
+            await self._write_system("[dim]No messages in history[/]")
+            return
+
+        await self._rebuild_from_messages(messages)
+        count = len(messages)
+        await self._write_system(f"Rebuilt chat from {count} messages")
+        self._chat.scroll_end(animate=False)
+        self._chat.anchor()
+
+    async def _rebuild_from_messages(self, messages: list) -> None:
+        """Rebuild chat widgets from a list of message dicts.
+
+        Shared by _replay_loaded_messages and _rebuild_chat.
+        Renders user messages, assistant content (StreamingMessage with
+        markdown), reasoning blocks (ReasoningMessage, collapsed by default),
+        and tool call/result pairs.
+        """
         # Track tool calls so we can pair them with results
         pending_tool_calls = {}  # tool_call_id -> (name, arguments)
 
@@ -2317,6 +2407,19 @@ class AgentTUI(App):
                     await self._write_user(content)
 
             elif role == "assistant":
+                # Display reasoning if present
+                reasoning = msg.get("reasoning_content")
+                if reasoning and reasoning.strip():
+                    was_at_bottom = self._is_at_bottom()
+                    r_widget = ReasoningMessage(
+                        title="Thinking", collapsed=True
+                    )
+                    r_widget.add_class("assistant-message")
+                    if await self._safe_mount(r_widget):
+                        await r_widget.append(reasoning)
+                        await r_widget.finalize()
+                        await self._scroll_if_at_bottom(was_at_bottom)
+
                 # Display assistant content (if any text before tool calls)
                 if content and content.strip():
                     was_at_bottom = self._is_at_bottom()
@@ -2833,6 +2936,14 @@ class AgentTUI(App):
 
         # Context (always shown, positioned after duration)
         ctx_str = f"Ctx: {total_str}"
+
+        # Turn count (hidden when zero)
+        turn_count = sum(
+            1
+            for m in self.agent.messages
+            if m.get("role") == "user" and not m.get("interrupt")
+        )
+        trn_str = f" | trn: {turn_count}" if turn_count > 0 else ""
         # MCP connection status (only show when connected)
         mcp_str = ""
         if self.agent.mcp and self.agent.mcp.is_connected():
@@ -2865,9 +2976,9 @@ class AgentTUI(App):
             # Log the anomaly but don't display it
             if is_debug_enabled():
                 log_tps_event("sanity_check_failed", {"absurd_tps": self._last_tps})
-        # Build right side: dur: | Ctx: | mcp: | jnl: | pol: | Tools: | tps:
+        # Build right side: dur: | Ctx: | trn: | mcp: | jnl: | pol: | Tools: | tps:
         right_side = (
-            f"{elapsed_str}{ctx_str}{mcp_str}{jnl_str}{pol_str}{tools_str}{tps_str}"
+            f"{elapsed_str}{ctx_str}{trn_str}{mcp_str}{jnl_str}{pol_str}{tools_str}{tps_str}"
             .strip()
         )
         self._status_right.update(right_side)
@@ -3046,8 +3157,17 @@ class AgentTUI(App):
         elif command == "delete":
             self._handle_delete_command(args)
         elif command == "clear":
-            clear_all = args.strip().lower() == "all"
-            asyncio.create_task(self.agent.request_clear(clear_widgets=clear_all))
+            arg = args.strip().lower()
+            if arg == "all":
+                asyncio.create_task(self.agent.request_clear(mode="all"))
+            elif arg.isdigit():
+                keep = int(arg)
+                asyncio.create_task(self._clear_and_show_last_n(keep))
+            else:
+                # /clear with no args — pure UI operation, history untouched
+                asyncio.create_task(self._clear_chat_display())
+        elif command == "rebuild":
+            asyncio.create_task(self._rebuild_chat())
         elif command == "prompt":
             self._handle_prompt_command(args)
         elif command == "pretty":
@@ -3278,11 +3398,14 @@ class AgentTUI(App):
             "  [yellow]/delete h N[/] - Delete message group N from history\n"
             "  [yellow]/delete q N[/] - Delete queue item N\n"
             "  [yellow]/delete s NAME[/] - Delete saved context\n"
-            "  [yellow]/clear [all][/] - Clear context (all: also clear scrollback)\n"
+            "  [yellow]/clear[/] - Clear chat window (history preserved)\n"
+            "  [yellow]/clear N[/] - Clear chat window, show last N turns (history preserved)\n"
+            "  [yellow]/clear all[/] - Clear chat window AND wipe message history\n"
+            "  [yellow]/rebuild[/] - Rebuild chat window from full message history\n"
             "  [yellow]/prompt [name][/] - Switch system prompt (tab to list)\n"
             "  [yellow]/pretty [on|off][/] - Toggle markdown rendering\n"
             "  [yellow]/tool-response [raw|json][/] - Set tool response format\n"
-            "  [yellow]/sandbox [mode][/] - Show/set sandbox mode\n"
+            "  [yellow]/sandbox [mode|pin|unpin][/] - Show/set sandbox mode, pin per-project\n"
             "  [yellow]/cwd [@path][/] - Show or change working directory (prefix @ for path completion)\n"
             "  [yellow]/mcp [connect|disconnect|reload][/] - List/manage MCP servers\n"
             "  [yellow]/tools[/] - Show tool usage statistics\n"
@@ -3908,6 +4031,7 @@ class AgentTUI(App):
         input_field = self.query_one("#input-field", ChatTextArea)
         input_field.text = user_text
         input_field.focus()
+        self.update_status()
         self._update_info_content(
             "[dim]Last message removed and loaded for editing. "
             "Press Enter to retry.[/]"
@@ -4013,6 +4137,7 @@ class AgentTUI(App):
             current = get_current_sandbox_mode()
             session = get_session_sandbox_mode()
             config_default = get_default_sandbox_mode()
+            pinned = get_pinned_sandbox_mode()
 
             lines = ["[bold]Sandbox Configuration:[/]"]
             lines.append(f"  Current mode: [cyan]{current.value}[/]")
@@ -4021,15 +4146,46 @@ class AgentTUI(App):
             else:
                 lines.append("  Session override: [dim]none (using config default)[/]")
             lines.append(f"  Config default: [dim]{config_default.value}[/]")
+            if pinned:
+                lines.append(
+                    f"  Pinned for this project: [yellow]{pinned.value}[/]"
+                )
+            else:
+                lines.append("  Pinned for this project: [dim]none[/]")
             lines.append("")
             lines.append(format_all_sandbox_modes())
             lines.append("")
-            lines.append("[dim]Usage: /sandbox <mode> to set session override[/]")
+            lines.append("[dim]/sandbox <mode>  set session mode[/]")
+            lines.append("[dim]/sandbox pin     pin current mode for this project[/]")
+            lines.append(
+                "[dim]/sandbox unpin   remove pin for this project[/]"
+            )
             self._update_info_content("\n".join(lines))
             return
 
-        # Set session override
         mode_str = args.strip().lower()
+
+        if mode_str == "pin":
+            current = get_current_sandbox_mode()
+            pin_sandbox_mode(current)
+            self._update_info_content(
+                f"[green]Pinned sandbox mode '{current.value}' for this project.[/]\n"
+                "[dim]This mode will auto-apply on startup in this directory.[/]"
+            )
+            return
+
+        if mode_str == "unpin":
+            if unpin_sandbox_mode():
+                self._update_info_content(
+                    "[green]Removed sandbox pin for this project.[/]"
+                )
+            else:
+                self._update_info_content(
+                    "[yellow]No sandbox pin exists for this project.[/]"
+                )
+            return
+
+        # Set session override
         try:
             mode = parse_sandbox_mode(mode_str)
             set_session_sandbox_mode(mode)
@@ -4176,6 +4332,14 @@ class AgentTUI(App):
                 mode_str = ""
 
             lines.append(f"  [yellow]{name}[/]  {success_str}{mode_str}")
+
+            # Param combo breakdown
+            combos = stats.param_combos.get(name, {})
+            if combos and len(combos) > 1:
+                combo_successes = stats.param_combo_successes.get(name, {})
+                for combo, count in sorted(combos.items(), key=lambda x: x[1], reverse=True):
+                    cs = combo_successes.get(combo, 0)
+                    lines.append(f"    [dim]{combo}={cs}/{count}[/]")
 
         self._update_info_content("\n".join(lines))
 
@@ -4535,6 +4699,7 @@ class AgentTUI(App):
         from agent13.commands import execute_polite
 
         result = execute_polite(self.agent, args)
+        self.update_status()
         if not args.strip():
             # Status query — show in yellow (info, not success/error)
             self._update_info_content(f"[yellow]{escape_markup(result.message)}[/]")
@@ -5733,6 +5898,11 @@ Provider names are read from ~/.agent13/config.toml
         except ValueError as e:
             print(f"Error: {e}", file=sys.stderr)
             sys.exit(1)
+    else:
+        # No explicit flag — check for a pinned mode for this project
+        pinned = get_pinned_sandbox_mode()
+        if pinned is not None:
+            set_session_sandbox_mode(pinned)
 
     # Create skill manager
     skill_manager = SkillManager(lambda: get_config())

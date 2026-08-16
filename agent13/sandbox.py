@@ -435,6 +435,126 @@ def get_effective_sandbox_mode(
     return get_default_sandbox_mode()
 
 
+# ---------------------------------------------------------------------------
+# Sandbox pinning (per-project persistent sandbox mode)
+# ---------------------------------------------------------------------------
+# Pins are stored in ~/.agent13/sandbox-pins.toml as a flat table:
+#   "/abs/path/to/project" = "off"
+#   "/abs/path/to/another" = "permissive-closed"
+#
+# This avoids modifying the user's hand-edited config.toml and keeps the
+# pin data simple enough to write without a TOML writer library.
+
+
+def _get_sandbox_pins_file() -> Path:
+    """Return the path to the sandbox pins file."""
+    from agent13.config_paths import get_config_dir
+
+    return get_config_dir() / "sandbox-pins.toml"
+
+
+def load_sandbox_pins() -> dict[str, str]:
+    """Load all sandbox pins from the pins file.
+
+    Returns:
+        Dict mapping absolute project path -> sandbox mode string.
+        Empty dict if file doesn't exist or is invalid.
+    """
+    pins_file = _get_sandbox_pins_file()
+    if not pins_file.exists():
+        return {}
+
+    try:
+        with open(pins_file, "rb") as f:
+            data = tomllib.load(f)
+        return {k: v for k, v in data.items() if isinstance(v, str)}
+    except Exception:
+        return {}
+
+
+def save_sandbox_pins(pins: dict[str, str]) -> None:
+    """Write sandbox pins to the pins file.
+
+    Args:
+        pins: Dict mapping absolute project path -> sandbox mode string.
+    """
+    from agent13.config_paths import ensure_config_dir
+
+    pins_file = _get_sandbox_pins_file()
+    ensure_config_dir()
+
+    lines = []
+    for path in sorted(pins.keys()):
+        mode = pins[path]
+        escaped = path.replace("\\", "\\\\")
+        lines.append(f'"{escaped}" = "{mode}"')
+
+    content = "# Sandbox pins - per-project persistent sandbox mode\n"
+    content += "# Managed by /sandbox pin and /sandbox unpin\n"
+    if lines:
+        content += "\n".join(lines) + "\n"
+
+    pins_file.write_text(content)
+
+
+def get_pinned_sandbox_mode(
+    project_dir: Optional[Path] = None,
+) -> Optional[SandboxMode]:
+    """Get the pinned sandbox mode for a project directory.
+
+    Args:
+        project_dir: The project directory. Defaults to cwd.
+
+    Returns:
+        The pinned SandboxMode, or None if no pin exists.
+    """
+    if project_dir is None:
+        project_dir = Path.cwd()
+    key = str(project_dir.resolve())
+    pins = load_sandbox_pins()
+    if key not in pins:
+        return None
+    try:
+        return parse_sandbox_mode(pins[key])
+    except ValueError:
+        return None
+
+
+def pin_sandbox_mode(mode: SandboxMode, project_dir: Optional[Path] = None) -> None:
+    """Pin a sandbox mode for a project directory.
+
+    Args:
+        mode: The sandbox mode to pin.
+        project_dir: The project directory. Defaults to cwd.
+    """
+    if project_dir is None:
+        project_dir = Path.cwd()
+    key = str(project_dir.resolve())
+    pins = load_sandbox_pins()
+    pins[key] = mode.value
+    save_sandbox_pins(pins)
+
+
+def unpin_sandbox_mode(project_dir: Optional[Path] = None) -> bool:
+    """Remove the sandbox pin for a project directory.
+
+    Args:
+        project_dir: The project directory. Defaults to cwd.
+
+    Returns:
+        True if a pin was removed, False if no pin existed.
+    """
+    if project_dir is None:
+        project_dir = Path.cwd()
+    key = str(project_dir.resolve())
+    pins = load_sandbox_pins()
+    if key not in pins:
+        return False
+    del pins[key]
+    save_sandbox_pins(pins)
+    return True
+
+
 def build_sandbox_command(
     command: str, mode: SandboxMode, project_dir: Optional[Path] = None
 ) -> list[str]:

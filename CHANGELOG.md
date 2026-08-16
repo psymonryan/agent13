@@ -5,6 +5,32 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.3] - 2026-08-16
+
+### Added
+
+- Add per-project sandbox pinning via /sandbox pin|unpin
+- Add trn: N turn count to status bar, hidden when zero
+- Add /clear (display only), /clear all, /clear N, and /rebuild commands
+- feat(tools): param combo tracking in /tools stats display
+- feat(edit_file): greedy anchor inference for replace mode without find
+
+### Fixed
+
+- fix: close leaked async generators to prevent httpcore2 RuntimeError on event loop shutdown
+- fix: close AsyncOpenAI client on batch/REPL exit to prevent httpcore2 generator errors
+- fix: explicitly close LLM streams to prevent httpcore2 RuntimeError on event loop shutdown
+- dependency fix for httpx
+- fix(tui): escape external content in MCP system messages to prevent MarkupError
+- fix(tui): refresh status bar immediately on /polite toggle
+- Fix /clear N to not modify message history - display-only rebuild from last N turns
+
+### Changed
+
+- Simplify edit_file prompt: remove auto-indent hint, clean mode list
+- Skip bell for /clear and /load - instant operations should not trigger WAITING→IDLE cycle
+- minor prompt and doco changes
+
 ## [0.3.2] - 2026-08-07
 
 ### Changed
@@ -34,9 +60,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - upgraded libraries prior to release to avoid new CVEs
+
 - Harden upgrade download against malformed content-length, restore PEP 427 comment
+
 - Hide /quit from tab completions in favour of /exit
+
 - /pause during polite wait pauses immediately instead of showing "next safe point"
+
 - Rewrote journalled user messages with [previous user message] prefix to break reflection priming pattern
   
   ## [0.3.0] - 2026-07-29

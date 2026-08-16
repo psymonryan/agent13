@@ -57,6 +57,9 @@ from agent13.status import get_tool_stats_summary
 from agent13.sandbox import (
     parse_sandbox_mode,
     get_default_sandbox_mode,
+    get_pinned_sandbox_mode,
+    pin_sandbox_mode,
+    unpin_sandbox_mode,
 )
 from tools.security import (
     set_session_sandbox_mode,
@@ -78,7 +81,7 @@ COMMANDS = {
     "/save": "Save session (e.g. /save mysession)",
     "/load": "Load session (e.g. /load mysession)",
     "/multi": "Enter multi-line mode (end with . on its own line) or just put a \\ on the end of the line",
-    "/clear": "Clear message history (/clear all to clear everything)",
+    "/clear": "Clear display: /clear (display only), /clear N (show last N turns), /clear all (wipe history + display)",
     "/history": "Show message history (grouped)",
     "/queue": "Show queued messages",
     "/retry": "Retry the last message",
@@ -89,7 +92,7 @@ COMMANDS = {
     "/compact": "Compact entire history: /compact [optional prompt name]",
     "/model": "Switch model: /model [name|number] (no args lists available models)",
     "/provider": "Switch provider: /provider <name|url>",
-    "/sandbox": "Show or set sandbox mode: /sandbox [off|permissive-open|permissive-closed|strict]",
+    "/sandbox": "Sandbox mode: /sandbox [mode|pin|unpin] (no args shows status)",
     "/bell": "Bell on idle: /bell [N|off] (0=always, N=threshold seconds)",
     "/bell-command": "Set external bell command: /bell-command [cmd|off]",
     "/devel": "Toggle devel mode: /devel [on|off|status]",
@@ -883,19 +886,29 @@ async def run_repl(
                     continue
 
                 elif cmd == "/clear":
-                    clear_all = cmd_arg.strip().lower() == "all"
-                    if agent.is_idle:
-                        count = agent.clear_messages()
-                        print(f"  Cleared {count} messages")
-                    else:
-                        # Queue the clear so it happens at a safe boundary
-                        await agent.request_clear(clear_widgets=False)
+                    arg = cmd_arg.strip().lower()
+                    if arg == "all":
+                        if agent.is_idle:
+                            count = agent.clear_messages()
+                            print(f"  Cleared {count} messages")
+                        else:
+                            await agent.request_clear(mode="all")
+                            print(
+                                "  Clear queued (will take effect after current response)"
+                            )
+                    elif arg.isdigit():
+                        # /clear N in REPL — no display to rebuild,
+                        # history untouched
                         print(
-                            "  Clear queued (will take effect after current response)"
+                            f"  History preserved ({len(agent.messages)} messages). "
+                            "Use /clear all to wipe."
                         )
-                    if clear_all:
+                    else:
+                        # /clear with no args in REPL — no display to wipe,
+                        # history untouched
                         print(
-                            "  (Note: /clear all has no effect in REPL — no scrollback to clear)"
+                            f"  History preserved ({len(agent.messages)} messages). "
+                            "Use /clear all to wipe."
                         )
 
                 elif cmd == "/history":
@@ -1123,6 +1136,7 @@ async def run_repl(
                         current = get_current_sandbox_mode()
                         session = get_session_sandbox_mode()
                         config_default = get_default_sandbox_mode()
+                        pinned = get_pinned_sandbox_mode()
                         print("\n  Sandbox Configuration:")
                         print(f"    Current mode: {current.value}")
                         if session:
@@ -1130,14 +1144,29 @@ async def run_repl(
                         else:
                             print("    Session override: none (using config default)")
                         print(f"    Config default: {config_default.value}")
+                        if pinned:
+                            print(f"    Pinned for this project: {pinned.value}")
+                        else:
+                            print("    Pinned for this project: none")
                         print()
-                        # Print available modes (plain text)
                         from agent13.sandbox import SandboxMode
 
                         for mode in SandboxMode:
                             print(f"    - {mode.value}")
                         print()
-                        print("  Use /sandbox <mode> to set session override")
+                        print("  /sandbox <mode>  set session mode")
+                        print("  /sandbox pin     pin current mode for this project")
+                        print("  /sandbox unpin   remove pin for this project")
+                    elif args == "pin":
+                        current = get_current_sandbox_mode()
+                        pin_sandbox_mode(current)
+                        print(f"  Pinned sandbox mode '{current.value}' for this project")
+                        print("  This mode will auto-apply on startup in this directory.")
+                    elif args == "unpin":
+                        if unpin_sandbox_mode():
+                            print("  Removed sandbox pin for this project")
+                        else:
+                            print("  No sandbox pin exists for this project")
                     else:
                         try:
                             mode = parse_sandbox_mode(args)

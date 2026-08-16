@@ -615,8 +615,10 @@ class TestCreateClient:
         assert str(client.base_url).startswith("https://api.example.com/v1")
         # Verify timeout is set
         timeout = client._client.timeout
-        assert timeout.read == 2400.0
-        assert timeout.connect == 30.0
+        # openai SDK wraps httpx.Timeout; .read is an httpx.Timeout whose
+        # .read attribute holds the actual float value
+        assert timeout.read.read == 2400.0
+        assert timeout.connect.connect == 30.0
 
     def test_create_client_custom_timeout(self):
         """create_client with custom read_timeout and connect_timeout passes them through."""
@@ -628,8 +630,8 @@ class TestCreateClient:
         )
         assert str(client.base_url).startswith("https://api.example.com/v1")
         timeout = client._client.timeout
-        assert timeout.read == 4800.0
-        assert timeout.connect == 60.0
+        assert timeout.read.read == 4800.0
+        assert timeout.connect.connect == 60.0
 
     def test_create_client_with_placeholder_key(self):
         """create_client works with placeholder API key (local servers use 'none')."""

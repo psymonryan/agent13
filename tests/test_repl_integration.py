@@ -338,7 +338,7 @@ class TestSaveLoadExperience:
             proc.expect("Saved", timeout=5)
             wait_for_prompt(proc)
 
-            proc.sendline("/clear")
+            proc.sendline("/clear all")
             time.sleep(1)
             proc.expect("leared", timeout=5)
             wait_for_prompt(proc)
@@ -412,7 +412,7 @@ class TestSaveLoadExperience:
             wait_for_prompt(proc)
 
             # Clear and load with explicit .ctx extension
-            proc.sendline("/clear")
+            proc.sendline("/clear all")
             time.sleep(1)
             proc.expect("leared", timeout=5)
             wait_for_prompt(proc)
@@ -524,7 +524,7 @@ class TestClearExperience:
             proc.expect("Hello! I'm a mock assistant", timeout=10)
             wait_for_prompt(proc)
 
-            proc.sendline("/clear")
+            proc.sendline("/clear all")
             time.sleep(1)
 
             # Should see "leared" (cleared/Cleared) with message count

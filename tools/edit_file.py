@@ -844,6 +844,93 @@ def _build_preview(
 
 
 # =============================================================================
+# Greedy Anchor Inference — fallback when 'find' is omitted
+# =============================================================================
+# When a model calls replace mode with only 'content' (no 'find'), we try to
+# locate the old text by greedily matching from both ends of content:
+#   1. Grow a prefix of content char-by-char until it uniquely matches in file
+#   2. Grow a suffix of content char-by-char until it uniquely matches (after start)
+#   3. Replace the span between the two anchor points with content
+# If either anchor can't reach uniqueness, we give up and ask for 'find'.
+
+
+def _find_all_substr(text: str, needle: str, start: int, end: int) -> list[int]:
+    """Find all positions of needle in text[start:end]."""
+    positions = []
+    pos = start
+    while True:
+        idx = text.find(needle, pos, end)
+        if idx == -1:
+            break
+        positions.append(idx)
+        pos = idx + 1
+    return positions
+
+
+def _greedy_anchor_match(
+    text: str, content: str, search_start: int = 0, search_end: int = None
+) -> Optional[tuple[int, int, str]]:
+    """Find unique start and end anchor positions for content in text.
+
+    Greedily grows anchor chunks from both ends of content until each
+    uniquely matches in text (within the search region).
+
+    Args:
+        text: The full file content to search within
+        content: The replacement text (whose boundaries are used as anchors)
+        search_start: Character offset to start searching (inclusive)
+        search_end: Character offset to end searching (exclusive)
+
+    Returns:
+        (start_pos, end_pos_exclusive, error_message) — on success,
+        error_message is empty. On failure, start/end are 0 and
+        error_message explains why.
+    """
+    if search_end is None:
+        search_end = len(text)
+
+    content_len = len(content)
+    if content_len == 0:
+        return 0, 0, "content is empty"
+
+    # --- Start anchor: grow prefix of content until unique match ---
+    start_pos = None
+    for n in range(1, content_len + 1):
+        chunk = content[:n]
+        matches = _find_all_substr(text, chunk, search_start, search_end)
+        if len(matches) == 0:
+            return 0, 0, (
+                "start of content not found in file"
+            )
+        if len(matches) == 1:
+            start_pos = matches[0]
+            break
+        # Multiple matches — grow prefix
+    else:
+        # Entire content matches multiple places — ambiguous
+        return 0, 0, (
+            "start of content matches multiple locations (ambiguous)"
+        )
+
+    # --- End anchor: grow suffix of content, search after start_pos ---
+    for m in range(1, content_len + 1):
+        chunk = content[content_len - m:]
+        matches = _find_all_substr(text, chunk, start_pos, search_end)
+        if len(matches) == 0:
+            return 0, 0, (
+                "end of content not found after start"
+            )
+        if len(matches) == 1:
+            end_pos_excl = matches[0] + m
+            return start_pos, end_pos_excl, ""
+        # Multiple matches — grow suffix
+    else:
+        return 0, 0, (
+            "end of content matches multiple locations (ambiguous)"
+        )
+
+
+# =============================================================================
 # edit_file Tool
 # =============================================================================
 
@@ -859,13 +946,13 @@ def edit_file(
     replace_all: bool = False,
     snapshot_id: Optional[int] = None,
 ) -> dict:
-    """Edit a file using line-based navigation. Modes: replace (default), append, prepend, replace_range, delete, rollback.
+    """Edit a file using line-based navigation. Modes: replace, append, prepend, replace_range, delete, rollback.
 
     Args:
         filepath: Path to file
         find: Text to find (replace/delete/append/prepend modes)
-        content: Content to insert or replace with (all modes except delete/rollback). If python, the first line indent may be autocorrected
-        mode: Edit mode — "rollback" undoes last edit; "rollback" + snapshot_id restores specific snapshot
+        content: Content to insert or replace with (all modes except delete/rollback)
+        mode: replace, append, prepend, replace_range, delete, or rollback
         start_line: Start line number (1-indexed, inclusive)
         end_line: End line number (1-indexed, inclusive)
         replace_all: Act on all matches (default: False)
@@ -946,8 +1033,11 @@ def edit_file(
 
     # Validate parameters for each non-rollback mode
     if mode == "replace":
-        if find is None or content is None:
+        if find is None and content is None:
             return {"error": f"Mode '{mode}' requires 'find' and 'content' parameters"}
+        if content is None:
+            return {"error": f"Mode '{mode}' requires 'content' parameter"}
+        # find is None but content is provided — will try greedy anchor inference
     elif mode == "delete":
         # Delete mode requires either find OR start_line/end_line
         if find is None and (start_line is None or end_line is None):
@@ -1040,20 +1130,72 @@ def edit_file(
     auto_indent = None  # Set by append/prepend/replace_range if auto-correct fires
 
     if mode == "replace":
-        success, modified_lines, error, num_replacements = _do_replace(
-            modified_lines, find, content, range_start, range_end, False, replace_all
-        )  # match_target_indentation disabled
-        if not success:
-            return {"success": False, "error": error}
-        # Build informative message with replacement count
-        if num_replacements == 1:
-            edit_description = f"Replaced 1 occurrence of '{find}' with '{content}'"
-        else:
-            edit_description = (
-                f"Replaced {num_replacements} occurrences of '{find}' with '{content}'"
+        if find is None:
+            # --- Greedy anchor inference (no 'find' provided) ---
+            # Clean content the same way other modes do
+            content_lines = content.splitlines()
+            content_lines = _clean_whitespace_lines(content_lines)
+            clean_content = "\n".join(content_lines)
+
+            # Determine search region from line range (character offsets)
+            if range_start is not None or range_end is not None:
+                # Compute character offsets for the line range
+                char_pos = 0
+                line_offsets = [0]
+                for ch in original_content:
+                    if ch == "\n":
+                        line_offsets.append(char_pos + 1)
+                    char_pos += 1
+                s = line_offsets[range_start] if range_start is not None else 0
+                if range_end is not None and range_end + 1 < len(line_offsets):
+                    e = line_offsets[range_end + 1]
+                else:
+                    e = len(original_content)
+            else:
+                s, e = 0, len(original_content)
+
+            start_pos, end_pos_excl, infer_error = _greedy_anchor_match(
+                original_content, clean_content, s, e
             )
-        if start_line is not None:
-            edit_description += f" in lines {start_line}-{end_line}"
+            if infer_error:
+                return {
+                    "success": False,
+                    "error": (
+                        "No 'find' provided — tried to infer the replacement "
+                        f"location from content boundaries, but failed: {infer_error}. "
+                        "Provide 'find' (the exact text currently in the file) "
+                        "and 'content' (the new text)."
+                    ),
+                }
+
+            # Extract what we're replacing (for result transparency)
+            old_text = original_content[start_pos:end_pos_excl]
+            original_lines = old_text.splitlines()
+
+            # Build the new file content
+            new_content = (
+                original_content[:start_pos]
+                + clean_content
+                + original_content[end_pos_excl:]
+            )
+            modified_lines = new_content.splitlines()
+            edit_description = "Inferred replacement (no 'find' provided)"
+            num_replacements = 1
+        else:
+            success, modified_lines, error, num_replacements = _do_replace(
+                modified_lines, find, content, range_start, range_end, False, replace_all
+            )  # match_target_indentation disabled
+            if not success:
+                return {"success": False, "error": error}
+            # Build informative message with replacement count
+            if num_replacements == 1:
+                edit_description = f"Replaced 1 occurrence of '{find}' with '{content}'"
+            else:
+                edit_description = (
+                    f"Replaced {num_replacements} occurrences of '{find}' with '{content}'"
+                )
+            if start_line is not None:
+                edit_description += f" in lines {start_line}-{end_line}"
     elif mode == "append":
         # Clean whitespace from content
         new_lines = content.splitlines()
@@ -1438,6 +1580,8 @@ def edit_file(
     # Include replacement/deletion count for replace and delete modes
     if mode == "replace":
         result["replacements"] = num_replacements
+        if find is None:
+            result["inferred"] = True
     elif mode == "delete" and find is not None:
         result["deletions"] = num_replacements  # num_replacements holds deletion count
     # Include original content for verification when lines were replaced

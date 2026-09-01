@@ -189,7 +189,7 @@ async def test_polite_agent_acquires_and_releases(mock_server, isolated_config):
     # The lock file should exist after set_polite (created on construction)
     assert agent.polite_lock is not None
     lock_path = agent.polite_lock.path
-    assert lock_path.parent == isolated_config
+    assert lock_path.parent == isolated_config / "locks"
 
     # Run a turn
     agent.queue.add("hello")

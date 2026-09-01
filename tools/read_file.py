@@ -3,13 +3,16 @@
 As a tool, returns dict with filepath, total_lines, view type, and content.
 """
 
+import base64
 import re
 from pathlib import Path
 from typing import Optional, Dict, List
 
-from tools import tool
+from tools import tool, ToolResult
 from tools.security import validate_path_for_read, get_current_sandbox_mode
 from agent13.file_injection import is_probably_text
+
+IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".tiff"}
 
 
 # =============================================================================
@@ -591,17 +594,23 @@ def _generate_raw_view(
 
 @tool
 def read_file(
-    filepath: str, offset: Optional[int] = None, limit: Optional[int] = None
-) -> dict:
+    filepath: str,
+    offset: Optional[int] = None,
+    limit: Optional[int] = None,
+    question: Optional[str] = None,
+) -> "dict | ToolResult":
     """Read a file. No params = skim (symbols). offset/limit = raw lines.
 
     Args:
         filepath: Path to file
         offset: Starting line (1-indexed)
         limit: Max lines to return
+        question: For image files — specific question for the vision model
+                  (e.g. "What color is the third tab?"). Omit for generic description.
 
     Returns:
-        Dict with filepath, total_lines, view type, and content
+        Dict with filepath, total_lines, view type, and content.
+        For image files: ToolResult with image data URI.
     """
     # Reject embedded null bytes early — .resolve() would crash with a
     # confusing ValueError before validation runs.
@@ -643,6 +652,21 @@ def read_file(
         raw_content = path.read_bytes()
     except Exception as e:
         return {"error": f"Failed to read file: {e}"}
+
+    # Image files: return as ToolResult with data URI
+    ext = path.suffix.lower()
+    if ext in IMAGE_EXTENSIONS:
+        media_type = f"image/{ext.lstrip('.')}"
+        if ext == ".jpg":
+            media_type = "image/jpeg"
+        elif ext == ".tiff":
+            media_type = "image/tiff"
+        b64 = base64.b64encode(raw_content).decode()
+        return ToolResult(
+            text=f"Image file: {filepath} ({len(raw_content)} bytes)",
+            images=[f"data:{media_type};base64,{b64}"],
+            question=question or "",
+        )
 
     # Check for binary content
     if not is_probably_text(raw_content):

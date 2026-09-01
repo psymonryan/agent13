@@ -27,6 +27,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
 
+from agent13.config_paths import _ensure_dir
+
 # Global debug state
 _debug_enabled = False
 _log_file: Optional[Path] = None
@@ -50,7 +52,7 @@ def init_debug(log_dir: Optional[Path] = None) -> None:
     if log_dir is None:
         log_dir = Path.home() / ".agent13"
 
-    log_dir.mkdir(parents=True, exist_ok=True)
+    _ensure_dir(log_dir)
     _log_file = log_dir / "debug.log"
 
     # Rotate if too large

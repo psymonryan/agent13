@@ -13,8 +13,9 @@ from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from agent13.config_paths import get_global_saves_dir
+from agent13.config_paths import _ensure_dir, get_global_saves_dir
 from agent13.debug_log import is_debug_enabled, log_session_restore
+from agent13.message_history import mark_injected_messages
 
 if TYPE_CHECKING:
     from agent13.core import Agent
@@ -83,7 +84,7 @@ def get_saves_dir() -> Path:
         saves_dir = Path(env_dir)
     else:
         saves_dir = Path.cwd() / ".agent13" / "saves"
-    saves_dir.mkdir(parents=True, exist_ok=True)
+    _ensure_dir(saves_dir)
     return saves_dir
 
 
@@ -350,6 +351,10 @@ def load_context(agent: "Agent", path: Path | str) -> tuple[bool, str, bool]:
 
     # Load into agent
     agent.messages = context["messages"]
+
+    # Sessions saved before injections were marked carry no flag; infer it
+    # so grouping/compaction treat image messages as mid-turn.
+    mark_injected_messages(agent.messages)
 
     # Restore other fields if present
     # Note: We intentionally do NOT restore model - user keeps their current

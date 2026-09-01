@@ -9,6 +9,72 @@ import json
 
 from agent13.debug_log import log_journal_debug
 
+# Message keys that are local bookkeeping flags, never sent to the API.
+# Stripped in llm.build_messages() before the request goes out.
+LOCAL_MSG_KEYS = ("interrupt", "injected")
+
+
+def is_injected(msg: dict) -> bool:
+    """True for messages agent13 injects mid-turn (native vision images).
+
+    An injected user message carries no user intent — it exists only because
+    the API wants image blocks in a user-role message. It must never be
+    mistaken for the start of a new turn.
+    """
+    return bool(msg.get("injected"))
+
+
+def is_turn_start(msg: dict) -> bool:
+    """True if ``msg`` begins a new user turn.
+
+    A turn starts at a user message that is neither an interrupt (``!!``,
+    injected mid-turn) nor a native-vision image injection. Both of those
+    belong to the turn they landed in, so grouping, compaction and trims
+    keep them attached instead of splitting a turn in half.
+    """
+    return msg.get("role") == "user" and not (
+        msg.get("interrupt") or is_injected(msg)
+    )
+
+
+def content_to_text(content) -> str:
+    """Flatten message content (str, list of blocks, or None) to plain text.
+
+    Multimodal content is a list of blocks; only text blocks carry text.
+    Blocks are joined with a single space to match UI rendering.
+    """
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return " ".join(
+            block.get("text", "")
+            for block in content
+            if isinstance(block, dict) and block.get("type") == "text"
+        )
+    return "" if content is None else str(content)
+
+
+def mark_injected_messages(messages: list[dict]) -> int:
+    """Add the "injected" flag to unmarked image-injection user messages.
+
+    Sessions saved before injections were marked have no flag to read. A
+    user message with *list* content can only have come from native-vision
+    injection (real prompts are plain strings), so the flag is inferable and
+    old sessions group correctly after loading.
+
+    Returns the number of messages marked.
+    """
+    count = 0
+    for msg in messages:
+        if (
+            msg.get("role") == "user"
+            and isinstance(msg.get("content"), list)
+            and not msg.get("injected")
+        ):
+            msg["injected"] = True
+            count += 1
+    return count
+
 
 class MessageHistory:
     """Message list wrapper with query and compaction methods.
@@ -49,16 +115,16 @@ class MessageHistory:
         return result
 
     def find_last_user_idx(self, start: int | None = None) -> int | None:
-        """Return index of the last non-interrupt user message.
+        """Return index of the last turn-start user message.
 
         Walks backward from ``start`` (default: end of messages).
-        Returns None if no non-interrupt user message is found.
+        Interrupts and native-vision injections are skipped — they belong
+        to the turn they landed in.
+        Returns None if no turn-start user message is found.
         """
         begin = start if start is not None else len(self.messages) - 1
         for i in range(begin, -1, -1):
-            if self.messages[i].get("role") == "user" and not self.messages[i].get(
-                "interrupt"
-            ):
+            if is_turn_start(self.messages[i]):
                 return i
         return None
 
@@ -66,13 +132,13 @@ class MessageHistory:
         """Find the boundary of the earliest tool-using turn.
 
         A tool-using turn consists of:
-        - A non-interrupt user message (turn start)
+        - A turn-start user message
         - One or more assistant messages with tool_calls + tool results
         - A final assistant message (turn conclusion)
 
         Returns:
             Tuple of (user_idx, end_idx) where:
-            - user_idx: index of the non-interrupt user message starting the turn
+            - user_idx: index of the turn-start user message
             - end_idx: index of the final assistant message concluding the turn,
               or the last message if the turn lacks a concluding assistant message
             Returns None if no tool-using turn is found.
@@ -100,7 +166,7 @@ class MessageHistory:
             })
             return None
 
-        # Step 2: Find the non-interrupt user message that starts this turn
+        # Step 2: Find the turn-start user message for this turn
         user_idx = self.find_last_user_idx(start=first_tool_idx - 1)
         if user_idx is None:
             # No user message before tool calls — unusual but handle it
@@ -108,7 +174,7 @@ class MessageHistory:
             user_idx = 0
 
         # Step 3: Walk forward from the tool_calls to find the end of the turn.
-        # The turn ends when we reach a non-interrupt user message or a final
+        # The turn ends when we reach a turn-start user message or a final
         # assistant message without tool_calls that isn't followed by more tools.
         # We need to handle multi-round tool use within a single turn:
         #   assistant(tool_calls) → tool → assistant(tool_calls) → tool → assistant(text)
@@ -117,7 +183,7 @@ class MessageHistory:
         while i < len(self.messages):
             msg = self.messages[i]
 
-            if msg.get("role") == "user" and not msg.get("interrupt"):
+            if is_turn_start(msg):
                 # We've hit the next turn — back up one
                 end_idx = i - 1
                 break
@@ -148,8 +214,8 @@ class MessageHistory:
     def count_tool_turns(self) -> int:
         """Count the number of tool-using turns in the message history.
 
-        A tool-using turn is a group (non-interrupt user msg through to next
-        non-interrupt user msg or end) that contains at least one assistant
+        A tool-using turn is a group (turn-start user msg through to the next
+        turn-start user msg or end) that contains at least one assistant
         message with tool_calls.
 
         Returns:
@@ -165,7 +231,7 @@ class MessageHistory:
         count = 0
         in_tool_turn = False
         for msg in self.messages:
-            if msg.get("role") == "user" and not msg.get("interrupt"):
+            if is_turn_start(msg):
                 # Start of a new group
                 in_tool_turn = False
             elif msg.get("role") == "assistant" and msg.get("tool_calls"):
@@ -182,22 +248,23 @@ class MessageHistory:
     def has_tool_calls_in_last_turn(self) -> bool:
         """Check if the last turn contained any tool calls.
 
-        Looks from the last non-interrupt user message forward, so that
-        tool calls before a mid-turn interrupt are still detected.
+        Looks from the last turn-start user message forward, so that
+        tool calls before a mid-turn interrupt (or image injection) are
+        still detected.
 
         Returns:
-            True if any assistant message after the last non-interrupt
+            True if any assistant message after the last turn-start
             user message has tool_calls.
         """
         if not self.messages:
             return False
 
-        # Find the last non-interrupt user message
+        # Find the last turn-start user message
         last_user_idx = self.find_last_user_idx()
         if last_user_idx is None:
             return False
 
-        # Check for tool_calls in any assistant message after the last non-interrupt user message
+        # Check for tool_calls in any assistant message after the last turn-start user message
         for msg in self.messages[last_user_idx + 1 :]:
             if msg.get("role") == "assistant" and msg.get("tool_calls"):
                 return True
@@ -213,7 +280,7 @@ class MessageHistory:
         skipped.
 
         Returns:
-            True if any assistant message after the last non-interrupt
+            True if any assistant message after the last turn-start
             user message has a tool_call with function name 'skill'.
         """
         if not self.messages:
@@ -371,13 +438,19 @@ class MessageHistory:
     def get_message_groups(self) -> list[list[int]]:
         """Group messages for atomic deletion.
 
-        Each group starts with a non-interrupt user message and includes all
-        subsequent messages (interrupt user messages, tool calls, tool results,
-        assistant responses) until the next non-interrupt user message.
+        Each group starts with a turn-start user message and includes all
+        subsequent messages (interrupt user messages, native-vision image
+        injections, tool calls, tool results, assistant responses) until the
+        next turn-start user message.
 
         Interrupt user messages (marked with "interrupt": True) are kept in
         the same group as the turn they interrupted, so they are deleted
         together when retrying or compacting.
+
+        Image injections (marked with "injected": True) are kept with their
+        turn for the same reason — they arrive mid-turn (after a tool result)
+        and carry no user intent, so starting a group at one would make
+        /retry / /compact target the injection instead of the user's prompt.
 
         Returns:
             List of groups, where each group is a list of message indices.
@@ -386,15 +459,13 @@ class MessageHistory:
         current_group = []
 
         for i, msg in enumerate(self.messages):
-            role = msg.get("role", "unknown")
-
-            if role == "user" and not msg.get("interrupt"):
-                # Start a new group (non-interrupt user message)
+            if is_turn_start(msg):
+                # Start a new group (turn-start user message)
                 if current_group:
                     groups.append(current_group)
                 current_group = [i]
             else:
-                # Add to current group (interrupt user msgs, tools, assistants)
+                # Add to current group (interrupt/injected msgs, tools, assistants)
                 current_group.append(i)
 
         # Don't forget the last group
@@ -565,15 +636,15 @@ class MessageHistory:
     ) -> None:
         """Compact the previous turn by replacing tool exploration with a summary.
 
-        Finds the last non-interrupt user message and replaces everything after
+        Finds the last turn-start user message and replaces everything after
         it with:
         - Preserved skill messages (if any) — as text, at the start
         - The tool summary (summarizing tool calls and results)
         - The original final assistant message (preserving the conclusion)
 
-        Interrupt user messages are skipped so that the entire turn (including
-        any mid-turn injected interrupts and their responses) is compacted as
-        one unit.
+        Interrupt and image-injection user messages are skipped so that the
+        entire turn (including any mid-turn injected messages and their
+        responses) is compacted as one unit.
 
         Args:
             tool_summary: Summary of tool exploration.
@@ -587,10 +658,10 @@ class MessageHistory:
         if not self.messages:
             return
 
-        # Find the index of the last non-interrupt user message
+        # Find the index of the last turn-start user message
         last_user_idx = self.find_last_user_idx()
         if last_user_idx is None:
-            # No non-interrupt user message found, nothing to compact
+            # No turn-start user message found, nothing to compact
             return
 
         # Combine tool summary with final message
@@ -598,7 +669,7 @@ class MessageHistory:
             f"{tool_summary}\n\n{final_message}" if final_message else tool_summary
         )
 
-        # Keep messages up to and including the last non-interrupt user message
+        # Keep messages up to and including the last turn-start user message
         self.messages = self.messages[: last_user_idx + 1]
 
         # Rewrite the user message so it's visually distinct from real requests.
@@ -606,7 +677,9 @@ class MessageHistory:
         # journal summary" and getting stuck in reflection mode.
         from agent13.prompts import JOURNAL_USER_MESSAGE
 
-        original_content = self.messages[last_user_idx].get("content") or ""
+        original_content = content_to_text(
+            self.messages[last_user_idx].get("content")
+        )
         self.messages[last_user_idx] = {
             "role": "user",
             "content": JOURNAL_USER_MESSAGE.format(original=original_content),

@@ -287,7 +287,8 @@ class TestInferReplaceWithLineRange:
 class TestInferReplaceSnapshotRollback:
     def test_inferred_edit_can_be_rolled_back(self):
         path = create_test_file("def foo():\n    return 1\n\ndef bar():\n    pass\n")
-        original = open(path).read()
+        with open(path) as f:
+            original = f.read()
         try:
             result = edit_file(
                 path, content="def foo():\n    return 42\n\ndef bar():"
@@ -296,7 +297,12 @@ class TestInferReplaceSnapshotRollback:
             assert "snapshot_id" in result
             rb = edit_file(path, mode="rollback")
             assert rb["success"] is True
-            assert open(path).read() == original
+            # Read into a variable before asserting: a failed assert on
+            # open(path).read() pins the file object in the traceback,
+            # which breaks delete_test_file() on Windows (WinError 32).
+            with open(path) as f:
+                restored = f.read()
+            assert restored == original
         finally:
             delete_test_file(path)
 

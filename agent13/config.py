@@ -7,10 +7,12 @@ Supports:
 """
 
 from dataclasses import dataclass, field
+from io import StringIO
 from pathlib import Path
 from typing import Optional, Literal
 import os
 import re
+import sys
 import urllib.parse
 
 import httpx
@@ -22,6 +24,7 @@ except ImportError:
 
 from dotenv import load_dotenv
 
+from agent13.fileio import ConfigFileError, read_text_robust
 from agent13.config_paths import (
     get_config_file,
     get_global_env_file,
@@ -186,6 +189,49 @@ class MCPServerConfig:
 
 
 @dataclass
+class VisionConfig:
+    """Configuration for vision/image support.
+
+    Controls how images returned by tools are routed to a vision model:
+    - sidecar: a separate vision model (e.g. oMLX/Gemma) describes the image
+    - native: images are injected inline as image_url content blocks
+    - auto: checks the current model name against patterns to decide
+
+    Attributes:
+        mode: Routing strategy - "sidecar", "native", or "auto"
+        sidecar_provider: Name of existing ProviderConfig for the sidecar
+        sidecar_model: Specific model to request from sidecar (empty = server default)
+        native_vision_patterns: Glob patterns for auto-detecting vision-capable models
+    """
+
+    mode: str = "sidecar"
+    sidecar_provider: str = ""
+    sidecar_model: str = ""
+    native_vision_patterns: list[str] = field(default_factory=list)
+
+    def is_native_vision(self, model_name: str) -> bool:
+        """Check if a model name matches any native vision pattern (glob)."""
+        from fnmatch import fnmatch
+
+        lower = model_name.lower()
+        return any(fnmatch(lower, p.lower()) for p in self.native_vision_patterns)
+
+    def should_use_native(self, model_name: str) -> bool:
+        """Determine routing for auto mode.
+
+        Returns:
+            True if images should be injected inline (native),
+            False if they should go through the sidecar.
+        """
+        if self.mode == "native":
+            return True
+        if self.mode == "sidecar":
+            return False
+        # auto
+        return self.is_native_vision(model_name)
+
+
+@dataclass
 class Config:
     """Agent configuration loaded from TOML file.
 
@@ -215,6 +261,9 @@ class Config:
     bell_enabled: bool = True  # Whether bell is active
     bell_command: str = ""  # External command to run instead of terminal bell
     cursor_blink: bool = False  # Whether input cursor blinks (false = tmux-friendly)
+    auto_compact_threshold: int = 0  # Token threshold for auto-compact (0 = disabled)
+    auto_compact_max_iterations: int = 3  # Max compact-and-continue cycles per turn
+    vision: Optional[VisionConfig] = None  # Vision/image routing config
 
     @classmethod
     def from_file(cls, path: Optional[Path] = None) -> "Config":
@@ -236,8 +285,17 @@ class Config:
         if not path.exists():
             raise FileNotFoundError(f"Config file not found: {path}")
 
-        with open(path, "rb") as f:
-            data = tomllib.load(f)
+        # read_text_robust transparently handles BOMs / UTF-16 / ANSI files
+        # (Notepad on Windows can save any of these). Raises ConfigFileError
+        # with an actionable message if the bytes are undecodable.
+        try:
+            data = tomllib.loads(read_text_robust(path))
+        except tomllib.TOMLDecodeError as e:
+            raise ConfigFileError(
+                f"{path} is not valid TOML: {e}. "
+                f"If you edited it in a text editor, re-save it as UTF-8 "
+                f"(in Notepad: Save As -> Encoding -> UTF-8)."
+            ) from e
 
         config = cls()
 
@@ -376,12 +434,44 @@ class Config:
             if isinstance(bc, str):
                 config.bell_command = bc
 
+        # Parse [auto_compact] section
+        auto_compact_data = data.get("auto_compact", {})
+        if isinstance(auto_compact_data, dict):
+            ac_threshold = auto_compact_data.get("threshold", 0)
+            if isinstance(ac_threshold, (int, float)) and ac_threshold >= 0:
+                config.auto_compact_threshold = int(ac_threshold)
+            ac_max = auto_compact_data.get("max_iterations", 3)
+            if isinstance(ac_max, (int, float)) and ac_max >= 1:
+                config.auto_compact_max_iterations = int(ac_max)
+
         # Parse [ui] section
         ui_data = data.get("ui", {})
         if isinstance(ui_data, dict):
             cb = ui_data.get("cursor_blink", False)
             if isinstance(cb, bool):
                 config.cursor_blink = cb
+
+        # Parse [vision] section
+        vision_data = data.get("vision")
+        if isinstance(vision_data, dict):
+            mode = vision_data.get("mode", "sidecar")
+            if not isinstance(mode, str) or mode not in ("sidecar", "native", "auto"):
+                raise ValueError(f"[vision] 'mode' must be 'sidecar', 'native', or 'auto', got '{mode}'")
+            sidecar_provider = vision_data.get("sidecar_provider", "")
+            if not isinstance(sidecar_provider, str):
+                raise ValueError("[vision] 'sidecar_provider' must be a string")
+            sidecar_model = vision_data.get("sidecar_model", "")
+            if not isinstance(sidecar_model, str):
+                raise ValueError("[vision] 'sidecar_model' must be a string")
+            patterns = vision_data.get("native_vision_patterns", [])
+            if not isinstance(patterns, list):
+                raise ValueError("[vision] 'native_vision_patterns' must be a list")
+            config.vision = VisionConfig(
+                mode=mode,
+                sidecar_provider=sidecar_provider,
+                sidecar_model=sidecar_model,
+                native_vision_patterns=[str(p) for p in patterns],
+            )
 
         config.validate()
         return config
@@ -471,15 +561,21 @@ def load_environment() -> None:
     # Ensure a starter ~/.env exists (mirrors ensure_default_config)
     ensure_default_env()
 
-    # Load global .env first
-    global_env = get_global_env_file()
-    if global_env.exists():
-        load_dotenv(global_env, override=False)
-
-    # Load local .env (overrides global)
-    local_env = get_local_env_file()
-    if local_env.exists():
-        load_dotenv(local_env, override=True)
+    # A corrupt .env is not fatal (it only holds API keys) - warn and
+    # continue rather than blocking startup. read_text_robust transparently
+    # repairs BOM / UTF-16 / ANSI files that Notepad may have produced.
+    for env_path, override in (
+        (get_global_env_file(), False),
+        (get_local_env_file(), True),
+    ):
+        if not env_path.exists():
+            continue
+        try:
+            text = read_text_robust(env_path)
+        except ConfigFileError as e:
+            print(f"warning: {e}", file=sys.stderr)
+            continue
+        load_dotenv(stream=StringIO(text), override=override)
 
     _environment_loaded = True
 
@@ -493,11 +589,9 @@ def get_config() -> Config:
 
     if _config is None:
         load_environment()
-        try:
-            _config = Config.from_file_or_empty()
-        except ValueError:
-            # Invalid config - re-raise
-            raise
+        # Corrupt/invalid config raises ConfigFileError (or ValueError for
+        # structural problems) - the CLI catches it and exits cleanly.
+        _config = Config.from_file_or_empty()
 
     return _config
 

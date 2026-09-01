@@ -57,7 +57,10 @@ compaction: |
   Preserve:
   - All key decisions, their rationale, and current status
   - Important code, file paths, and technical details
+  - New knowledge gained by doing: how to connect to hosts/services,
+    exact commands that work, environment quirks and gotchas
   - Open questions and unresolved issues
   - The current direction/next steps
   Skip pleasantries and hedging. Write as a direct reference document
   that lets you continue the work seamlessly.
+  If you'd have to re-discover it from scratch, it belongs in the summary.

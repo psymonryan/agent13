@@ -235,28 +235,6 @@ class TestAppendAssistantMessage:
         assert len(messages) == 2
         assert messages[1]["role"] == "assistant"
 
-    def test_append_message_without_reasoning_when_send_reasoning_false(self):
-        """Should NOT include reasoning when send_reasoning=False."""
-        messages = []
-        append_assistant_message(
-            messages, "The answer is 42.", "Let me think...", send_reasoning=False
-        )
-
-        assert len(messages) == 1
-        assert messages[0]["content"] == "The answer is 42."
-        assert "reasoning_content" not in messages[0]
-
-    def test_append_message_with_reasoning_when_send_reasoning_true(self):
-        """Should include reasoning when send_reasoning=True."""
-        messages = []
-        append_assistant_message(
-            messages, "The answer is 42.", "Let me think...", send_reasoning=True
-        )
-
-        assert len(messages) == 1
-        assert messages[0]["content"] == "The answer is 42."
-        assert messages[0]["reasoning_content"] == "Let me think..."
-
 
 class TestFormatContextSize:
     """Tests for format_context_size function."""

@@ -13,12 +13,9 @@
 
 > Named after the agent from Get Smart who always seemed to end up in the tightest places - a mailbox, a fridge, a grandfather clock, and now a GPU?
 
-**What makes agent13 different:**
-
-- **2x effective speed** with local models - tool-use success goes from ~50% to 95% through AI-native tool design
-- **Runs on 24 GB VRAM** - works with any OpenAI-compatible API: llama-server, Ollama, vLLM, LM Studio, OpenRouter
-- **Incremental compaction** - no auto-compaction amnesia; journals tool responses so context stays small without losing information
-- **Zero telemetry** - privacy focussed, no tracking, no analytics, no phoning home
+- **Runs well in low VRAM environments** - works with any OpenAI-compatible API: llama-server, Ollama, vLLM, LM Studio, OpenRouter
+- **Incremental compaction or full compaction with steering** ; journals tool responses so context stays small without losing information, or compacts the entire message thread
+- **No telemetry** - privacy focussed
 - **Screen Reader Friendly** - Has both a REPL mode and the option to also to split output to a separate file which can then be tailed into a text to speech engine such as Linux-Speakup
 
 ## How is this different?
@@ -29,23 +26,7 @@ Most AI agents fix tool-use issues by adding more instructions: *"do this, don't
 
 agent13 takes the opposite approach: *every tool was refined by watching how models actually used them, then modifying the tool to suit the AI's expectations.*
 
-After applying this approach, tool-use success across open-weight models (Qwen, GLM, Kimi, Devstral) went from around 50% to near 95%, which equates to an effective 2x speedup when the agent is trying to get things done!  (Which for local models is a huge time saver)  - PS. If you dont like this agent, then tell your agent to steal the edit tools from this agent. :grinning:
-
-### First Class support for Local Providers
-
-Local-first, provider-flexible. Runs on 24 GB GPUs with any OpenAI-compatible endpoint (llama-server, Ollama, LM Studio, vLLM, OpenRouter).
-
-### Incremental Compaction
-
-So-called *full history compaction* just doesnt seem to work, especially with small context local setups. The agent ends up throwing away too much information, and 'auto-compaction' is a royal pain, as soon as the agent starts making headway, compaction starts and it forgets what it is doing!
-
-agent13 uses incremental journalling (use --journal to enable), so for every turn where tools are used, the agent reflects on what it does and rewords the sometimes extremely token heavy tool responses into what it was trying to do and what it learned.
-
-There is no point keeping a 20k token file read, if the agent was just checking how things are structured.
-
-This approach means that the context stays small and the agent doesnt lose information on each step it has taken and what it was attempting.
-
-Also, and perhaps more critically, this approach keeps the kv-cache snapshots valid, since we are only ever modifying the 'end' of the context being sent to the api.
+After applying this approach, tool-use success across open-weight models (Qwen, GLM, Kimi, Devstral) went from around 50% to near 95%, this is a real speedup when the agent is trying to get things done!  - PS. If you dont like this agent, then tell your agent to steal the edit tools from this agent. :grinning:
 
 ### Is agent13 for you?
 
@@ -61,7 +42,7 @@ Also, and perhaps more critically, this approach keeps the kv-cache snapshots va
 
 - You need a more polished GUI (but hey, this one's not bad!)
 - You're all-in on Anthropic's ecosystem (Claude Code)
-- You want managed infrastructure (cloud agents)
+- You want managed infrastructure
 
 ## Features
 
@@ -85,26 +66,26 @@ This means when you see the agent struggling with something, or you forgot to te
 
 **Devel mode.** Toggle developer tools on/off at runtime. Hidden tools (TUI viewer, testing utilities) shown with `--devel` flag or `/devel on` in TUI. agent13 also comes with 'self development' tools, so if you ask the agent to change itself, it has tests and tools that help it change itself. So if you want to make your own mods, turn this on and let it self-modify.
 
-**No telemetry.** No tracking, no analytics, no phoning home.
-
 **Mobile friendly.** Works over Turmux/Termius and similar mobile SSH clients. (you can slow down the activity spinner or turn it off)
 
 **Tools that work WITH the Agent.** Automatically correcting for known LLM shortcomings with feedback, rollback and hinting on errors to help the agents next try.
 
 ## Quick start
 
+Requires Python 3.11+. The steps below install and configure everything else.
+
 ### 1. Install uv
 
-```bash
-curl -LsSf https://astral.sh/uv/install.sh | sh
-```
+Install uv using [the official uv installation guide](https://docs.astral.sh/uv/getting-started/installation/) - it has the command for your platform.
+
+If your terminal says `uv` is not recognised after installing, close and reopen it - uv adds itself to your PATH, and already-open terminals don't pick that up.
 
 ### 2. Install agent13
 
 **From GitHub release** (recommended - latest stable):
 
 ```bash
-uv tool install https://github.com/psymonryan/agent13/releases/download/v0.3.3/agent13-0.3.3-py3-none-any.whl
+uv tool install https://github.com/psymonryan/agent13/releases/download/v0.4.0/agent13-0.4.0-py3-none-any.whl
 ```
 
 **From source** (for development):
@@ -118,82 +99,109 @@ uv run agent13.py      # run from source
 uv tool install -e .   # install as editable
 ```
 
-### 3. Set up your API key
-
-Agent13 loads API keys from environment variables. Create `~/.env`:
+### 3. Create your config
 
 ```bash
-# For local servers (key can be anything)
-# For OPENAI, use the supplied key
-OPENAI_API_KEY=local
-
-# For OpenRouter
-OPENROUTER_API_KEY=sk-or-v3-...
+agent13 --list-providers
 ```
 
-Agent13 loads `~/.env` first, then `./.env` (local overrides global).
+On first run this creates your starter config at `~/.agent13/config.toml` (and a starter `~/.env` in your home directory), then lists the providers in it.
 
-### 4. Create your config
-
-Modify the default provided `~/.agent13/config.toml`:
+The starter config includes a few example providers. Open `~/.agent13/config.toml` and delete the `[[providers]]` blocks you don't use - each one looks like this:
 
 ```toml
-# Local llama-server
-[[providers]]
-name = "local"
-api_base = "http://localhost:8012/v1"
-api_key_env_var = "OPENAI_API_KEY"
-
-# Remote server with longer timeout for reasoning models
-[[providers]]
-name = "remote"
-api_base = "http://myserver:8012/v1"
-api_key_env_var = "OPENAI_API_KEY"
-read_timeout = 2400  # 40 minutes for super slow loading
-
-# OpenRouter
 [[providers]]
 name = "openrouter"
 api_base = "https://openrouter.ai/api/v1"
 api_key_env_var = "OPENROUTER_API_KEY"
 ```
 
-Verify providers:
+Running your own server (llama.cpp, vLLM, Ollama, ...)? Add a block pointing at it - the `name` is what you'll type on the command line:
 
-```bash
-agent13 --list-providers
+```toml
+[[providers]]
+name = "local"
+api_base = "http://localhost:8012/v1"
+api_key_env_var = "OPENAI_API_KEY"
 ```
+
+(The starter config also has an example MCP server - it stays dormant unless you pass `--mcp`.)
 
 See [USER_GUIDE.md](USER_GUIDE.md) for advanced configuration (MCP servers, tool filtering, clipboard, timeouts, environment variables).
 
-### 5. Run the TUI
+### 4. Set up your API key
+
+Open `~/.env` (auto created in the previous step) and replace the `dummy` values with your real keys.
+
+A provider is any server that speaks the OpenAI API. If you don't run your own, the easiest option is [OpenRouter](https://openrouter.ai) - create a key at [openrouter.ai/keys](https://openrouter.ai/keys) and paste it after `OPENROUTER_API_KEY=`.
+
+agent13 loads `~/.env` first, then `./.env` in your working directory (local overrides global).
+
+### 5. Choose a model
+
+agent13 needs a model that supports tool calling (function calling); not all models do. List what your provider offers (replace `openrouter` with your provider name):
+
+```bash
+agent13 openrouter --model
+```
+
+Pick by name or number, or run without `--model` to choose interactively. On OpenRouter, skip models with a `:batch` suffix - those only work with its batch API, not the TUI. Good starting points:
+
+| Model        | Provider            | Notes                                                                   |
+| ------------ | ------------------- | ----------------------------------------------------------------------- |
+| Qwen-3.8-27B | Local               | Excellent tool calling, good performance over the large context size    |
+| GLM-5.3      | Local/Remote        | Good reasoning, excellent coding, not everyone can fit this one locally |
+| GPT-4o       | OpenAI / openrouter | Cloud model, reliable tool calling (never used it myself)               |
+
+### 6. Run the TUI
 
 ```bash
 # Interactive TUI (prompts for model selection)
-agent13 local
+agent13 openrouter
 ```
 
 On first run with a provider, agent13 lists available models:
 
 ```
   Available models:
-    1. qwen-3.5-27b
-    2. devstral2
-    3. glm-5.1
+    1. qwen-3.8-27B
+    2. GLM-5.3-Flash-Next
 
   Select model (number or name, or 'q' to quit): _
 ```
 
-```bash
-# Batch mode (single prompt, exits after)
-agent13 local --model 3 -p "Write a Python script to sum numbers 1 to 100"
+Batch mode runs in your terminal (not the TUI) for one-shot prompts:
 
-# Batch mode with MCP tools (servers auto-disconnect on exit)
-agent13 local --mcp -p "Use the deep_research skill to investigate X and write report.md"
+```bash
+# Single prompt, exits after
+agent13 openrouter --model 1 -p "Write a Python script to sum numbers 1 to 100"
+
+# With MCP tools (servers auto-disconnect on exit)
+agent13 openrouter --mcp -p "Use the deep_research skill to investigate X and write report.md"
 
 # Specify model directly
-agent13 local --model qwen-3.5-27b
+agent13 openrouter --model qwen-3.8-27B
 ```
+
+### 7. First conversation
+
+Once the TUI is up:
+
+1. Type a message and press `Enter`
+2. Watch the response stream in token by token
+3. Watch the agent call tools (read files, run commands, etc.)
+4. Type `/help` to see the slash commands
+
+Try these to explore:
+
+```text
+What tools do you have available?
+Read the README.md file and summarize it.
+List the files in the current directory.
+I dont like the status bar colours, change them for me.
+```
+
+For the full reference (slash commands, config keys, modes) and troubleshooting, see [USER_GUIDE.md](USER_GUIDE.md).
 
 ### Debugging
 
@@ -229,7 +237,6 @@ All commands accept `--help` for full option listing.
 | `--mcp`                     | Connect to MCP servers on startup                                    | off                   |
 | `--skills`                  | Include discovered skills in system prompt                           | off                   |
 | `--journal`                 | Enable journal mode (context compaction)                             | off                   |
-| `--send-reasoning`          | Include reasoning tokens in history                                  | off                   |
 | `--remove-reasoning`        | Strip reasoning tokens between turns                                 | off                   |
 | `-c, --continue`            | Resume previous session                                              | -                     |
 | `--devel`                   | Show devel-group tools to AI                                         | off                   |
@@ -276,14 +283,13 @@ Agent13 works with any OpenAI-compatible endpoint that supports tool calling:
 
 ## Documentation
 
-| Document                                 | Description                                            |
-| ---------------------------------------- | ------------------------------------------------------ |
-| [ARCHITECTURE.md](ARCHITECTURE.md)       | Event-driven architecture, code structure, tool design |
-| [USER_GUIDE.md](USER_GUIDE.md)           | Full usage guide, all features in detail               |
-| [GETTING_STARTED.md](GETTING_STARTED.md) | Step-by-step setup walkthrough                         |
-| [CONTRIBUTING.md](CONTRIBUTING.md)       | How to contribute, dev setup, PR process               |
-| [CHANGELOG.md](CHANGELOG.md)             | Release history and changes                            |
-| [AGENTS.md](AGENTS.md)                   | AI agent instructions (for self-coding context)        |
+| Document                           | Description                                            |
+| ---------------------------------- | ------------------------------------------------------ |
+| [ARCHITECTURE.md](ARCHITECTURE.md) | Event-driven architecture, code structure, tool design |
+| [USER_GUIDE.md](USER_GUIDE.md)     | Full usage guide, all features in detail               |
+| [CONTRIBUTING.md](CONTRIBUTING.md) | How to contribute, dev setup, PR process               |
+| [CHANGELOG.md](CHANGELOG.md)       | Release history and changes                            |
+| [AGENTS.md](AGENTS.md)             | AI agent instructions (for self-coding context)        |
 
 ## License
 

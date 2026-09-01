@@ -53,6 +53,7 @@ from agent13.commands import (
     format_queue_items,
     format_history_groups,
 )
+from agent13.message_history import content_to_text
 from agent13.status import get_tool_stats_summary
 from agent13.sandbox import (
     parse_sandbox_mode,
@@ -89,7 +90,7 @@ COMMANDS = {
     "/deprioritise": "Remove priority from queue item: /deprioritise N",
     "/delete": "Delete items: /delete h N (history group), /delete q N (queue item), /delete s NAME (save)",
     "/journal": "Control journal mode: /journal [on|off|last|all|status]",
-    "/compact": "Compact entire history: /compact [optional prompt name]",
+    "/compact": "Compact history: /compact [next-task focus] | /compact --prompt <name>",
     "/model": "Switch model: /model [name|number] (no args lists available models)",
     "/provider": "Switch provider: /provider <name|url>",
     "/sandbox": "Sandbox mode: /sandbox [mode|pin|unpin] (no args shows status)",
@@ -101,6 +102,8 @@ COMMANDS = {
     "/cwd": "Show or change working directory: /cwd [path]",
     "/upgrade": "Check for and apply updates",
     "/polite": "Multi-agent lock coordination: /polite N | /polite off",
+    "/auto_compact_threshold": "Auto-compact threshold: /auto_compact_threshold [N|0] (supports k suffix)",
+    "/auto_compact_max": "Auto-compact max cycles: /auto_compact_max [N] (min 1)",
 }
 
 
@@ -176,6 +179,9 @@ def _display_loaded_messages(agent) -> None:
         tool_calls = msg.get("tool_calls", [])
         tool_call_id = msg.get("tool_call_id")
 
+        # Normalize multimodal content (list of blocks) to display text
+        content = content_to_text(content)
+
         if role == "user":
             if content:
                 display = content[:200] + "..." if len(content) > 200 else content
@@ -221,7 +227,6 @@ async def run_repl(
     prompt_manager: Optional[PromptManager] = None,
     system_prompt: Optional[str] = None,
     journal_mode: bool = False,
-    send_reasoning: bool = False,
     remove_reasoning: bool = False,
     devel_mode: bool = False,
     skills_mode: bool = False,
@@ -235,6 +240,8 @@ async def run_repl(
     bell_enabled: bool = True,
     bell_command: str = "",
     priming_enabled: bool = False,
+    auto_compact_threshold: int = 0,
+    auto_compact_max_iterations: int = 3,
 ):
     """Run the agent in interactive REPL mode.
 
@@ -340,12 +347,13 @@ async def run_repl(
             disabled_tools=config.disabled_tools or None,
         ),
         execute_tool=execute_tool,
-        send_reasoning=send_reasoning,
         remove_reasoning=remove_reasoning,
         devel_mode=devel_mode,
         skills_mode=skills_mode,
         journal_mode=journal_mode,
         priming_enabled=priming_enabled,
+        auto_compact_threshold=auto_compact_threshold,
+        auto_compact_max_iterations=auto_compact_max_iterations,
     )
 
     # Store available models on agent
@@ -938,6 +946,10 @@ async def run_repl(
                                     print(
                                         f"         interrupt: {_sanitize(entry.content)}"
                                     )
+                                elif entry.is_injected:
+                                    print(
+                                        f"         injected: {_sanitize(entry.content)}"
+                                    )
                                 elif entry.content:
                                     print(
                                         f"         {entry.role}: {_sanitize(entry.content)}"
@@ -1020,26 +1032,23 @@ async def run_repl(
                         print("    /journal status  - Show current state")
 
                 elif cmd == "/compact":
-                    from agent13.prompts import DEFAULT_COMPACT_PROMPT
+                    from agent13.prompts import resolve_compact_prompt
 
-                    prompt_name = cmd_arg.strip()
-                    if prompt_name:
-                        prompt_text = prompt_manager.get_prompt(prompt_name)
-                        if prompt_text == prompt_manager.get_prompt("default") and prompt_name != "default":
-                            print(f"  Prompt '{prompt_name}' not found")
-                            print(f"  Available: {', '.join(prompt_manager.prompts.keys())}")
-                        else:
-                            await agent.add_message(
-                                f"/compact {prompt_name}",
-                                kind="compact",
-                                data={"compact_prompt": prompt_text},
-                            )
+                    arg = cmd_arg.strip()
+                    compact_prompt_text, error = resolve_compact_prompt(prompt_manager, arg)
+                    if error:
+                        for error_line in error.splitlines():
+                            print(f"  {error_line}")
                     else:
-                        prompt_text = prompt_manager.prompts.get("compaction", DEFAULT_COMPACT_PROMPT)
+                        # Track turn start so the idle handler prints
+                        # "[complete]" and re-shows the prompt (same as the
+                        # normal message dispatch below).
+                        _processing_start_time = time.time()
+                        queued_text = f"/compact {arg}" if arg else "/compact"
                         await agent.add_message(
-                            "/compact",
+                            queued_text,
                             kind="compact",
-                            data={"compact_prompt": prompt_text},
+                            data={"compact_prompt": compact_prompt_text},
                         )
 
                 elif cmd == "/model":
@@ -1377,6 +1386,51 @@ async def run_repl(
                             print("  /bell-command     - Show current status")
                         else:
                             print(f"  Bell command: {args}")
+
+                elif cmd == "/auto_compact_threshold":
+                    args = cmd_arg.strip()
+                    if not args:
+                        if agent.auto_compact_threshold > 0:
+                            print(f"  Auto-compact: on ({agent.auto_compact_threshold:,} tokens)")
+                        else:
+                            print("  Auto-compact: off")
+                    else:
+                        try:
+                            val = args.lower()
+                            if val.endswith("k"):
+                                threshold = int(val[:-1]) * 1000
+                            else:
+                                threshold = int(val)
+                            if threshold < 0:
+                                raise ValueError("negative")
+                            agent.auto_compact_threshold = threshold
+                            if threshold == 0:
+                                print("  Auto-compact: off")
+                            else:
+                                print(f"  Auto-compact: on ({threshold:,} tokens)")
+                        except ValueError:
+                            print("  Usage: /auto_compact_threshold [N|0]")
+                            print("    /auto_compact_threshold 150k - Compact at 150,000 tokens")
+                            print("    /auto_compact_threshold 0    - Disable")
+                            print("    /auto_compact_threshold      - Show current status")
+
+                elif cmd == "/auto_compact_max":
+                    args = cmd_arg.strip()
+                    if not args:
+                        print(
+                            f"  Auto-compact max cycles: {agent.auto_compact_max_iterations}"
+                        )
+                    else:
+                        try:
+                            max_iter = int(args)
+                            if max_iter < 1:
+                                raise ValueError("must be >= 1")
+                            agent.auto_compact_max_iterations = max_iter
+                            print(f"  Auto-compact max cycles: {max_iter}")
+                        except ValueError:
+                            print("  Usage: /auto_compact_max [N]")
+                            print("    /auto_compact_max 3 - Pause after 3 compact-and-continue cycles")
+                            print("    /auto_compact_max   - Show current value")
 
                 else:
                     print(f"  Unknown command: {user_input}")

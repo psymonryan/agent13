@@ -6,6 +6,8 @@ from pathlib import Path
 
 import yaml
 
+from agent13.fileio import read_text_robust
+
 
 def load_yaml(path: Path) -> dict:
     """Load a YAML file, returning empty dict only if file is missing.
@@ -13,6 +15,9 @@ def load_yaml(path: Path) -> dict:
     A missing file is normal (first run) and returns {}. A file that
     exists but cannot be parsed raises YAMLError — callers should let
     this propagate so the user sees the error (fail-fast strategy).
+
+    Files are read via read_text_robust so BOM / UTF-16 / ANSI encodings
+    (e.g. from Notepad) are handled transparently.
 
     Args:
         path: Path to YAML file.
@@ -23,11 +28,11 @@ def load_yaml(path: Path) -> dict:
     Raises:
         yaml.YAMLError: If file exists but contains invalid YAML.
         ValueError: If file exists but top-level structure is not a dict.
+        ConfigFileError: If the file's encoding is unrecognized.
     """
     if not path.exists():
         return {}
-    with open(path) as f:
-        data = yaml.safe_load(f)
+    data = yaml.safe_load(read_text_robust(path))
     if data is None:
         return {}
     if not isinstance(data, dict):

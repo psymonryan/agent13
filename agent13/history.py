@@ -33,7 +33,7 @@ def get_default_history_path() -> str:
     """Get the default history file path (backward compatibility).
 
     Returns:
-        Path in format ~/.agent13/history-{basename-cwd}-{YYYY-MM-DD}
+        Path in format ~/.agent13/history/history-{basename-cwd}-{YYYY-MM-DD}
     """
     return get_history_path()
 
@@ -46,7 +46,7 @@ def get_history_path(project_name: str = None) -> str:
                       Falls back to "global" if no cwd available.
 
     Returns:
-        Path in format ~/.agent13/history-{project}[-test]-{YYYY-MM-DD}
+        Path in format ~/.agent13/history/history-{project}[-test]-{YYYY-MM-DD}
         The -test suffix is added when running under pytest.
     """
     # Add _test suffix when running under pytest
@@ -125,7 +125,7 @@ class History:
             date: The date to get the path for.
 
         Returns:
-            Path in format ~/.agent13/history-{project}[-test]-{YYYY-MM-DD}
+            Path in format ~/.agent13/history/history-{project}[-test]-{YYYY-MM-DD}
         """
         base_path = self._get_path()
         # Replace the date portion (last 10 chars before extension if present,

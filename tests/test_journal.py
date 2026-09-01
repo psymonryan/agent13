@@ -1765,3 +1765,33 @@ class TestCountMessageWords:
             }
         ]
         assert _count_message_words(msgs) > 1
+
+    def test_vision_list_content(self):
+        """Vision messages have list content — must not raise AttributeError."""
+        from agent13.journal import _count_message_words
+        msgs = [
+            {"role": "user", "content": "look at this image"},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "[Image from tool: read_file]"},
+                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,xyz"}},
+                ],
+            },
+            {"role": "tool", "content": "done"},
+        ]
+        # "look at this image" (4) + "[Image from tool: read_file]" (4) + "done" (1) = 9
+        assert _count_message_words(msgs) == 9
+
+    def test_vision_list_content_no_text_blocks(self):
+        """Pure image message with no text blocks counts as 0 words."""
+        from agent13.journal import _count_message_words
+        msgs = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,xyz"}},
+                ],
+            },
+        ]
+        assert _count_message_words(msgs) == 0

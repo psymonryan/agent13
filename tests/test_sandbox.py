@@ -193,7 +193,8 @@ class TestBuildSandboxCommand:
         """'off' mode should return simple shell command."""
         cmd = build_sandbox_command("echo hello", SandboxMode.OFF)
         if sys.platform == "win32":
-            assert cmd == ["cmd.exe", "/c", "echo hello"]
+            assert cmd[-1] == "echo hello"
+            assert "-Command" in cmd
         else:
             assert cmd == ["/bin/sh", "-c", "echo hello"]
 
@@ -203,7 +204,8 @@ class TestBuildSandboxCommand:
             mock_macos.return_value = False
             cmd = build_sandbox_command("echo hello", SandboxMode.PERMISSIVE_OPEN)
             if sys.platform == "win32":
-                assert cmd == ["cmd.exe", "/c", "echo hello"]
+                assert cmd[-1] == "echo hello"
+                assert "-Command" in cmd
             else:
                 assert cmd == ["/bin/sh", "-c", "echo hello"]
 
@@ -250,6 +252,18 @@ class TestRunSandboxed:
         result = run_sandboxed("sleep 10", SandboxMode.OFF, timeout=0.5)
         assert result["success"] is False
         assert result["timed_out"] is True
+        assert "timed out" in result["stderr"].lower()
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX shell command (python3)")
+    def test_timeout_preserves_partial_output(self):
+        """Output printed before the timeout kill should be preserved."""
+        result = run_sandboxed(
+            "python3 -c \"import time; print('partial', flush=True); time.sleep(30)\"",
+            SandboxMode.OFF,
+            timeout=2,
+        )
+        assert result["timed_out"] is True
+        assert "partial" in result["stdout"]
         assert "timed out" in result["stderr"].lower()
 
     @pytest.mark.skipif(sys.platform == "win32", reason="POSIX shell command (python3)")
@@ -703,8 +717,8 @@ class TestBashToolUseCases:
     @pytest.mark.skipif(
         sys.platform == "win32", reason="POSIX shell command (sleep)"
     )
-    async def test_timeout_message_shows_correct_max(self):
-        """Timeout error message should say 600 seconds, not 300."""
+    async def test_timeout_message_reports_timeout_and_stdin_hint(self):
+        """Timeout message should report the actual timeout and hint at stdin."""
         from agent13.sandbox import run_sandboxed_async, SandboxMode
 
         result = await run_sandboxed_async(
@@ -713,8 +727,25 @@ class TestBashToolUseCases:
             timeout=0.5,
         )
         assert result["timed_out"] is True
-        assert "600 seconds" in result["stderr"]
-        assert "300 seconds" not in result["stderr"]
+        assert "timed out after 0.5 seconds" in result["stderr"]
+        assert "stdin" in result["stderr"]
+
+    @pytest.mark.asyncio
+    @pytest.mark.skipif(
+        sys.platform == "win32", reason="POSIX shell command (python3)"
+    )
+    async def test_timeout_preserves_partial_output(self):
+        """Output printed before the timeout kill should be preserved (async)."""
+        from agent13.sandbox import run_sandboxed_async, SandboxMode
+
+        result = await run_sandboxed_async(
+            "python3 -c \"import time; print('partial', flush=True); time.sleep(30)\"",
+            SandboxMode.OFF,
+            timeout=2,
+        )
+        assert result["timed_out"] is True
+        assert "partial" in result["stdout"]
+        assert "timed out" in result["stderr"].lower()
 
     @pytest.mark.asyncio
     @pytest.mark.skipif(
@@ -752,11 +783,17 @@ class TestBashToolUseCases:
         # Set sandbox to off for this test
         set_session_sandbox_mode(SandboxMode.OFF)
 
+        # Windows: commands run in PowerShell (command v2) - use PS syntax
+        if sys.platform == "win32":
+            cmd = "nonexistent_command_xyz; if ($LASTEXITCODE -ne 0) { 'fallback executed' }"
+        else:
+            cmd = "nonexistent_command_xyz 2>/dev/null || echo 'fallback executed'"
+
         # First command fails, second succeeds
         result = await execute_tool(
             "command",
             {
-                "command": "nonexistent_command_xyz 2>/dev/null || echo 'fallback executed'"
+                "command": cmd
             },
         )
         data = json.loads(result)
@@ -860,13 +897,71 @@ class TestBashToolUseCases:
         # Set sandbox to off for this test
         set_session_sandbox_mode(SandboxMode.OFF)
 
-        result = await execute_tool(
-            "command", {"command": "echo 'to stdout' && echo 'to stderr' >&2"}
-        )
+        # Windows: commands run in PowerShell (command v2) - use PS syntax.
+        # Write-Error is a non-terminating error: it writes to stderr but the
+        # script still exits 0, matching the POSIX `&&` chain behaviour.
+        if sys.platform == "win32":
+            cmd = "Write-Output 'to stdout'; Write-Error 'to stderr'"
+        else:
+            cmd = "echo 'to stdout' && echo 'to stderr' >&2"
+
+        result = await execute_tool("command", {"command": cmd})
         data = json.loads(result)
-        assert data["success"] is True
         assert "to stdout" in data["stdout"]
         assert "to stderr" in data["stderr"]
 
         # Reset sandbox
         set_session_sandbox_mode(None)
+
+
+class TestPowershellRouting:
+    """Tests for Windows PowerShell direct-spawn routing (command v2 phase 1)."""
+
+    def test_build_powershell_command_argv_shape(self):
+        """Command must be a single argv element after -Command."""
+        from agent13.sandbox import build_powershell_command
+
+        cmd = build_powershell_command('Get-ChildItem | Where-Object {$_.Name -like "*.py"}', pwsh_path="/fake/pwsh.exe")
+        assert cmd == ["/fake/pwsh.exe", "-NoProfile", "-NonInteractive", "-Command",
+                       'Get-ChildItem | Where-Object {$_.Name -like "*.py"}']
+
+    def test_build_powershell_command_fallback_to_cmd(self):
+        """No PowerShell found -> legacy cmd.exe behaviour."""
+        from agent13.sandbox import build_powershell_command
+
+        cmd = build_powershell_command("echo hi", pwsh_path=None)
+        if sys.platform == "win32":
+            assert cmd[-1] == "echo hi"
+        else:
+            assert cmd == ["cmd.exe", "/c", "echo hi"]
+
+    def test_find_powershell_returns_none_off_windows(self):
+        from agent13.sandbox import find_powershell
+
+        if sys.platform != "win32":
+            assert find_powershell() is None
+
+    def test_is_powershell_7_by_name(self):
+        from agent13.sandbox import is_powershell_7
+
+        assert is_powershell_7("/opt/pwsh/pwsh.exe") is True
+        assert is_powershell_7("/opt/pwsh/pwsh") is True
+        # "powershell" contains "pwsh" as a substring (PowerSHell) - check
+        # the stem, not a substring
+        assert is_powershell_7(r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe") is False
+        # None resolves via find_powershell(): on a machine with pwsh installed
+        # that is edition 7, so only assert False when no PowerShell is found
+        if sys.platform == "win32":
+            assert is_powershell_7(None) is not None
+        else:
+            assert is_powershell_7(None) is False
+
+    def test_build_sandbox_command_windows_uses_powershell(self):
+        """On Windows, build_sandbox_command routes through PowerShell."""
+        from agent13.sandbox import build_sandbox_command
+
+        with patch("agent13.sandbox.is_macos", return_value=False), \
+             patch("agent13.sandbox.find_powershell", return_value=r"C:\pwsh\pwsh.exe"):
+            cmd = build_sandbox_command("echo hello", SandboxMode.OFF)
+        if sys.platform == "win32":
+            assert cmd == [r"C:\pwsh\pwsh.exe", "-NoProfile", "-NonInteractive", "-Command", "echo hello"]

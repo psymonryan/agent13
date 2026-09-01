@@ -139,8 +139,8 @@ class MockAgent:
         except asyncio.CancelledError:
             pass
 
-    async def add_message(self, text, priority=False, interrupt=False):
-        self._calls.append(("add_message", text, priority, interrupt))
+    async def add_message(self, text, priority=False, interrupt=False, kind="prompt", data=None):
+        self._calls.append(("add_message", text, priority, interrupt, kind, data))
         msg = {"role": "user", "content": text}
         if interrupt:
             msg["interrupt"] = True
@@ -220,7 +220,7 @@ class MockHistoryStore:
 # ── Scenario runner ──────────────────────────────────────────────────
 
 
-async def run_scenario(inputs):
+async def run_scenario(inputs, prompt_manager=None):
     """Run a REPL scenario with scripted inputs.
 
     Args:
@@ -228,6 +228,9 @@ async def run_scenario(inputs):
                 Strings are returned by input()/readline().
                 Use InputFeeder.EOF to trigger Ctrl+D.
                 Use InputFeeder.INTERRUPT to trigger Ctrl+C.
+        prompt_manager: Optional PromptManager to inject (e.g. backed by a
+                temp file for hermetic prompt lookups). Defaults to the
+                real PromptManager (~/.agent13/prompts.yaml).
 
     Returns:
         (output_text, agent) tuple — captured stdout and mock agent
@@ -280,6 +283,7 @@ async def run_scenario(inputs):
             provider="test",
             pretty=False,
             system_prompt="test prompt",
+            prompt_manager=prompt_manager,
         )
 
     output = captured_stdout.getvalue()

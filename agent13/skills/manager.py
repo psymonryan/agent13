@@ -10,7 +10,7 @@ if TYPE_CHECKING:
 
 from agent13.skills.models import SkillInfo, SkillMetadata
 from agent13.skills.parser import parse_frontmatter
-from agent13.config_paths import get_skills_dir
+from agent13.config_paths import _ensure_dir, get_skills_dir
 
 logger = getLogger(__name__)
 
@@ -38,7 +38,7 @@ def ensure_default_skills() -> None:
         return
 
     # Create user's skills directory
-    GLOBAL_SKILLS_DIR.mkdir(parents=True, exist_ok=True)
+    _ensure_dir(GLOBAL_SKILLS_DIR)
 
     # Copy each skill directory
     for skill_dir in DEFAULT_SKILLS_DIR.iterdir():

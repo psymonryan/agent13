@@ -32,7 +32,7 @@ from typing import Callable, Optional
 import httpx
 
 from agent13 import __version__
-from agent13.config_paths import get_config_dir
+from agent13.config_paths import ensure_config_dir, get_config_dir
 
 logger = logging.getLogger(__name__)
 
@@ -87,7 +87,7 @@ def _read_last_check() -> Optional[datetime]:
 def _write_last_check(now: datetime) -> None:
     """Write the current check timestamp to the state file."""
     try:
-        get_config_dir().mkdir(parents=True, exist_ok=True)
+        ensure_config_dir()
         _LAST_CHECK_FILE.write_text(
             json.dumps({"last_check": now.isoformat()})
         )

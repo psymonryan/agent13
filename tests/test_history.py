@@ -52,6 +52,11 @@ class TestGetHistoryPath:
         path = get_history_path("test")
         assert ".agent13" in path
 
+    def test_returns_path_in_history_subdirectory(self):
+        """Test that path is in the ~/.agent13/history subdirectory."""
+        path = get_history_path("test")
+        assert os.path.basename(os.path.dirname(path)) == "history"
+
     def test_path_is_expanded(self):
         """Test that ~ is expanded to home directory."""
         path = get_history_path("test")

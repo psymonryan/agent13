@@ -32,11 +32,40 @@ method = "osc52"
 enabled = true
 threshold = 0
 
+# Auto-compact threshold (tokens)
+# When the context window (prompt_tokens) reaches this value mid-turn,
+# the agent stops at the next safe point and journals (if journal is on)
+# or compacts the full history (if journal is off).
+# 0 = disabled (default). Set to e.g. 150000 to enable.
+# Change at runtime with: /auto_compact_threshold 150k
+[auto_compact]
+threshold = 0
+# Max times the agent will compact-and-continue within a single turn before
+# pausing (so you can /compact, /journal all, or /model to a bigger-context
+# model, then /resume). Change at runtime with: /auto_compact_max N
+max_iterations = 3
+
 # UI settings
 # cursor_blink = false  → solid cursor, no periodic terminal output (default, tmux-friendly)
 # cursor_blink = true   → blinking cursor (causes periodic output, triggers tmux activity)
 [ui]
 cursor_blink = false
+
+# Vision support — lets the agent "see" images returned by tools.
+# Uncomment and configure to enable.
+#
+# mode = "sidecar"  → a separate vision model describes images (works with any text model)
+# mode = "native"   → images injected inline (main model must support vision)
+# mode = "auto"     → checks model name against native_vision_patterns
+#
+# sidecar_provider references an existing [[providers]] entry by name.
+# sidecar_model is optional — omit to use the server's default model.
+#
+# [vision]
+# mode = "sidecar"
+# sidecar_provider = "studio-oMLX"
+# # sidecar_model = "gemma-4-31b"
+# native_vision_patterns = ["gemma-3*", "gemma-4*", "qwen*-vl*", "llava*"]
 # Agent13 Configuration
 # Config directory: ~/.agent13 (or $AGENT13_CONFIG_DIR)
 # Environment: ~/.env then ./.env (local overrides global)
@@ -47,7 +76,7 @@ api_base = "http://c10:8012/v1"
 api_key_env_var = "OPENAI_API_KEY"
 
 [[providers]]
-name = "studio-oMLX"
+name = "studiomlx"
 api_base = "http://c10:8111/v1"
 api_key_env_var = "OPENAI_API_KEY"
 
@@ -57,15 +86,14 @@ api_base = "https://openrouter.ai/api/v1"
 api_key_env_var = "OPENROUTER_API_KEY"
 
 [[providers]]
-name = "c144"
-api_base = "http://c144:8012/v1"
+name = "c144mlx"
+api_base = "http://c144:8111/v1"
 api_key_env_var = "OPENAI_API_KEY"
 # read_timeout = 2400  # Seconds to wait for tokens during streaming (default: 2400)
 # connect_timeout = 30  # Seconds to wait for initial connection (default: 30)
 
-# Use this for testing with model 'devstral2'
 [[providers]]
-name = "test"
+name = "c144"
 api_base = "http://c144:8012/v1"
 api_key_env_var = "OPENAI_API_KEY"
 
@@ -85,21 +113,27 @@ api_key_env_var = "OPENAI_API_KEY"
 # [[mcp_servers]]
 # name = "hvac_server"
 # transport = "http"
-# url = "http://c10.vestek.lan:4040/mcp"
+# url = "http://c10:4040/mcp"
 # enabled_tools = []
 # disabled_tools = []
 
 # MCP Servers - stdio transport (local process)
 # --with mcp<2: pin MCP SDK 1.x — many MCP servers import mcp.server.fastmcp
 #   which was removed in MCP SDK 2.0. Remove once your servers support 2.x.
-[[mcp_servers]]
-name = "web_research"
-transport = "stdio"
-command = "uvx"
-args = ["--with", "mcp<2", "web-research-assistant"]
-env = { "SEARXNG_BASE_URL" = "http://searxng/search" }
-enabled_tools = []
-disabled_tools = []
+# --with playwright==1.61.0: pin the browser driver. web-research-assistant uses
+#   Playwright for crawl_url; unpinned, uvx drifts to the latest release, whose
+#   required Chromium build isn't in ~/Library/Caches/ms-playwright, so crawl_url
+#   fails with "Executable doesn't exist". 1.61.0 -> build 1228. If you bump the
+#   pin, run: uvx --with "playwright==<NEW>" playwright install chromium
+
+# [[mcp_servers]]
+# name = "web_research"
+# transport = "stdio"
+# command = "uvx"
+# args = ["--with", "mcp<2", "--with", "playwright==1.61.0", "web-research-assistant"]
+# env = { "SEARXNG_BASE_URL" = "http://searxng/search" }
+# enabled_tools = []
+# disabled_tools = []
 
 [[mcp_servers]]
 name = "fetch_server"

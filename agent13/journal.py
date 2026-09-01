@@ -40,7 +40,14 @@ def _count_message_words(messages: list[dict]) -> int:
     for m in messages:
         content = m.get("content")
         if content:
-            total += len(content.split())
+            if isinstance(content, str):
+                total += len(content.split())
+            elif isinstance(content, list):
+                # Vision messages: list of content blocks
+                # (e.g. [{"type": "text", "text": ...}, {"type": "image_url", ...}])
+                for block in content:
+                    if isinstance(block, dict) and block.get("type") == "text":
+                        total += len(block.get("text", "").split())
         # Count tool-call arguments (the payload that compaction removes)
         tool_calls = m.get("tool_calls")
         if tool_calls:

@@ -436,30 +436,21 @@ async def run_headless(
                             else:
                                 print(f"LOAD_ERROR: {msg}", flush=True)
                 elif cmd.startswith("/compact"):
-                    from agent13.prompts import DEFAULT_COMPACT_PROMPT
+                    from agent13.prompts import resolve_compact_prompt
 
                     parts = line.split(maxsplit=1)
-                    prompt_name = parts[1].strip() if len(parts) > 1 else ""
+                    arg = parts[1].strip() if len(parts) > 1 else ""
                     pm = PromptManager()
-                    if prompt_name:
-                        prompt_text = pm.get_prompt(prompt_name)
-                        if (
-                            prompt_text == pm.get_prompt("default")
-                            and prompt_name != "default"
-                        ):
-                            print(f"COMPACT_ERROR: Prompt '{prompt_name}' not found", flush=True)
-                        else:
-                            await agent.add_message(
-                                f"/compact {prompt_name}",
-                                kind="compact",
-                                data={"compact_prompt": prompt_text},
-                            )
+                    compact_prompt_text, error = resolve_compact_prompt(pm, arg)
+                    if error:
+                        for error_line in error.splitlines():
+                            print(f"COMPACT_ERROR: {error_line}", flush=True)
                     else:
-                        prompt_text = pm.prompts.get("compaction", DEFAULT_COMPACT_PROMPT)
+                        queued_text = f"/compact {arg}" if arg else "/compact"
                         await agent.add_message(
-                            "/compact",
+                            queued_text,
                             kind="compact",
-                            data={"compact_prompt": prompt_text},
+                            data={"compact_prompt": compact_prompt_text},
                         )
                 else:
                     print(f"UNKNOWN_COMMAND: {line}", flush=True)

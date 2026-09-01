@@ -517,11 +517,10 @@ class MCPManager:
             ):
                 yield read_stream, write_stream, stderr_capture
         else:
-            async with streamablehttp_client(config.url) as (
-                read_stream,
-                write_stream,
-                _,
-            ):
+            async with streamablehttp_client(config.url) as result:
+                # mcp SDK 1.x yields (read, write, get_session_id_callback);
+                # mcp SDK 2.x yields (read, write). Take the first two either way.
+                read_stream, write_stream = result[0], result[1]
                 yield read_stream, write_stream, None
 
     async def _session_runner(self, server_name: str) -> None:

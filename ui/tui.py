@@ -13,8 +13,6 @@ import sys
 import os
 import asyncio
 import json
-import shutil
-import subprocess
 
 from dotenv import load_dotenv
 from openai import AsyncOpenAI
@@ -93,6 +91,7 @@ from agent13.commands import (
     format_queue_items,
     format_history_groups,
 )
+from agent13.message_history import content_to_text, is_turn_start
 from agent13.prompts import get_skills_section
 from agent13.sandbox import (
     format_all_sandbox_modes,
@@ -122,6 +121,46 @@ _ctrl_c_pressed = False
 def escape_markup(text: str) -> str:
     """Escape all brackets in text for safe use in Textual markup."""
     return text.replace("\\", "\\\\").replace("[", "\\[").replace("]", "\\]")
+
+
+# Max chars for the model name in the status bar before it's truncated.
+_MODEL_DISPLAY_BUDGET = 16
+
+
+def compress_model(model: str, budget: int = _MODEL_DISPLAY_BUDGET) -> str:
+    """Compress a model name for the status bar.
+
+    Keeps dash-separated pairs up to ``budget`` chars (breaking at a dash),
+    marks truncation with ``__``, and shortens a trailing ``:value`` thinking
+    suffix to its first three letters (e.g. ``:medium`` -> ``:med``).
+
+    Examples:
+        Qwen3.8-27B-MTPLX-Optimized-Quality:medium -> Qwen3.8-27B__:med
+        gpt-oss-120b-oQ8                          -> gpt-oss-120b-oQ8 (fits)
+        GLM-5.1                                   -> GLM-5.1
+    """
+    base, sep, value = model.rpartition(":")
+    if not sep:
+        base, value = model, ""
+    parts = base.split("-")
+    kept = parts[0]
+    chopped = False
+    for part in parts[1:]:
+        candidate = f"{kept}-{part}"
+        if len(candidate) <= budget:
+            kept = candidate
+        else:
+            chopped = True
+            break
+    # No dash to break at and the first part alone overran the budget.
+    if len(kept) > budget:
+        kept = kept[:budget]
+        chopped = True
+    if chopped:
+        kept += "__"
+    if value:
+        kept += ":" + value[:3]
+    return kept
 
 
 # Load environment variables from ~/.env
@@ -156,6 +195,33 @@ class ToolCallMessage(Message):
         super().__init__()
         self.name = name
         self.arguments = arguments
+
+
+class ToolCallStartedMessage(Message):
+    """Message sent when a tool call's name is known but args are still streaming.
+
+    Lets the UI show the tool name immediately (dimmed, args pending) instead of
+    waiting for the full argument stream to complete.
+    """
+
+    def __init__(self, name: str) -> None:
+        super().__init__()
+        self.name = name
+
+
+class ToolCallPendingMessage(Message):
+    """Message sent when the provider is buffering a tool call (name unknown).
+
+    Providers like mlx-lm buffer whole tool calls: while generating one they
+    stream nothing visible - only payload-less keep-alive chunks. This message
+    lets the UI show a dimmed "⚙ …" placeholder so the user sees the agent is
+    preparing a tool call. It is replaced in place by TOOL_CALL_STARTED (name
+    known) or TOOL_CALL (complete), and silently removed if content tokens
+    start arriving instead (the silence was just slow thinking, not a tool).
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
 
 
 class ToolResultMessage(Message):
@@ -574,6 +640,8 @@ class AgentTUI(App):
         "/polite",
         "/bell",
         "/bell-command",
+        "/auto_compact_threshold",
+        "/auto_compact_max",
     ]
     # Class-level attribute for type checking (instance copy created in __init__)
     SLASH_COMMANDS = _BUILTIN_SLASH_COMMANDS
@@ -636,6 +704,11 @@ class AgentTUI(App):
     prompt_tokens = reactive(0)
     completion_tokens = reactive(0)
     total_tokens = reactive(0)
+    # Live context estimate at the safe point (prompt_tokens is stale there -
+    # it predates the tool results just added). Shown with a "~" until the next
+    # LLM call reports the grounded count via TOKEN_USAGE.
+    estimated_context = reactive(0)
+    context_is_estimated = reactive(False)
 
     # TPS (tokens per second) tracking
     _last_tps = reactive(0.0)  # TPS from the most recent API call
@@ -655,7 +728,6 @@ class AgentTUI(App):
         system_prompt: str = None,
         include_skills: bool = False,
         journal_mode: bool = False,
-        send_reasoning: bool = False,
         remove_reasoning: bool = False,
         continue_session: bool = False,
         devel_mode: bool = False,
@@ -668,6 +740,8 @@ class AgentTUI(App):
         bell_command: str = "",
         priming_enabled: bool = False,
         cursor_blink: bool = False,
+        auto_compact_threshold: int = 0,
+        auto_compact_max_iterations: int = 3,
     ):
         """Initialize the TUI.
 
@@ -687,7 +761,6 @@ class AgentTUI(App):
                 Gates visibility of the skill *tool* to the AI. Slash commands are
                 unaffected. Default False (minimal context).
             journal_mode: Enable context compaction via reflection
-            send_reasoning: Include reasoning_content in message history
             remove_reasoning: Strip reasoning tokens between turns
             continue_session: Load latest auto-save on startup
             devel_mode: Enable devel mode (show devel-group tools to the AI)
@@ -775,11 +848,12 @@ class AgentTUI(App):
             execute_tool=execute_tool,
             response_format=response_format,
             journal_mode=journal_mode,
-            send_reasoning=send_reasoning,
             remove_reasoning=remove_reasoning,
             devel_mode=devel_mode,
             skills_mode=skills_mode,
             priming_enabled=priming_enabled,
+            auto_compact_threshold=auto_compact_threshold,
+            auto_compact_max_iterations=auto_compact_max_iterations,
         )
 
         # Store available models on agent (single source of truth)
@@ -824,6 +898,10 @@ class AgentTUI(App):
         self._finalize_before_tool: bool = (
             False  # True if we finalized before a tool call
         )
+        # Tool-call widgets shown at TOOL_CALL_STARTED (name only, args pending).
+        # Consumed in FIFO order by the matching TOOL_CALL (complete) event, which
+        # updates the widget in place to add the args.
+        self._pending_tool_widgets: list[Static] = []
         self._stream_generation: int = (
             0  # Incremented on each new streaming session to discard stale tokens
         )
@@ -834,6 +912,7 @@ class AgentTUI(App):
         self._token_queue: asyncio.Queue[
             TokenMessage
             | ToolCallMessage
+            | ToolCallStartedMessage
             | ToolResultMessage
             | SystemQueueMessage
             | None
@@ -1636,6 +1715,9 @@ class AgentTUI(App):
             # Increment stream generation for new conversation turn
             # This ensures any stale tokens from previous turns are discarded
             self._stream_generation += 1
+            # Drop any orphaned pending tool widgets left by a prior turn that
+            # errored mid-tool-call (name shown, args never completed).
+            await self._discard_pending_tool_widgets()
             # Show user message in chat when processing starts
             # MUST await (not create_task) to ensure user message appears before
             # any subsequent events like JOURNAL_COMPACT that mount widgets
@@ -1689,6 +1771,19 @@ class AgentTUI(App):
             self.post_message(
                 TokenMessage("", is_final=True, generation=self._stream_generation)
             )
+
+        @self.agent.on_event
+        async def on_tool_call_pending(event: AgentEventData):
+            if event.event != AgentEvent.TOOL_CALL_PENDING:
+                return
+            self.post_message(ToolCallPendingMessage())
+
+        @self.agent.on_event
+        async def on_tool_call_started(event: AgentEventData):
+            if event.event != AgentEvent.TOOL_CALL_STARTED:
+                return
+            name = event.data.get("name", "")
+            self.post_message(ToolCallStartedMessage(name))
 
         @self.agent.on_event
         async def on_tool_call(event: AgentEventData):
@@ -1780,6 +1875,8 @@ class AgentTUI(App):
                 await self._streaming_content_widget.finalize()
                 self._streaming_content_widget = None
             self._in_reasoning = False
+            # Drop any pending tool widgets (name shown, args never completed)
+            await self._discard_pending_tool_widgets()
             # Increment stream generation to discard any stale tokens
             self._stream_generation += 1
             # Note: Don't show message here - _interrupt_agent_loop handles it
@@ -1937,6 +2034,13 @@ class AgentTUI(App):
             self.call_later(
                 self._update_token_usage, event.data, first_time, effective_last_time
             )
+
+        @self.agent.on_event
+        async def on_context_estimate(event: AgentEventData):
+            if event.event != AgentEvent.CONTEXT_ESTIMATE:
+                return
+            est = event.data.get("estimated_tokens", 0)
+            self.call_later(self._set_context_estimate, est)
 
         @self.agent.on_event
         async def on_stream_start(event: AgentEventData):
@@ -2184,7 +2288,7 @@ class AgentTUI(App):
 
         # Find the index of the first message in the last N turns
         user_indices = [
-            i for i, m in enumerate(messages) if m.get("role") == "user"
+            i for i, m in enumerate(messages) if is_turn_start(m)
         ]
         if len(user_indices) <= keep_turns:
             # Not enough turns to trim — show everything
@@ -2246,13 +2350,19 @@ class AgentTUI(App):
         if await self._safe_mount(msg):
             await self._scroll_if_at_bottom(was_at_bottom)
 
-    async def _write_tool_call(self, name: str, arguments: dict) -> None:
-        """Write a tool call message with formatted panel."""
-        if not self._chat_ready():
-            return
-        was_at_bottom = self._is_at_bottom()
+    @staticmethod
+    def _tool_call_markup(name: str, arguments: dict, pending: bool = False) -> str:
+        """Build the Rich markup for a tool-call widget.
 
-        # Format arguments nicely
+        pending=True renders a dimmed name-only variant shown while the model is
+        still generating the tool's arguments (the args line isn't available yet).
+        pending=False renders the full variant with the args (truncated to 200 chars).
+        """
+        if pending:
+            if not name:
+                # Name unknown yet (provider buffering the tool call)
+                return "[dim]⚙ …[/]"
+            return f"[dim]⚙ {escape_markup(name)} …[/]"
         if arguments:
             try:
                 args_str = json.dumps(arguments, indent=2)
@@ -2263,13 +2373,21 @@ class AgentTUI(App):
                 args_str = str(arguments)[:200]
         else:
             args_str = ""
-
-        # Create formatted tool call panel
         lines = [f"[bold yellow]⚙ {escape_markup(name)}[/]"]
         if args_str:
             lines.append(f"[dim]{escape_markup(args_str)}[/]")
+        return "\n".join(lines)
 
-        msg = Static("\n".join(lines), classes="tool-call", markup=True)
+    async def _write_tool_call(self, name: str, arguments: dict) -> None:
+        """Write a tool call message with formatted panel."""
+        if not self._chat_ready():
+            return
+        was_at_bottom = self._is_at_bottom()
+        msg = Static(
+            self._tool_call_markup(name, arguments, pending=False),
+            classes="tool-call",
+            markup=True,
+        )
         if await self._safe_mount(msg):
             await self._scroll_if_at_bottom(was_at_bottom)
 
@@ -2400,6 +2518,9 @@ class AgentTUI(App):
             content = msg.get("content", "")
             tool_calls = msg.get("tool_calls", [])
             tool_call_id = msg.get("tool_call_id")
+
+            # Normalize multimodal content (list of blocks) to display text
+            content = content_to_text(content)
 
             if role == "user":
                 # Display user message
@@ -2542,8 +2663,15 @@ class AgentTUI(App):
     # ── Info pane formatting helpers ──────────────────────────────────
 
     @staticmethod
-    def _sanitize_text(text: str, max_len: int = 120) -> str:
+    def _sanitize_text(text: "str | list", max_len: int = 120) -> str:
         """Collapse newlines and truncate for single-line display."""
+        # Normalize multimodal content (list of blocks) to text
+        if isinstance(text, list):
+            text = " ".join(
+                part.get("text", "")
+                for part in text
+                if isinstance(part, dict) and part.get("type") == "text"
+            )
         text = " ".join(text.split())
         if len(text) > max_len:
             return text[:max_len] + "..."
@@ -2591,6 +2719,13 @@ class AgentTUI(App):
         edit_file's ``Replaced ... of '<find>' with '<content>'``) embed
         the raw find/content strings which routinely contain newlines.
         """
+        # Normalize multimodal content (list of blocks) to text
+        if isinstance(content, list):
+            content = " ".join(
+                part.get("text", "")
+                for part in content
+                if isinstance(part, dict) and part.get("type") == "text"
+            )
         if not content:
             return "[dim]tool result (empty)[/]"
 
@@ -2753,6 +2888,11 @@ class AgentTUI(App):
         """Backwards-compatible shim — delegates to BellManager.validate_command."""
         return BellManager.validate_command(command)
 
+    def _set_context_estimate(self, est: int) -> None:
+        """Show the live context estimate (with "~") until the next grounded count."""
+        self.estimated_context = est
+        self.context_is_estimated = True
+
     def _update_token_usage(
         self, data: dict, first_token_time: float = None, last_token_time: float = None
     ) -> None:
@@ -2769,6 +2909,8 @@ class AgentTUI(App):
         self.prompt_tokens = data.get("prompt_tokens", 0)
         self.completion_tokens = data.get("completion_tokens", 0)
         self.total_tokens = data.get("total_tokens", 0)
+        # A grounded count just arrived - the estimate is no longer current.
+        self.context_is_estimated = False
 
         result = self.tracker.compute_tps(data, first_token_time, last_token_time)
         if result is not None:
@@ -2902,7 +3044,12 @@ class AgentTUI(App):
                 return f"{n / 1000:.1f}k"
             return str(n)
 
-        total_str = format_tokens(self.prompt_tokens)
+        # Show the live estimate (with "~") at a safe point; the grounded
+        # count (no "~") once the next LLM call reports it.
+        if self.context_is_estimated:
+            total_str = f"~{format_tokens(self.estimated_context)}"
+        else:
+            total_str = format_tokens(self.prompt_tokens)
 
         # Queue count: when polite-waiting, the current item is dequeued but
         # blocked on the lock — it hasn't started processing. Count it so the
@@ -2916,7 +3063,11 @@ class AgentTUI(App):
         queue_info = f" | Queue: {queue_count}" if queue_count > 0 else ""
 
         # Update left side (status info)
-        model_display = f"{self.provider}/{self.model}" if self.provider else self.model
+        # Compress the model name to fit the bar (provider stays full).
+        compressed_model = compress_model(self.model)
+        model_display = (
+            f"{self.provider}/{compressed_model}" if self.provider else compressed_model
+        )
         left_side = f"{spinner} {status_text} | {model_display}{queue_info}".strip()
         self._status_left.update(left_side)
 
@@ -2939,9 +3090,7 @@ class AgentTUI(App):
 
         # Turn count (hidden when zero)
         turn_count = sum(
-            1
-            for m in self.agent.messages
-            if m.get("role") == "user" and not m.get("interrupt")
+            1 for m in self.agent.messages if is_turn_start(m)
         )
         trn_str = f" | trn: {turn_count}" if turn_count > 0 else ""
         # MCP connection status (only show when connected)
@@ -2999,6 +3148,14 @@ class AgentTUI(App):
 
     def watch_prompt_tokens(self, old: int, new: int) -> None:
         """Update status when prompt tokens change."""
+        self.update_status()
+
+    def watch_estimated_context(self, old: int, new: int) -> None:
+        """Update status when the context estimate changes."""
+        self.update_status()
+
+    def watch_context_is_estimated(self, old: bool, new: bool) -> None:
+        """Update status when the estimate/grounded flag changes."""
         self.update_status()
 
     def watch_completion_tokens(self, old: int, new: int) -> None:
@@ -3224,6 +3381,10 @@ class AgentTUI(App):
             self._handle_bell_command(args)
         elif command == "bell-command":
             self._handle_bell_command_command(args)
+        elif command == "auto_compact_threshold":
+            self._handle_auto_compact_threshold_command(args)
+        elif command == "auto_compact_max":
+            self._handle_auto_compact_max_command(args)
         elif command in ("quit", "exit"):
             self.agent.stop()
             self.exit()
@@ -3234,6 +3395,8 @@ class AgentTUI(App):
                 if skill:
                     content = self.skill_manager.format_skill_content(command)
                     if content:
+                        if args:
+                            content = f"{content}\n\n{args}"
                         asyncio.create_task(self._send_message(content))
                     else:
                         self._update_info_content(
@@ -3336,8 +3499,13 @@ class AgentTUI(App):
             else:
                 display = "(empty)"
 
+            role_tag = (
+                f"[bold green]{g.first_role}:[/]"
+                if g.first_role == "user"
+                else f"[bold]{g.first_role}:[/]"
+            )
             lines.append(
-                f"  [cyan]{g.number}.[/] [bold]{g.first_role}:[/] {escape_markup(display)}"
+                f"  [cyan]{g.number}.[/] {role_tag} {escape_markup(display)}"
             )
 
             for entry in g.entries:
@@ -3348,15 +3516,16 @@ class AgentTUI(App):
                 elif entry.role == "assistant":
                     if entry.content:
                         display = self._sanitize_text(entry.content, 120)
-                        lines.append(
-                            f"      [magenta]assistant:[/] {escape_markup(display)}"
-                        )
+                        if display:
+                            lines.append(
+                                f"      [magenta]assistant:[/] {escape_markup(display)}"
+                            )
                     for tc in entry.tool_calls:
                         preview = self._format_tool_call_preview(
                             tc["name"], tc["arguments"]
                         )
                         lines.append(
-                            f"      [yellow]tool call: {escape_markup(preview)}[/]"
+                            f"      [yellow]tool call:[/] {escape_markup(preview)}"
                         )
                 elif entry.is_interrupt:
                     if entry.content:
@@ -3365,6 +3534,14 @@ class AgentTUI(App):
                         display = "(empty)"
                     lines.append(
                         f"      [yellow]\u26a1 interrupt:[/] {escape_markup(display)}"
+                    )
+                elif entry.is_injected:
+                    if entry.content:
+                        display = self._sanitize_text(entry.content, 120)
+                    else:
+                        display = "(empty)"
+                    lines.append(
+                        f"      [dim]\u21b3 injected:[/] {escape_markup(display)}"
                     )
                 elif entry.content:
                     display = self._sanitize_text(entry.content, 120)
@@ -3423,7 +3600,8 @@ class AgentTUI(App):
             "  [yellow]/deprioritise N[/] - Remove priority from item\n"
             "\n[bold]Journal mode:[/]\n"
             "  [yellow]/journal [on|off|last|all|status][/] - Context compaction via reflection\n"
-            "  [yellow]/compact [prompt name][/] - Compact entire history into one summary pair\n"
+            "  [yellow]/compact [next-task focus][/] - Compact history, steered toward your next task\n"
+            "  [yellow]/compact --prompt <name>[/] - Compact using a named prompt\n"
             "\n[bold]Reasoning:[/]\n"
             "  [yellow]/remove-reasoning [on|off][/] - Strip reasoning tokens between turns\n"
             "\n[bold]Spinner:[/]\n"
@@ -3444,6 +3622,12 @@ class AgentTUI(App):
             "  [yellow]/bell-command <cmd>[/] - Run external command instead of terminal bell\n"
             "  [yellow]/bell-command off[/] - Revert to terminal bell\n"
             "  [yellow]/bell-command[/] - Show current command\n"
+            "\n[bold]Auto-compact:[/]\n"
+            "  [yellow]/auto_compact_threshold N[/] - Compact when context exceeds N tokens (supports k suffix)\n"
+            "  [yellow]/auto_compact_threshold 0[/] - Disable auto-compact\n"
+            "  [yellow]/auto_compact_threshold[/] - Show current status\n"
+            "  [yellow]/auto_compact_max N[/] - Max compact-and-continue cycles per turn (then pause)\n"
+            "  [yellow]/auto_compact_max[/] - Show current value\n"
             "\n[bold]Keyboard shortcuts:[/]\n"
             "  [yellow]ESC[/] - Cancel request (use /resume to continue)\n"
             "  [yellow]Ctrl+C[/] - Clear input or quit\n"
@@ -3627,9 +3811,10 @@ class AgentTUI(App):
                 self._resumed_saved_at = ctx_data.get("saved_at")
             except (OSError, json.JSONDecodeError):
                 pass
-        # Count user-role messages for turn count
+        # Count turn-start user messages for turn count (skips interrupts
+        # and native-vision image injections)
         self._resumed_turn_count = sum(
-            1 for m in self.agent.messages if m.get("role") == "user"
+            1 for m in self.agent.messages if is_turn_start(m)
         )
         # Snapshot token counters
         self._resumed_prompt_tokens = self.prompt_tokens
@@ -3818,7 +4003,8 @@ class AgentTUI(App):
         idx = self.agent.history.find_last_user_idx()
         if idx is None:
             return None
-        content = self.agent.messages[idx].get("content", "")
+        # Flattened: multimodal content (image blocks) arrives as a list
+        content = content_to_text(self.agent.messages[idx].get("content", ""))
         if not content or not content.strip():
             return None
         return content
@@ -4459,31 +4645,23 @@ class AgentTUI(App):
 
     def _handle_compact_command(self, args: str) -> None:
         """Handle /compact command - compact entire history into one pair."""
-        from agent13.prompts import DEFAULT_COMPACT_PROMPT
+        from agent13.prompts import resolve_compact_prompt
 
-        prompt_name = args.strip()
-        if prompt_name:
-            prompt_text = self.prompt_manager.get_prompt(prompt_name)
-            if (
-                prompt_text == self.prompt_manager.get_prompt("default")
-                and prompt_name != "default"
-            ):
-                self._update_info_content(
-                    f"[red]Prompt '{prompt_name}' not found[/]\n"
-                    f"Available: {', '.join(self.prompt_manager.prompts.keys())}"
-                )
-                return
-        else:
-            prompt_text = self.prompt_manager.prompts.get(
-                "compaction", DEFAULT_COMPACT_PROMPT
+        arg = args.strip()
+        compact_prompt_text, error = resolve_compact_prompt(self.prompt_manager, arg)
+        if error:
+            first, *rest = error.splitlines()
+            self._update_info_content(
+                f"[red]{first}[/]" + (f"\n{'\n'.join(rest)}" if rest else "")
             )
+            return
 
-        display = f"/compact {prompt_name}" if prompt_name else "/compact"
+        display = f"/compact {arg}" if arg else "/compact"
         asyncio.create_task(
             self.agent.add_message(
                 display,
                 kind="compact",
-                data={"compact_prompt": prompt_text},
+                data={"compact_prompt": compact_prompt_text},
             )
         )
 
@@ -4783,6 +4961,74 @@ class AgentTUI(App):
                 f"[green]Bell command: {escape_markup(args)}[/]"
             )
 
+    def _handle_auto_compact_threshold_command(self, args: str) -> None:
+        """Handle /auto_compact_threshold - set or show the auto-compact threshold.
+
+        /auto_compact_threshold N   - Set threshold to N tokens (supports k suffix)
+        /auto_compact_threshold 0   - Disable auto-compact
+        /auto_compact_threshold     - Show current status
+        """
+        args = args.strip()
+        if not args:
+            if self.agent.auto_compact_threshold > 0:
+                self._update_info_content(
+                    f"[green]Auto-compact: on ({self.agent.auto_compact_threshold:,} tokens)[/]"
+                )
+            else:
+                self._update_info_content("[yellow]Auto-compact: off[/]")
+            return
+
+        try:
+            val = args.lower()
+            if val.endswith("k"):
+                threshold = int(val[:-1]) * 1000
+            else:
+                threshold = int(val)
+            if threshold < 0:
+                raise ValueError("negative")
+            self.agent.auto_compact_threshold = threshold
+            if threshold == 0:
+                self._update_info_content("[yellow]Auto-compact: off[/]")
+            else:
+                self._update_info_content(
+                    f"[green]Auto-compact: on ({threshold:,} tokens)[/]"
+                )
+        except ValueError:
+            self._update_info_content(
+                "[red]Usage: /auto_compact_threshold [N|0][/]\n"
+                "  [yellow]/auto_compact_threshold 150k[/] - Compact at 150,000 tokens\n"
+                "  [yellow]/auto_compact_threshold 0[/] - Disable\n"
+                "  [yellow]/auto_compact_threshold[/] - Show current status"
+            )
+
+    def _handle_auto_compact_max_command(self, args: str) -> None:
+        """Handle /auto_compact_max - set or show the max compact-and-continue cycles.
+
+        /auto_compact_max N   - Set max cycles to N (minimum 1)
+        /auto_compact_max     - Show current value
+        """
+        args = args.strip()
+        if not args:
+            self._update_info_content(
+                f"[green]Auto-compact max cycles: {self.agent.auto_compact_max_iterations}[/]"
+            )
+            return
+
+        try:
+            max_iter = int(args)
+            if max_iter < 1:
+                raise ValueError("must be >= 1")
+            self.agent.auto_compact_max_iterations = max_iter
+            self._update_info_content(
+                f"[green]Auto-compact max cycles: {max_iter}[/]"
+            )
+        except ValueError:
+            self._update_info_content(
+                "[red]Usage: /auto_compact_max N[/]\n"
+                "  [yellow]/auto_compact_max 3[/] - Pause after 3 compact-and-continue cycles\n"
+                "  [yellow]/auto_compact_max[/] - Show current value"
+            )
+
     def _handle_save_command(self, args: str) -> None:
         """Handle /save command - save context to file."""
         result = execute_save(self.agent, args)
@@ -4884,6 +5130,24 @@ class AgentTUI(App):
             return
         self._token_queue.put_nowait(message)
 
+    def on_tool_call_started_message(self, message: ToolCallStartedMessage) -> None:
+        """Enqueue a tool-call-started message for sequential processing.
+
+        Must go through _token_queue (like ToolCallMessage) so the pending
+        name-only widget is mounted in order with the streaming content and the
+        subsequent complete tool call that updates it in place.
+        """
+        self._token_queue.put_nowait(message)
+
+    def on_tool_call_pending_message(self, message: ToolCallPendingMessage) -> None:
+        """Enqueue a tool-call-pending message for sequential processing.
+
+        Same ordering requirements as ToolCallStartedMessage: the placeholder
+        must mount in order with streaming content, and before the tool call
+        that replaces it.
+        """
+        self._token_queue.put_nowait(message)
+
     def on_tool_call_message(self, message: ToolCallMessage) -> None:
         """Enqueue tool call for sequential processing.
 
@@ -4924,6 +5188,14 @@ class AgentTUI(App):
             try:
                 if isinstance(message, ToolCallMessage):
                     await self._handle_tool_call(message)
+                    continue
+
+                if isinstance(message, ToolCallStartedMessage):
+                    await self._handle_tool_call_started(message)
+                    continue
+
+                if isinstance(message, ToolCallPendingMessage):
+                    await self._handle_tool_call_pending(message)
                     continue
 
                 if isinstance(message, ToolResultMessage):
@@ -4983,6 +5255,13 @@ class AgentTUI(App):
                     log_tps_first_token(token_count=self.tracker._token_count)
             self.tracker.record_token(now)
 
+            # Visible tokens are flowing again: any "⚙ …" placeholder mounted
+            # during a silent stretch was a false alarm (the model was just
+            # thinking slowly, not preparing a buffered tool call). Remove it
+            # before the content/reasoning widget mounts.
+            if self._pending_tool_widgets:
+                await self._discard_pending_tool_widgets()
+
             was_at_bottom = self._is_at_bottom()
 
             if message.is_reasoning:
@@ -5027,6 +5306,10 @@ class AgentTUI(App):
     async def _handle_tool_call(self, message: ToolCallMessage) -> None:
         """Process a tool call message: finalize streaming, then write tool call.
 
+        If a matching pending widget exists (created at TOOL_CALL_STARTED when
+        only the name was known), update it in place to add the args. Otherwise
+        write a fresh widget (e.g. if the started event was missed).
+
         Handles the edge case where a tool call arrives with no preceding content
         (the LLM "thought" silently and then called a tool). In this case, we
         skip creating an empty "Agent:" widget.
@@ -5039,7 +5322,100 @@ class AgentTUI(App):
         else:
             # No content was ever shown, just set the flag
             self._finalize_before_tool = True
+
+        # Reuse the pending name-only widget if one is waiting for this call.
+        # FIFO match: started events and complete events arrive in the same order.
+        if self._pending_tool_widgets:
+            widget = self._pending_tool_widgets.pop(0)
+            widget.update(
+                self._tool_call_markup(message.name, message.arguments, pending=False)
+            )
+            return
+
         await self._write_tool_call(message.name, message.arguments)
+
+    async def _handle_tool_call_started(self, message: ToolCallStartedMessage) -> None:
+        """Process a tool-call-started message: show the tool name immediately.
+
+        The model has committed to a tool (name known) but its arguments are still
+        streaming. Mount a dimmed name-only widget now so the user gets feedback
+        during (potentially long) argument generation; the matching TOOL_CALL
+        later updates it in place with the full args.
+
+        If a TOOL_CALL_PENDING placeholder is already mounted (provider buffers
+        tool calls, so the name only became known now), update it in place
+        instead of mounting a second widget.
+        """
+        # A tool call means no more pre-tool content is coming for this turn, so
+        # finalize any streaming widget (same as _handle_tool_call).
+        if self._streaming_content_widget or self._in_reasoning:
+            await self._finalize_streaming_for_tool()
+        else:
+            self._finalize_before_tool = True
+
+        # Upgrade an existing "⚙ …" placeholder to the named pending widget.
+        # Only a name-unknown placeholder (from TOOL_CALL_PENDING) is upgraded
+        # in place; a named pending widget from an earlier TOOL_CALL_STARTED
+        # (parallel tool calls) must not be overwritten - mount a new one.
+        if self._pending_tool_widgets:
+            last = self._pending_tool_widgets[-1]
+            if getattr(last, "_pending_unknown", False):
+                last._pending_unknown = False
+                last.update(
+                    self._tool_call_markup(message.name, {}, pending=True)
+                )
+                return
+
+        was_at_bottom = self._is_at_bottom()
+        widget = Static(
+            self._tool_call_markup(message.name, {}, pending=True),
+            classes="tool-call",
+            markup=True,
+        )
+        if await self._safe_mount(widget):
+            self._pending_tool_widgets.append(widget)
+            await self._scroll_if_at_bottom(was_at_bottom)
+
+    async def _handle_tool_call_pending(self, message: ToolCallPendingMessage) -> None:
+        """Process a tool-call-pending message: show a name-unknown placeholder.
+
+        The provider is buffering a tool call: the stream is alive (keep-alive
+        chunks) but nothing visible is being emitted, and the tool name won't be
+        known until generation finishes. Mount a dimmed "⚙ …" placeholder so the
+        user sees the agent is preparing a tool call. TOOL_CALL_STARTED or
+        TOOL_CALL later replaces it in place; if content arrives instead, the
+        placeholder is discarded (false alarm - it was silent thinking).
+        """
+        # Already showing a pending/placeholder widget - nothing to add.
+        if self._pending_tool_widgets:
+            return
+
+        was_at_bottom = self._is_at_bottom()
+        widget = Static(
+            self._tool_call_markup("", {}, pending=True),
+            classes="tool-call",
+            markup=True,
+        )
+        # Mark as name-unknown so TOOL_CALL_STARTED upgrades it in place
+        widget._pending_unknown = True
+        if await self._safe_mount(widget):
+            self._pending_tool_widgets.append(widget)
+            await self._scroll_if_at_bottom(was_at_bottom)
+
+    async def _discard_pending_tool_widgets(self) -> None:
+        """Remove any orphaned pending tool-call widgets from the chat.
+
+        Called at turn boundaries (new item / interrupt) to clean up widgets that
+        were shown at TOOL_CALL_STARTED but never completed (e.g. the stream
+        errored after the tool name but before the arguments finished).
+        """
+        for widget in self._pending_tool_widgets:
+            try:
+                if widget.is_mounted:
+                    await widget.remove()
+            except Exception:
+                pass
+        self._pending_tool_widgets = []
 
     async def _handle_tool_result(self, message: ToolResultMessage) -> None:
         """Process a tool result message: write the result widget."""

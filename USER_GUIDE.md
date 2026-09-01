@@ -44,9 +44,11 @@ Complete reference for using Agent13 - configuration, tools, skills, TUI command
 
 ## Quick Start
 
+This guide is the reference. For the full setup (install, API key, config, first run) see the [README quick start](README.md#quick-start). Below: installing uv on other platforms, and uninstalling or updating.
+
 ### Install UV
 
-Make sure you have [uv](https://docs.astral.sh/uv/getting-started/installation/#installation-methods) installed:
+Install uv using [the official uv installation guide](https://docs.astral.sh/uv/getting-started/installation/) - it has the command for your platform:
 
 **macOS:**
 
@@ -86,7 +88,7 @@ pipx install uv
 
 **Pipe to Shell Method:**
 
-(Dangerous: see warning above)
+(Dangerous habit: see warning above)
 
 ```bash
 curl -LsSf https://astral.sh/uv/install.sh | sh
@@ -94,21 +96,10 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 
 ### Install Agent13
 
-Install package directly from github:
-
-```
-uv tool install https://github.com/psymonryan/agent13/releases/download/v0.3.3/agent13-0.3.3-py3-none-any.whl
-```
-
-Or install from source (for hacking on the agent itself):
+Install the latest release:
 
 ```bash
-git clone https://github.com/psymonryan/agent13
-cd agent13
-uv sync
-uv run agent13.py      # run from source
-# or
-uv tool install -e .   # install as editable tool
+uv tool install https://github.com/psymonryan/agent13/releases/download/v0.4.0/agent13-0.4.0-py3-none-any.whl
 ```
 
 ### Uninstall Agent13
@@ -129,46 +120,6 @@ Or inside a running session:
 /upgrade
 ```
 
-### Configuration
-
-`~/.agent13/config.toml`: # Sample is created for you on first run
-
-```toml
-[[providers]]
-name = "local"
-api_base = "http://localhost:8012/v1"
-api_key_env_var = "OPENAI_API_KEY"
-
-# For slower providers that need longer timeouts
-[[providers]]
-name = "laptop"
-api_base = "http://laptop.local.home:8012/v1"
-api_key_env_var = "OPENAI_API_KEY"
-read_timeout = 2400  # 40 min for long load and response times
-```
-
-Set your API key in `~/.env`:
-
-```bash
-OPENAI_API_KEY=your_key_here
-```
-
-### First Run
-
-```bash
-# Interactive TUI (will prompt you for model name/number)
-agent13 local
-
-# Batch mode (single prompt, exits after processing)
-agent13 local -p "Write a Python script to add all the numbers from 1 to 100"
-
-# List available providers
-agent13 --list-providers
-
-# Run on local provider and select model 5 (or give model name)
-agent13 local --model 5
-```
-
 ## Running Agent13
 
 ### TUI Mode
@@ -177,7 +128,7 @@ The primary interface - a full-featured terminal UI (using Textual library) with
 
 ```bash
 agent13 local
-agent13 openrouter --model qwen/qwen3.7-flash
+agent13 openrouter --model qwen/qwen3.8-Flash-Next
 ```
 
 The TUI provides:
@@ -210,7 +161,7 @@ Batch mode processes the prompt, prints the response, and exits. Useful for:
 `--mcp` works in batch mode too, letting scripts invoke MCP-provided tools (web search, fetch, deep research skills, etc.) and exit cleanly:
 
 ```bash
-agent13 local --mcp -p "Use the deep_research skill to investigate X and write findings to report.md"
+agent13 local --skills --mcp -p "Use the deep_research skill to investigate X and write findings to report.md"
 ```
 
 MCP servers are auto-disconnected when the batch run exits.
@@ -285,7 +236,6 @@ The `Agent` constructor accepts:
 - `tools: list[dict]` - Tool schemas for function calling
 - `execute_tool: Callable` - Tool execution function (sync or async)
 - `journal_mode: bool` - Enable context compaction
-- `send_reasoning: bool` - Include reasoning in message history
 - `remove_reasoning: bool` - Strip reasoning between turns
 - `devel_mode: bool` - Show devel-group tools
 
@@ -311,7 +261,6 @@ The `Agent` constructor accepts:
 | `--mcp`                     | Connect to MCP servers on startup (TUI and batch modes)                                                  | off                   |
 | `--skills`                  | Include discovered skills in the system prompt                                                           | off                   |
 | `--journal`                 | Enable journal mode (context compaction)                                                                 | off                   |
-| `--send-reasoning`          | Include reasoning_content in message history                                                             | off                   |
 | `--remove-reasoning`        | Strip reasoning tokens between turns                                                                     | off                   |
 | `-c`, `--continue`          | Continue from last auto-saved session                                                                    | -                     |
 | `--devel`                   | Enable devel mode (show devel-group tools)                                                               | off                   |
@@ -367,7 +316,7 @@ Commands are typed in the input field with a `/` prefix:
 | `/provider [name]` | Switch provider; supports `:alias` suffix (e.g., `6:nothink`) |
 | `/prompt [name]`   | Switch system prompt                                          |
 
-Note: both /model and /provider can use numbered or named models and providers
+Note: both /model and /provider can use numbered or named models and providers. You can also swap mid-flight (useful when running low on context): `/pause`, then `/provider <name>` and/or `/model <name>`.
 
 #### Queue Management
 
@@ -585,6 +534,8 @@ The bell can also be set at runtime with `/bell N` (or `/bell off`) in the TUI, 
 Polite mode coordinates access when multiple agent13 instances share the same provider - only one sends at a time, waiting for a shared provider lock. It is enabled by default with a 10-second poll interval.
 
 Disable for a session with `--polite off` on the command line, or `/polite off` in the TUI. There is no config.toml section for polite mode - it is CLI/TUI-only.
+
+The default is a polite level of 10, so if you have 5 agents running simultaniously, each will get an equal chance at grabbing the GPU whenever there is an opportunity. You can set polite to higher numbers for a lower chance, or if you want an agent to run ASAP then do a `/polite 0` to put it into 'rude' mode where it will steal the GPU from all the other agents at the next opportunity.
 
 ### Environment Variables
 
@@ -846,7 +797,6 @@ Use `/snippet` in the TUI to see available snippets and insert one. `/snippet li
 
 Agent13 can include or exclude reasoning tokens (chain-of-thought) in message history:
 
-- `--send-reasoning` - Include the model's reasoning_content in the next API call's message history.
 - `--remove-reasoning` - Strip reasoning tokens between turns. Reduces context size and focuses on final answers. Recommended for most use cases.
 
 Toggle reasoning visibility in the TUI with `Ctrl+O` to collapse/expand reasoning content.
@@ -934,9 +884,13 @@ curl http://localhost:8012/v1/models
 
 Verify the URL in `~/.agent13/config.toml` matches your server.
 
+### No Providers Configured
+
+If agent13 reports no providers, create `~/.agent13/config.toml` with at least one `[[providers]]` entry (see [Provider Configuration](#provider-configuration)).
+
 ### Model Doesn't Use Tools
 
-Not all models support tool/function calling. Try a model known for good tool support (see [Getting Started](GETTING_STARTED.md) for recommendations).
+Not all models support tool/function calling. Try a model known for good tool support (see [README → Quick start](README.md#quick-start)).
 
 ### Clipboard Not Working
 

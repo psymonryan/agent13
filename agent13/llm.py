@@ -27,6 +27,7 @@ from agent13.debug_log import (
     log_stream_end,
 )
 from agent13.prompts import DEFAULT_PROMPT
+from agent13.message_history import LOCAL_MSG_KEYS
 
 # Cache for AGENTS.md content - read once at module load time
 _AGENTS_MD_CACHE: str | None = None
@@ -338,9 +339,11 @@ def build_messages_with_system(
         system_prompt += f"\n\nGuidance for this project:\n{_AGENTS_MD_CACHE}"
 
     # Strip non-standard keys before sending to LLM API
-    # (e.g. "interrupt" is a local flag for turn-boundary logic, not an API field)
+    # (e.g. "interrupt"/"injected" are local flags for turn-boundary logic,
+    # not API fields)
     clean_messages = [
-        {k: v for k, v in msg.items() if k != "interrupt"} for msg in messages
+        {k: v for k, v in msg.items() if k not in LOCAL_MSG_KEYS}
+        for msg in messages
     ]
 
     return [{"role": "system", "content": system_prompt}] + clean_messages
@@ -512,20 +515,19 @@ def handle_tool_calls(
 
 
 def append_assistant_message(
-    messages: list[dict], content: str, reasoning: str = "", send_reasoning: bool = True
+    messages: list[dict], content: str, reasoning: str = ""
 ) -> None:
     """Append an assistant message to the message list.
 
     Args:
         messages: Message list to modify
         content: The assistant's response content
-        reasoning: Optional reasoning content
-        send_reasoning: If True, include reasoning_content in message history.
-                       Default True to preserve reasoning within a turn for
-                       better multi-step reasoning continuity.
+        reasoning: Optional reasoning content. Always included when present to
+                   preserve the model's reasoning thread within a turn (required
+                   for tool-calling continuity across providers).
     """
     message = {"role": "assistant", "content": content}
-    if reasoning and send_reasoning:
+    if reasoning:
         message["reasoning_content"] = reasoning
     messages.append(message)
 
@@ -620,6 +622,21 @@ async def stream_response_with_tools(
             if delta.content:
                 chunk_count += 1
                 yield ("content", delta.content)
+
+            # Payload-less chunks (role-only / empty deltas) are the server's
+            # keep-alive signal. Some providers buffer whole tool calls and
+            # stream NOTHING visible while generating them - these chunks are
+            # the only proof the stream is alive. Yield them so core can
+            # detect "silent but working" and give the UI feedback.
+            # (The terminal finish_reason chunk is excluded: generation has
+            # ended, there is nothing left to keep alive.)
+            if (
+                not delta.content
+                and not getattr(delta, "reasoning_content", None)
+                and not getattr(delta, "tool_calls", None)
+                and not chunk.choices[0].finish_reason
+            ):
+                yield ("keepalive", {})
 
             # Handle tool call chunks
             if hasattr(delta, "tool_calls") and delta.tool_calls:

@@ -5,6 +5,43 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] - 2026-09-01
+
+### Added
+
+- feat: vision support - ToolResult, sidecar or native routing, images are stripped after turns to avoid context bloat
+- feat: /compact now takes a focus param to steer compaction
+- status bar now shows live context estimate (~N) at safe points, grounded once the next API call reports
+- added auto-compact threshold: stops at safe point when context exceeds limit, then journals if you have enabled it, or falls back to full /compact otherwise
+- Added experimental PyInstaller spec + docs for standalone Windows builds
+- command tool can now direct-spawn PowerShell on Windows (pwsh 7+ preferred, 5.1 fallback)
+- we now allow arguments on skill slash commands: /skillname <text> appends text after skill content
+- Show "⚙ ..." placeholder when provider buffers tool calls
+
+### Fixed
+
+- fix: force UTF-8 on piped stdio on Windows (cp1252 locale broke non-ASCII output, e.g. /compact result line); CI default host c110→c122
+- fix: handle stale files and symlinks in config dir creation
+- fix: tool call widget is now created as soon as possible to give better chat window feedback
+
+### Changed
+
+- tui: /history - dim tool call preview (yellow label only)
+- tui: colour user: green in /history group headers
+- polite: "Rude mode enabled" when interval is 0 for polite mode (a bit of humour)
+- pinned playwright in default config to avoid failure each time browsers update
+- mcp: accept 2- or 3-value streamablehttp_client yield (mcp SDK 1.x/2.x)
+- Widen batch-mode timing threshold 30s -> 120s: hang detector, not perf test
+- Command tool: 120s default timeout, preserve partial output on timeout, stdin hint in message
+- Status bar: compressed model name to stop long model names stealing too much real estate on status bar
+- Polite lock: key by base model name (thinking suffix stripped), moved locks to ~/.agent13/locks/
+- Remove vestigial --send-reasoning flag (dead code; within-turn reasoning always kept)
+- Move history files into ~/.agent13/history/ subdir
+- Robust config reading: repair BOM/UTF-16/ANSI files, clean one-line error for corrupt config
+- bumped all dependant libraries
+- docs: reorganised content based on feedback from manual testers
+- 
+
 ## [0.3.3] - 2026-08-16
 
 ### Added

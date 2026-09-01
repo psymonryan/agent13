@@ -5,6 +5,7 @@ Uses macOS Seatbelt sandboxing via sandbox-exec to restrict file and network acc
 
 import os
 import platform
+import shutil
 import subprocess
 import asyncio
 import signal
@@ -359,6 +360,71 @@ def _expand_path(path: str) -> str:
     return path
 
 
+# ── Windows PowerShell routing ──────────────────────────────────────────────
+# On Windows we route every command through PowerShell instead of cmd.exe.
+# The command is passed as a single argv element (-Command <cmd>), so
+# CreateProcess never re-interprets quotes/backslashes — zero quoting layers.
+# We prefer pwsh (7+, better syntax) and fall back to powershell.exe (5.1).
+
+_PWSH_CACHE: Optional[str] = None
+
+
+def find_powershell() -> Optional[str]:
+    """Find a PowerShell executable on Windows.
+
+    Returns the path to pwsh (PowerShell 7+) if available, else
+    powershell.exe (5.1, always present on Windows), else None.
+    Result is cached for the session.
+    """
+    global _PWSH_CACHE
+    if _PWSH_CACHE is not None:
+        return _PWSH_CACHE
+    if sys.platform != "win32":
+        return None
+    for name in ("pwsh", "pwsh.exe"):
+        path = shutil.which(name)
+        if path:
+            _PWSH_CACHE = path
+            return path
+    # powershell.exe lives in System32 on every Windows install
+    path = shutil.which("powershell") or shutil.which("powershell.exe")
+    if path:
+        _PWSH_CACHE = path
+        return path
+    system32 = os.environ.get("SystemRoot", r"C:\Windows") + r"\System32\WindowsPowerShell\v1.0\powershell.exe"
+    if os.path.exists(system32):
+        _PWSH_CACHE = system32
+        return system32
+    return None
+
+
+def is_powershell_7(pwsh_path: Optional[str] = None) -> bool:
+    """Return True if the resolved PowerShell is edition 7+ (pwsh).
+
+    Checks the executable stem, not a substring: "powershell" contains
+    "pwsh" as a substring (PowerSHell) but is edition 5.1.
+    """
+    path = pwsh_path or find_powershell()
+    if not path:
+        return False
+    return Path(path).stem.lower() == "pwsh"
+
+
+def build_powershell_command(command: str, pwsh_path: Optional[str] = None) -> list[str]:
+    """Build a direct-spawn PowerShell argv for a command string.
+
+    The command is a single argv element: the model's text reaches PowerShell
+    verbatim with no intermediate shell to mangle $_, $?, backticks, etc.
+    -NoProfile skips user profiles (deterministic, faster, no side effects).
+    -NonInteractive prevents prompts from hanging the tool.
+    """
+    path = pwsh_path or find_powershell()
+    if not path:
+        # No PowerShell found — fall back to cmd.exe (legacy behaviour)
+        return ["cmd.exe", "/c", command]
+    return [path, "-NoProfile", "-NonInteractive", "-Command", command]
+
+
 def is_macos() -> bool:
     """Check if we're running on macOS."""
     return platform.system() == "Darwin"
@@ -575,7 +641,8 @@ def build_sandbox_command(
     if not is_macos() or mode == SandboxMode.OFF:
         # No sandboxing on non-macOS or when disabled
         if sys.platform == "win32":
-            return ["cmd.exe", "/c", command]
+            # Direct-spawn PowerShell (single argv, no quoting layers)
+            return build_powershell_command(command)
         return ["/bin/sh", "-c", command]
 
     if project_dir is None:
@@ -610,7 +677,7 @@ def build_sandbox_command(
 def run_sandboxed(
     command: str,
     mode: SandboxMode,
-    timeout: float = 30.0,
+    timeout: float = 120.0,
     max_output: int = 100000,
     project_dir: Optional[Path] = None,
 ) -> dict:
@@ -619,7 +686,7 @@ def run_sandboxed(
     Args:
         command: The command to run
         mode: The sandbox mode
-        timeout: Timeout in seconds (default 30)
+        timeout: Timeout in seconds (default 120)
         max_output: Maximum output size in bytes (default 100KB)
         project_dir: The project directory (defaults to cwd)
 
@@ -670,16 +737,19 @@ def run_sandboxed(
             "sandbox_mode": mode.value,
         }
 
-    except subprocess.TimeoutExpired:
-        return {
-            "success": False,
-            "exit_code": -1,
-            "stdout": "",
-            "stderr": f"Command timed out after {timeout} seconds. You can specify a larger timeout (up to 600 seconds) using the timeout parameter.",
-            "truncated": False,
-            "timed_out": True,
-            "sandbox_mode": mode.value,
-        }
+    except subprocess.TimeoutExpired as e:
+        # TimeoutExpired carries the output captured before the kill; it may
+        # be bytes even in text mode
+        def _to_text(data) -> str:
+            if data is None:
+                return ""
+            if isinstance(data, bytes):
+                return data.decode(_SUBPROCESS_ENCODING, errors="replace")
+            return data
+
+        return _timeout_result(
+            timeout, _to_text(e.stdout), _to_text(e.stderr), mode, max_output
+        )
     except FileNotFoundError as e:
         return {
             "success": False,
@@ -765,7 +835,7 @@ def validate_sandbox_profiles() -> list[str]:
 async def run_sandboxed_async(
     command: str,
     mode: SandboxMode,
-    timeout: float = 30.0,
+    timeout: float = 120.0,
     max_output: int = 100000,
     project_dir: Optional[Path] = None,
 ) -> dict:
@@ -777,7 +847,7 @@ async def run_sandboxed_async(
     Args:
         command: The command to run
         mode: The sandbox mode
-        timeout: Timeout in seconds (default 30)
+        timeout: Timeout in seconds (default 120)
         max_output: Maximum output size in bytes (default 100KB)
         project_dir: The project directory (defaults to cwd)
 
@@ -791,17 +861,15 @@ async def run_sandboxed_async(
         - timed_out: bool (if command timed out)
         - sandbox_mode: str (the mode used)
     """
-    # Windows requires different subprocess handling:
-    # - create_subprocess_shell() for proper command string interpretation
-    # - CREATE_NEW_PROCESS_GROUP instead of start_new_session
+    # Windows: direct-spawn PowerShell with the command as a single argv
+    # element (no intermediate shell to mangle quotes/backslashes/$_).
+    # CREATE_NEW_PROCESS_GROUP instead of start_new_session.
     # Unix uses create_subprocess_exec() with start_new_session for process groups
     if sys.platform == "win32":
-        # On Windows, use shell=True equivalent via create_subprocess_shell
-        # This properly handles command strings with quotes and special chars
         # CREATE_NO_WINDOW (0x08000000): Prevents console window from appearing
         # CREATE_NEW_PROCESS_GROUP (0x200): Allows process tree termination
-        process = await asyncio.create_subprocess_shell(
-            command,
+        process = await asyncio.create_subprocess_exec(
+            *build_powershell_command(command),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             creationflags=0x08000200,  # CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP
@@ -819,10 +887,46 @@ async def run_sandboxed_async(
             cwd=str(project_dir) if project_dir else None,
         )
 
+    # Pump both streams into chunk lists so partial output survives a
+    # timeout kill - cancelling communicate() would discard data already
+    # read.
+    chunks_out: list[bytes] = []
+    chunks_err: list[bytes] = []
+
+    async def _pump(stream, chunks: list[bytes]) -> None:
+        while True:
+            chunk = await stream.read(65536)
+            if not chunk:
+                break
+            chunks.append(chunk)
+
+    pump_out = asyncio.create_task(_pump(process.stdout, chunks_out))
+    pump_err = asyncio.create_task(_pump(process.stderr, chunks_err))
+
     try:
-        stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout)
-        stdout = stdout.decode(_SUBPROCESS_ENCODING, errors="replace")
-        stderr = stderr.decode(_SUBPROCESS_ENCODING, errors="replace")
+        timed_out = False
+        try:
+            await asyncio.wait_for(process.wait(), timeout=timeout)
+        except asyncio.TimeoutError:
+            timed_out = True
+            # Kill the process tree
+            await _kill_process_tree(process)
+
+        # Let the pumps drain to EOF (instant in the normal case; bounded
+        # in case a stray grandchild still holds a pipe open)
+        try:
+            await asyncio.wait_for(asyncio.gather(pump_out, pump_err), timeout=5)
+        except asyncio.TimeoutError:
+            await _kill_process_tree(process)
+            pump_out.cancel()
+            pump_err.cancel()
+
+        stdout = b"".join(chunks_out).decode(_SUBPROCESS_ENCODING, errors="replace")
+        stderr = b"".join(chunks_err).decode(_SUBPROCESS_ENCODING, errors="replace")
+
+        if timed_out:
+            return _timeout_result(timeout, stdout, stderr, mode, max_output)
+
         truncated = False
 
         # Truncate output if needed
@@ -847,20 +951,9 @@ async def run_sandboxed_async(
             "sandbox_mode": mode.value,
         }
 
-    except asyncio.TimeoutError:
-        # Kill the process tree
-        await _kill_process_tree(process)
-        return {
-            "success": False,
-            "exit_code": -1,
-            "stdout": "",
-            "stderr": f"Command timed out after {timeout} seconds. You can specify a larger timeout (up to 600 seconds) using the timeout parameter.",
-            "truncated": False,
-            "timed_out": True,
-            "sandbox_mode": mode.value,
-        }
-
     except FileNotFoundError as e:
+        pump_out.cancel()
+        pump_err.cancel()
         return {
             "success": False,
             "exit_code": -1,
@@ -871,6 +964,8 @@ async def run_sandboxed_async(
             "sandbox_mode": mode.value,
         }
     except Exception as e:
+        pump_out.cancel()
+        pump_err.cancel()
         return {
             "success": False,
             "exit_code": -1,
@@ -880,6 +975,45 @@ async def run_sandboxed_async(
             "timed_out": False,
             "sandbox_mode": mode.value,
         }
+
+
+def _timeout_result(
+    timeout: float,
+    stdout: str,
+    stderr: str,
+    mode: SandboxMode,
+    max_output: int,
+) -> dict:
+    """Build the result dict for a timed-out command, keeping partial output.
+
+    Output captured before the kill is preserved (truncated like the normal
+    path) so the caller can see how far the command got.
+    """
+    truncated = False
+    if len(stdout) > max_output:
+        stdout = stdout[:max_output] + f"\n... [Output truncated at {max_output} bytes]"
+        truncated = True
+    if len(stderr) > max_output:
+        stderr = stderr[:max_output] + f"\n... [Output truncated at {max_output} bytes]"
+        truncated = True
+
+    message = (
+        f"Command timed out after {timeout} seconds. If the command is "
+        "interactive (TUI, ssh, a prompt), it was likely blocked waiting on "
+        "stdin - retry with stdin closed (e.g. `cmd </dev/null`) or a "
+        "non-interactive flag."
+    )
+    stderr = (stderr + "\n" if stderr else "") + message
+
+    return {
+        "success": False,
+        "exit_code": -1,
+        "stdout": stdout,
+        "stderr": stderr,
+        "truncated": truncated,
+        "timed_out": True,
+        "sandbox_mode": mode.value,
+    }
 
 
 async def _kill_process_tree(proc: asyncio.subprocess.Process) -> None:

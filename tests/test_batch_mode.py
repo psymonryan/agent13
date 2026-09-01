@@ -183,15 +183,19 @@ class TestBatchModeTiming:
             ],
             capture_output=True,
             text=True,
-            timeout=60,
+            timeout=180,
             env=mock_provider_env,
             cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
         )
 
         elapsed = time.time() - start
 
-        # Should complete within reasonable time (not hang)
-        assert elapsed < 30, f"Batch took too long: {elapsed}s"
+        # Should complete within reasonable time (not hang).
+        # Generous on purpose: this is a hang detector, not a performance
+        # test. A loaded CI box (Windows) has been observed at ~42s; the
+        # regression this catches is an infinite hang, which the 180s
+        # subprocess timeout still terminates.
+        assert elapsed < 120, f"Batch took too long: {elapsed}s"
 
         # Should take at least a little time to process (not exit immediately)
         # This catches the regression where batch exits on initial IDLE

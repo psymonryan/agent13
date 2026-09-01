@@ -46,11 +46,11 @@ def test_sanitize_provider_idempotent():
 # ---------------------------------------------------------------------------
 
 
-def test_lock_path_uses_config_dir(tmp_path, monkeypatch):
-    """Lock file lives in ~/.agent13/ (config dir) with sanitized provider."""
+def test_lock_path_uses_locks_dir(tmp_path, monkeypatch):
+    """Lock file lives in ~/.agent13/locks/ with sanitized provider."""
     monkeypatch.setenv("AGENT13_CONFIG_DIR", str(tmp_path))
     lock = PoliteLock(provider="studiomlx", interval=0.1)
-    assert lock.path.parent == tmp_path
+    assert lock.path.parent == tmp_path / "locks"
     assert lock.path.name == "polite_studiomlx.lck"
 
 
@@ -61,13 +61,13 @@ def test_lock_path_url_provider(tmp_path, monkeypatch):
     assert lock.path.name == "polite_http_localhost_8080_v1.lck"
 
 
-def test_lock_path_creates_config_dir(tmp_path, monkeypatch):
-    """Config dir is created if it doesn't exist."""
+def test_lock_path_creates_locks_dir(tmp_path, monkeypatch):
+    """Config dir and locks/ subdir are created if they don't exist."""
     nested = tmp_path / "nested" / "config"
     monkeypatch.setenv("AGENT13_CONFIG_DIR", str(nested))
     lock = PoliteLock(provider="test", interval=0.1)
-    assert nested.exists()
-    assert lock.path.parent == nested
+    assert (nested / "locks").exists()
+    assert lock.path.parent == nested / "locks"
 
 
 def test_two_locks_same_provider_same_path(tmp_path, monkeypatch):
@@ -84,6 +84,43 @@ def test_two_locks_different_provider_different_path(tmp_path, monkeypatch):
     l1 = PoliteLock(provider="alpha", interval=0.1)
     l2 = PoliteLock(provider="beta", interval=0.1)
     assert l1.path != l2.path
+
+
+def test_lock_path_with_model(tmp_path, monkeypatch):
+    """A model name is appended to the lock filename."""
+    monkeypatch.setenv("AGENT13_CONFIG_DIR", str(tmp_path))
+    lock = PoliteLock(provider="studiomlx", interval=0.1, model="GLM-5.1")
+    assert lock.path.name == "polite_studiomlx_GLM_5_1.lck"
+
+
+def test_lock_path_model_none_is_legacy(tmp_path, monkeypatch):
+    """model=None produces the legacy provider-only filename."""
+    monkeypatch.setenv("AGENT13_CONFIG_DIR", str(tmp_path))
+    lock = PoliteLock(provider="studiomlx", interval=0.1)
+    assert lock.path.name == "polite_studiomlx.lck"
+
+
+def test_lock_path_model_name_sanitized(tmp_path, monkeypatch):
+    """A model-name fallback is sanitized into the filename."""
+    monkeypatch.setenv("AGENT13_CONFIG_DIR", str(tmp_path))
+    lock = PoliteLock(provider="x", interval=0.1, model="Qwen/3.8-27B")
+    assert lock.path.name == "polite_x_Qwen_3_8_27B.lck"
+
+
+def test_two_locks_same_provider_different_model(tmp_path, monkeypatch):
+    """Same provider, different models -> different paths (run in parallel)."""
+    monkeypatch.setenv("AGENT13_CONFIG_DIR", str(tmp_path))
+    l1 = PoliteLock(provider="shared", interval=0.1, model="GLM-5.1")
+    l2 = PoliteLock(provider="shared", interval=0.1, model="GLM-5.2")
+    assert l1.path != l2.path
+
+
+def test_two_locks_same_provider_same_model(tmp_path, monkeypatch):
+    """Same provider and model -> same path (coordinate)."""
+    monkeypatch.setenv("AGENT13_CONFIG_DIR", str(tmp_path))
+    l1 = PoliteLock(provider="shared", interval=0.1, model="GLM-5.1")
+    l2 = PoliteLock(provider="shared", interval=0.2, model="GLM-5.1")
+    assert l1.path == l2.path
 
 
 # ---------------------------------------------------------------------------
@@ -117,6 +154,13 @@ def test_provider_property_preserves_raw(tmp_path, monkeypatch):
     monkeypatch.setenv("AGENT13_CONFIG_DIR", str(tmp_path))
     lock = PoliteLock(provider="http://localhost:8080", interval=0.1)
     assert lock.provider == "http://localhost:8080"
+
+
+def test_model_property_returns_value(tmp_path, monkeypatch):
+    """model property returns the value passed in (or None)."""
+    monkeypatch.setenv("AGENT13_CONFIG_DIR", str(tmp_path))
+    assert PoliteLock(provider="x", interval=0.1, model="GLM-5.1").model == "GLM-5.1"
+    assert PoliteLock(provider="x", interval=0.1).model is None
 
 
 # ---------------------------------------------------------------------------
@@ -406,3 +450,147 @@ async def test_set_client_skips_rekey_when_held(config_dir):
     assert agent.polite_lock is held_obj
     assert agent.polite_lock.is_held()
     agent.polite_lock.release()
+
+
+# ---------------------------------------------------------------------------
+# Per-model keying (base name / thinking-suffix strip / re-key)
+# ---------------------------------------------------------------------------
+
+
+def test_model_base_name_no_colon(config_dir):
+    """A model name without a colon is returned unchanged."""
+    from agent13.core import Agent
+
+    agent = Agent(_MockClient("http://x/v1"), model="GLM-5.1")
+    assert agent._model_base_name() == "GLM-5.1"
+
+
+def test_model_base_name_strips_thinking_suffix(config_dir):
+    """A thinking-level suffix (:none/:medium) is stripped from the key."""
+    from agent13.core import Agent
+
+    agent = Agent(_MockClient("http://x/v1"), model="GLM-5.1:medium")
+    assert agent._model_base_name() == "GLM-5.1"
+
+
+def test_model_base_name_strips_suffix_even_if_in_model_list(config_dir):
+    """Regression: backends expose thinking variants as /v1/models entries.
+
+    The suffix must be stripped by the verb whitelist, not by list membership
+    — otherwise "Model:medium" (which IS in the list) would keep the suffix
+    and the same model would get multiple locks.
+    """
+    from agent13.core import Agent
+
+    agent = Agent(
+        _MockClient("http://x/v1"),
+        model="Qwen3.8-27B-MTPLX-Optimized-Quality:medium",
+    )
+    agent.available_models = [
+        "Qwen3.8-27B-MTPLX-Optimized-Quality",
+        "Qwen3.8-27B-MTPLX-Optimized-Quality:none",
+        "Qwen3.8-27B-MTPLX-Optimized-Quality:medium",
+    ]
+    assert agent._model_base_name() == "Qwen3.8-27B-MTPLX-Optimized-Quality"
+
+
+def test_model_base_name_keeps_non_thinking_suffix(config_dir):
+    """A non-thinking colon suffix (OpenRouter) is kept."""
+    from agent13.core import Agent
+
+    agent = Agent(_MockClient("http://x/v1"), model="meta-llama/llama-3.1:free")
+    assert agent._model_base_name() == "meta-llama/llama-3.1:free"
+
+
+def test_model_base_name_strips_all_thinking_verbs(config_dir):
+    """Every whitelisted thinking verb is stripped."""
+    from agent13.core import Agent
+
+    for verb in ("nothink", "none", "low", "medium", "high", "xhigh", "max"):
+        agent = Agent(_MockClient("http://x/v1"), model=f"GLM-5.1:{verb}")
+        assert agent._model_base_name() == "GLM-5.1", verb
+
+
+def test_polite_model_key_sanitized_name(config_dir):
+    """_polite_model_key returns the sanitized base model name."""
+    from agent13.core import Agent
+
+    agent = Agent(_MockClient("http://x/v1"), model="Qwen/3.8-27B")
+    assert agent._polite_model_key() == "Qwen_3_8_27B"
+
+
+def test_polite_model_key_strips_thinking_suffix(config_dir):
+    """The thinking suffix is stripped before sanitizing."""
+    from agent13.core import Agent
+
+    agent = Agent(_MockClient("http://x/v1"), model="GLM-5.1:medium")
+    assert agent._polite_model_key() == "GLM_5_1"
+
+
+def test_polite_model_key_keeps_non_thinking_suffix(config_dir):
+    """A non-thinking colon suffix survives into the key."""
+    from agent13.core import Agent
+
+    agent = Agent(_MockClient("http://x/v1"), model="meta-llama/llama-3.1:free")
+    assert agent._polite_model_key() == "meta_llama_llama_3_1_free"
+
+
+def test_polite_model_key_none_without_model(config_dir):
+    """No model set -> None (provider-only key)."""
+    from agent13.core import Agent
+
+    agent = Agent(_MockClient("http://x/v1"), model="")
+    agent.available_models = ["alpha"]
+    assert agent._polite_model_key() is None
+
+
+def test_set_polite_uses_model_name_in_path(config_dir):
+    """set_polite keys the lock by provider + base model name."""
+    from agent13.core import Agent
+
+    agent = Agent(_MockClient("http://x:8012/v1"), model="GLM-5.1:medium")
+    agent.available_models = ["GLM-5.1"]
+    agent.set_polite(interval=3)
+    assert agent.polite_lock.path.name == "polite_http_x_8012_v1_GLM_5_1.lck"
+    assert agent.polite_lock.model == "GLM_5_1"
+
+
+def test_set_polite_same_provider_model_no_rekey(config_dir):
+    """Re-calling set_polite with the same provider+model keeps the object."""
+    from agent13.core import Agent
+
+    agent = Agent(_MockClient("http://x/v1"), model="delta")
+    agent.available_models = ["delta"]
+    agent.set_polite(interval=1.0)
+    lock_obj = agent.polite_lock
+    agent.set_polite(interval=2.0)
+    assert agent.polite_lock is lock_obj  # same object, interval updated
+    assert agent.polite_lock.interval == 2.0
+
+
+def test_set_model_rekeys_polite_lock(config_dir):
+    """set_model re-keys the polite lock to the new model's name."""
+    from agent13.core import Agent
+
+    agent = Agent(_MockClient("http://x/v1"), model="alpha")
+    agent.available_models = ["alpha", "beta", "gamma"]
+    agent.set_polite(interval=3)
+    old_path = agent.polite_lock.path
+    assert agent.polite_lock.model == "alpha"
+
+    agent.set_model("gamma")
+
+    assert agent.polite_lock.model == "gamma"
+    assert agent.polite_lock.path != old_path
+    assert agent.polite_lock.interval == 3  # preserved
+
+
+def test_set_model_no_polite_no_crash(config_dir):
+    """set_model is safe when polite mode is not enabled."""
+    from agent13.core import Agent
+
+    agent = Agent(_MockClient("http://x/v1"), model="alpha")
+    agent.available_models = ["alpha", "beta"]
+    assert agent.polite_lock is None
+    agent.set_model("beta")  # should not raise
+    assert agent.polite_lock is None

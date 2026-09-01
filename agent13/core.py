@@ -4,6 +4,7 @@ import asyncio
 import datetime
 import json
 import re
+import time
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Callable, Awaitable, Optional, TYPE_CHECKING
@@ -12,9 +13,9 @@ from openai import AsyncOpenAI
 
 from agent13.events import AgentEvent, AgentEventData, EventHandler
 from agent13.journal import JournalManager
-from agent13.polite import PoliteLock
-from agent13.message_history import MessageHistory
-from agent13.prompts import DEFAULT_PROMPT
+from agent13.polite import PoliteLock, _sanitize_provider
+from agent13.message_history import MessageHistory, is_turn_start
+from agent13.prompts import DEFAULT_PROMPT, AUTO_COMPACT_CONTINUE_HINT
 from agent13.queue import AgentQueue, QueueItem
 from agent13.llm import (
     append_assistant_message,
@@ -37,6 +38,16 @@ from agent13.debug_log import (
     is_debug_enabled,
     log_tps_event,
 )
+from agent13.vision import describe_image, resize_image_uri
+from agent13.vision import SIDECAR_MAX_DIMENSION, NATIVE_MAX_DIMENSION
+from tools import ToolResult
+
+# Seconds of stream silence (no visible tokens, only keep-alive chunks) before
+# core emits TOOL_CALL_PENDING. Providers that buffer whole tool calls (mlx-lm)
+# send a keep-alive every ~10s while generating; 5s means the placeholder
+# appears on the first keep-alive past the threshold. Normal responses start
+# streaming content within ~1s of the role chunk, so they never trip this.
+TOOL_CALL_PENDING_SILENCE = 5.0
 
 if TYPE_CHECKING:
     from agent13.mcp import MCPManager
@@ -115,15 +126,11 @@ class ToolStats:
                 )
 
         # Track param combo (sorted tuple of non-None argument names)
-        combo = ",".join(
-            sorted(k for k, v in arguments.items() if v is not None)
-        )
+        combo = ",".join(sorted(k for k, v in arguments.items() if v is not None))
         if name not in self.param_combos:
             self.param_combos[name] = {}
             self.param_combo_successes[name] = {}
-        self.param_combos[name][combo] = (
-            self.param_combos[name].get(combo, 0) + 1
-        )
+        self.param_combos[name][combo] = self.param_combos[name].get(combo, 0) + 1
         if is_success:
             self.param_combo_successes[name][combo] = (
                 self.param_combo_successes[name].get(combo, 0) + 1
@@ -241,6 +248,13 @@ class Agent:
         await agent.run()
     """
 
+    # Thinking-level suffixes stripped from the polite lock key so agents on
+    # the same model with different thinking budgets share one lock. Some
+    # backends expose these as first-class /v1/models entries (e.g.
+    # "Model:medium"), so membership in the model list can't detect them — a
+    # fixed whitelist is the reliable signal.
+    _THINKING_SUFFIXES = {"nothink", "none", "low", "medium", "high", "xhigh", "max"}
+
     def __init__(
         self,
         client: AsyncOpenAI,
@@ -253,11 +267,12 @@ class Agent:
         | Callable[[str, dict], Awaitable[str]] = None,
         response_format: dict = None,
         journal_mode: bool = False,
-        send_reasoning: bool = False,
         remove_reasoning: bool = False,
         devel_mode: bool = False,
         skills_mode: bool = False,
         priming_enabled: bool = False,
+        auto_compact_threshold: int = 0,
+        auto_compact_max_iterations: int = 3,
     ):
         """Initialize the agent.
 
@@ -272,7 +287,6 @@ class Agent:
                          Can be sync or async.
             response_format: Optional response format (e.g., {"type": "json_object"})
             journal_mode: Enable context compaction via journal summaries.
-            send_reasoning: If True, include reasoning_content in message history.
             remove_reasoning: If True, strip reasoning tokens between turns.
                              Defaults to False (preserve reasoning between turns).
             devel_mode: If True, include tools in the "devel" group (e.g. TUI viewer).
@@ -287,11 +301,22 @@ class Agent:
         self.execute_tool = execute_tool
         self.response_format = response_format
         self.journal_mode = journal_mode
-        self.send_reasoning = send_reasoning
         self.remove_reasoning = remove_reasoning
         self._devel_mode = devel_mode
         self._skills_mode = skills_mode
         self.priming_enabled = priming_enabled
+        self.auto_compact_threshold = auto_compact_threshold
+        self.auto_compact_max_iterations = auto_compact_max_iterations
+        self._auto_compact_failures = 0  # Circuit breaker counter
+        self._auto_compact_triggered = False  # Set when threshold hit mid-turn
+        self._auto_compact_iterations = 0  # Compact cycles this turn (resets per turn)
+        self._auto_compact_snapshot_count = (
+            0  # Per-session monotonic (snapshot filenames)
+        )
+        # Message count at the start of the most recent LLM stream. Used to
+        # estimate the true context size at the safe point (prompt_tokens is
+        # stale there - it predates the tool results just added).
+        self._msg_count_before_stream = 0
         self.execute_tool = execute_tool
         # Session date: stable for the lifetime of the session.
         # Used in the system prompt to prevent midnight date changes
@@ -301,7 +326,6 @@ class Agent:
         self.available_models: list[str] = []
         self.response_format = response_format
         self.journal_mode = journal_mode
-        self.send_reasoning = send_reasoning
         self.remove_reasoning = remove_reasoning
 
         self._handlers: list[EventHandler] = []
@@ -804,27 +828,31 @@ class Agent:
                     # Execute the tool
                     result = await self._execute_tool_async(name, arguments)
 
+                    # Extract display text (TUI/stats expect str, not ToolResult)
+                    display_text = (
+                        result.text if isinstance(result, ToolResult) else result
+                    )
+
                     # Record tool statistics
-                    self.tool_stats.record(name, arguments, result)
+                    self.tool_stats.record(name, arguments, display_text)
 
                     # Emit result
-                    log_tool_result(name, result)
+                    log_tool_result(name, display_text)
                     await self.emit(
                         AgentEvent.TOOL_RESULT,
                         {
                             "name": name,
-                            "result": result,
+                            "result": display_text,
                         },
                     )
 
-                    # Add tool result to messages
-                    self.messages.append(
-                        {
-                            "role": "tool",
-                            "tool_call_id": tc["id"],
-                            "content": result,
-                        }
+                    # Add tool result to messages (handles vision routing)
+                    tool_msg, extra_msgs = await self._build_tool_result_content(
+                        result, name, tc["id"]
                     )
+                    self.messages.append(tool_msg)
+                    for msg in extra_msgs:
+                        self.messages.append(msg)
 
                     # Safe pause point - check if pause requested after
                     # each tool result (mirrors _llm_turn's tool loop).
@@ -883,6 +911,65 @@ class Agent:
                     await self._set_status(AgentStatus.IDLE)
                 await self.emit(AgentEvent.RESUMED, {})
 
+    @staticmethod
+    def _estimate_message_tokens(messages: list) -> int:
+        """Roughly estimate the token count of a list of messages.
+
+        Uses a chars/4 heuristic (no tokenizer dependency). Adequate for a
+        threshold check given the headroom between the auto-compact threshold
+        and the model's real context limit.
+
+        Image content blocks are counted as a fixed 170 tokens (the actual
+        API cost for a medium-resolution image), not as the length of the
+        base64 data URI.
+        """
+        IMAGE_BLOCK_TOKENS = 170  # ~token cost of one image block
+        total = 0
+        for m in messages:
+            content = m.get("content")
+            if isinstance(content, str):
+                total += len(content) // 4
+            elif isinstance(content, list):
+                for block in content:
+                    if isinstance(block, dict):
+                        btype = block.get("type")
+                        if btype == "text":
+                            total += len(block.get("text", "")) // 4
+                        elif btype == "image_url":
+                            total += IMAGE_BLOCK_TOKENS
+            for tc in m.get("tool_calls") or []:
+                fn = tc.get("function", {}) if isinstance(tc, dict) else {}
+                total += len(fn.get("arguments", "") or "") // 4
+        return total
+
+    def _estimate_current_context_tokens(self) -> int:
+        """Estimate the true current context size at the safe point.
+
+        prompt_tokens reflects the LLM call that just completed (the context
+        before the tool results that were just added). Add the estimated
+        tokens of every message appended since that stream started.
+        """
+        added = self.messages[self._msg_count_before_stream :]
+        return self.prompt_tokens + self._estimate_message_tokens(added)
+
+    def _save_auto_compact_snapshot(self, n: int) -> None:
+        """Save pre-compact history to a dated snapshot file.
+
+        Uses the same location and date pattern as the auto-save, with a
+        ``_N`` suffix (N = per-session auto-compact count) so snapshots never
+        collide. A safety net: if the journal/compact summary loses state, the
+        user can reload this file. Never blocks the turn on failure.
+        """
+        try:
+            from agent13.persistence import get_auto_save_path, save_context
+
+            base = get_auto_save_path(session_date=self.session_date)
+            path = base.parent / f"{base.stem}_{n}.ctx"
+            save_context(self, path)
+        except Exception:
+            # Snapshot is best-effort; a failure here must not kill the turn.
+            pass
+
     async def _execute_tool_async(self, name: str, arguments: dict) -> str:
         """Execute a tool (handles both sync and async callables).
 
@@ -912,6 +999,162 @@ class Agent:
             return await loop.run_in_executor(
                 None, lambda: self.execute_tool(name, arguments)
             )
+
+    async def _build_tool_result_content(
+        self, result: "str | ToolResult", tool_name: str, tool_call_id: str
+    ) -> tuple[dict, list[dict]]:
+        """Convert tool result into message(s) for the conversation.
+
+        Handles vision routing: if the result carries images, routes them
+        based on vision config (sidecar, native, or drop).
+
+        Args:
+            result: Tool result (str or ToolResult)
+            tool_name: Name of the tool that produced the result
+            tool_call_id: The tool call ID for the tool message
+
+        Returns:
+            (tool_message, extra_messages) where extra_messages are
+            additional messages to inject after the tool message.
+        """
+        if isinstance(result, ToolResult):
+            text = result.text
+            images = result.images
+            question = result.question
+        else:
+            text = str(result)
+            images = []
+            question = ""
+
+        if not images:
+            # No images — current behavior
+            return (
+                {"role": "tool", "tool_call_id": tool_call_id, "content": text},
+                [],
+            )
+
+        # We have images. Route based on vision config.
+        from agent13.config import get_config
+
+        config = get_config()
+        vision = config.vision
+        # No [vision] section → assume current model has vision (native mode).
+        # [vision] is only needed to nominate a sidecar for text-only models.
+        if vision is None or vision.should_use_native(self.model):
+            # Native: inject images inline as a user message with image_url blocks.
+            # OpenAI API requires images in user role, not tool role.
+            images = [resize_image_uri(uri, NATIVE_MAX_DIMENSION) for uri in images]
+            content_parts = [
+                {"type": "text", "text": f"[Image from tool: {tool_name}]"}
+            ]
+            for uri in images:
+                content_parts.append({"type": "image_url", "image_url": {"url": uri}})
+            return (
+                {"role": "tool", "tool_call_id": tool_call_id, "content": text},
+                [
+                    {
+                        "role": "user",
+                        "content": content_parts,
+                        # Mid-turn injection: no user intent. The flag keeps
+                        # it inside the current turn for grouping/compaction
+                        # (see message_history.is_turn_start).
+                        "injected": True,
+                    }
+                ],
+            )
+
+        elif vision.sidecar_provider:
+            # Sidecar: send each image to vision model, get text descriptions back.
+            sidecar_config = config.get_provider(vision.sidecar_provider)
+            if sidecar_config is None:
+                # Provider not found — drop images
+                return (
+                    {
+                        "role": "tool",
+                        "tool_call_id": tool_call_id,
+                        "content": text
+                        + f"\n\n[Image data omitted — sidecar provider '{vision.sidecar_provider}' not found]",
+                    },
+                    [],
+                )
+
+            images = [resize_image_uri(uri, SIDECAR_MAX_DIMENSION) for uri in images]
+            descriptions = []
+            for uri in images:
+                if question:
+                    prompt = question
+                else:
+                    prompt = (
+                        f"Context: {text}. "
+                        "Describe this image in detail: all visible text, "
+                        "UI elements, colors, layout, and anything notable."
+                    )
+                desc = await describe_image(
+                    sidecar_config, vision.sidecar_model or None, uri, prompt
+                )
+                descriptions.append(desc)
+
+            combined = text + "\n\n" + "\n\n".join(descriptions)
+            return (
+                {"role": "tool", "tool_call_id": tool_call_id, "content": combined},
+                [],
+            )
+
+        else:
+            # Auto mode, no match, no sidecar — drop images
+            return (
+                {
+                    "role": "tool",
+                    "tool_call_id": tool_call_id,
+                    "content": text
+                    + "\n\n[Image data omitted — no vision backend available]",
+                },
+                [],
+            )
+
+    def _strip_images_from_messages(self) -> None:
+        """Remove image_url blocks from messages after the model has seen them.
+
+        Replaces each image_url content block with a text placeholder
+        (e.g. "[image: screenshot.png]"). This prevents base64 image data
+        from accumulating in context across turns. The model already
+        processed the image in the current turn; future turns reference
+        the text description in the tool result.
+
+        Only affects user messages with list content (the pattern used
+        by native vision injection). Tool messages and plain-string
+        user messages are untouched.
+        """
+        for msg in self.messages:
+            if msg.get("role") != "user":
+                continue
+            content = msg.get("content")
+            if not isinstance(content, list):
+                continue
+            # Check if this message has any image_url blocks
+            has_image = any(
+                isinstance(block, dict) and block.get("type") == "image_url"
+                for block in content
+            )
+            if not has_image:
+                continue
+            # Replace image_url blocks with text placeholders
+            new_content = []
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "image_url":
+                    # Extract a short label from the data URI if possible
+                    url = block.get("image_url", {}).get("url", "")
+                    if url.startswith("data:image/"):
+                        # e.g. "data:image/png;base64,..." → "png"
+                        media_type = url.split("/")[1].split(";")[0]
+                        new_content.append(
+                            {"type": "text", "text": f"[image: {media_type}]"}
+                        )
+                    else:
+                        new_content.append({"type": "text", "text": "[image]"})
+                else:
+                    new_content.append(block)
+            msg["content"] = new_content
 
     def set_mcp_servers(self, server_configs: list) -> None:
         """Set MCP server configurations (does not connect).
@@ -1151,8 +1394,39 @@ class Agent:
                 # Add user message to history
                 self.messages.append({"role": "user", "content": item.text})
 
+                # Reset the per-turn compact counter before this turn starts.
+                self._auto_compact_iterations = 0
+
                 # Process with LLM (may include multiple tool call rounds)
                 await self._llm_turn(_polite_acquired=_polite_acquired)
+
+                # Auto-compact: the threshold was hit mid-turn. Compact (or
+                # journal) the history, nudge the model to resume the in-progress
+                # task, and re-enter the turn. Bounded by
+                # auto_compact_max_iterations; once the bound is reached the
+                # agent pauses (handled inside _llm_turn) instead of failing,
+                # so the user can /compact, /journal all, or /model to a
+                # bigger-context model, then /resume.
+                while self._auto_compact_triggered:
+                    self._auto_compact_triggered = False
+                    self._auto_compact_iterations += 1
+                    # Snapshot the pre-compact history (safety net). Named with
+                    # a per-session monotonic counter so snapshots never collide.
+                    self._auto_compact_snapshot_count += 1
+                    self._save_auto_compact_snapshot(self._auto_compact_snapshot_count)
+                    if self.journal_mode:
+                        success, msg = await self.journal.journal_all()
+                    else:
+                        success, msg = await self.compact_history("")
+                    if not success:
+                        self._auto_compact_failures += 1
+                        break
+                    self._auto_compact_failures = 0
+                    # Nudge the model to finish the original task.
+                    self.messages.append(
+                        {"role": "user", "content": AUTO_COMPACT_CONTINUE_HINT}
+                    )
+                    await self._llm_turn(_polite_acquired=_polite_acquired)
 
                 # Stage 12: Run reflection after turn completes
                 await self.journal.maybe_reflect_after_turn()
@@ -1252,6 +1526,18 @@ class Agent:
                 content = ""
                 reasoning = ""
                 tool_calls = None
+                # Tool-call ids we've already emitted TOOL_CALL_STARTED for, so
+                # the early "name known" signal fires exactly once per tool call.
+                _started_tool_ids: set = set()
+                # Silent-stream detection: providers that buffer whole tool
+                # calls (e.g. mlx-lm) stream nothing visible while generating
+                # them - only payload-less keep-alive chunks. Track the last
+                # time a visible token arrived so a long silence can be
+                # reported to the UI as "a tool call is likely being prepared".
+                # None until the first chunk arrives: prompt-processing time
+                # (request sent -> first chunk) is normal waiting, not silence.
+                _last_visible_t: float | None = None
+                _pending_emitted = False
 
                 if is_debug_enabled():
                     log_tps_event(
@@ -1263,6 +1549,11 @@ class Agent:
                 _first_reasoning = True
                 _first_content = True
 
+                # Record context size at stream start so the safe point can
+                # estimate the true current context (prompt_tokens alone is
+                # stale - it predates the tool results added after this call).
+                self._msg_count_before_stream = len(self.messages)
+
                 # Stream via _stream_and_emit which handles STREAM_START
                 # and TOKEN_USAGE centrally (DRY).
                 async for event_type, data in self._stream_and_emit(
@@ -1271,6 +1562,13 @@ class Agent:
                 ):
                     if event_type == "content":
                         content += data
+                        _last_visible_t = time.time()
+                        # Visible tokens are flowing: re-arm the silent-stream
+                        # signal. A placeholder shown during an earlier silence
+                        # was a false alarm (slow start / pre-thinking gap),
+                        # but a LATER silence in the same stream (e.g.
+                        # thinking -> buffered tool call) must signal again.
+                        _pending_emitted = False
                         # Transition to PROCESSING on first content token
                         if _first_content:
                             _first_content = False
@@ -1283,6 +1581,9 @@ class Agent:
                         )
                     elif event_type == "reasoning":
                         reasoning += data
+                        _last_visible_t = time.time()
+                        # Re-arm the silent-stream signal (same as content).
+                        _pending_emitted = False
                         # Transition to THINKING on first reasoning token
                         if _first_reasoning and data.strip():
                             _first_reasoning = False
@@ -1293,6 +1594,58 @@ class Agent:
                                 "text": data,
                             },
                         )
+                    elif event_type == "keepalive":
+                        # Payload-less chunk: the stream is alive but the
+                        # server is suppressing output. The first chunk only
+                        # starts the clock (generation has begun); silence
+                        # AFTER it means the model is almost certainly
+                        # generating a (buffered) tool call - tell the UI so
+                        # the user isn't left staring at nothing.
+                        if _last_visible_t is None:
+                            _last_visible_t = time.time()
+                            continue
+                        _silent_for = time.time() - _last_visible_t
+                        if (
+                            not _pending_emitted
+                            and _silent_for > TOOL_CALL_PENDING_SILENCE
+                        ):
+                            _pending_emitted = True
+                            if is_debug_enabled():
+                                log_tps_event(
+                                    "agent_tool_call_pending",
+                                    {
+                                        "silent_for": round(_silent_for, 1),
+                                        "note": "stream alive, no visible tokens - "
+                                        "provider likely buffering a tool call",
+                                    },
+                                )
+                            await self.emit(AgentEvent.TOOL_CALL_PENDING, {})
+                    elif event_type == "tool_call":
+                        # Early signal: the model has committed to a tool (name
+                        # known) but its arguments are still streaming. Emit once
+                        # per tool-call id so the UI can show the tool name
+                        # immediately instead of waiting for the full argument
+                        # stream to finish (which can be long — e.g. a big
+                        # write_file whose file content IS the arguments).
+                        tc_id = data.get("id")
+                        if tc_id is not None and tc_id not in _started_tool_ids:
+                            _started_tool_ids.add(tc_id)
+                            # The name is now known - any TOOL_CALL_PENDING
+                            # placeholder is superseded by the named widget.
+                            _pending_emitted = True
+                            if is_debug_enabled():
+                                log_tps_event(
+                                    "agent_tool_call_started",
+                                    {
+                                        "name": data.get("name", ""),
+                                        "id": tc_id,
+                                        "note": "name known, args still streaming",
+                                    },
+                                )
+                            await self.emit(
+                                AgentEvent.TOOL_CALL_STARTED,
+                                {"name": data.get("name", ""), "id": tc_id},
+                            )
                     elif event_type == "tool_calls_complete":
                         tool_calls = data["tool_calls"]
                         # Transition to TOOLING state when tools are about to execute
@@ -1405,27 +1758,31 @@ class Agent:
                         # Execute the tool
                         result = await self._execute_tool_async(name, arguments)
 
-                        # Record tool statistics
-                        self.tool_stats.record(name, arguments, result)
+                        # Extract display text (TUI/stats expect str, not ToolResult)
+                        display_text = (
+                            result.text if isinstance(result, ToolResult) else result
+                        )
 
-                        # Emit result after execution completes
-                        log_tool_result(name, result)
+                        # Record tool statistics
+                        self.tool_stats.record(name, arguments, display_text)
+
+                        # Emit result
+                        log_tool_result(name, display_text)
                         await self.emit(
                             AgentEvent.TOOL_RESULT,
                             {
                                 "name": name,
-                                "result": result,
+                                "result": display_text,
                             },
                         )
 
-                        # Add tool result to messages
-                        self.messages.append(
-                            {
-                                "role": "tool",
-                                "tool_call_id": tc["id"],
-                                "content": result,
-                            }
+                        # Add tool result to messages (handles vision routing)
+                        tool_msg, extra_msgs = await self._build_tool_result_content(
+                            result, name, tc["id"]
                         )
+                        self.messages.append(tool_msg)
+                        for msg in extra_msgs:
+                            self.messages.append(msg)
 
                     # Safe pause point - check if pause requested
                     await self._wait_if_paused()
@@ -1473,6 +1830,75 @@ class Agent:
                         # injected message in context. This preserves the KV
                         # cache because reasoning tokens are not stripped.
                         continue
+
+                    # Auto-compact threshold check at safe point.
+                    # Use the estimated CURRENT context (prompt_tokens is stale
+                    # here - it predates the tool results just added). If over
+                    # the threshold, either compact-and-continue (bounded) or
+                    # pause so the user can intervene.
+                    estimated_context = self._estimate_current_context_tokens()
+                    # Publish the live context estimate so the UI can show it
+                    # (with a "~") until the next LLM call reports the grounded
+                    # count via TOKEN_USAGE.
+                    await self.emit(
+                        AgentEvent.CONTEXT_ESTIMATE,
+                        {"estimated_tokens": estimated_context},
+                    )
+                    if (
+                        self.auto_compact_threshold > 0
+                        and estimated_context >= self.auto_compact_threshold
+                        and self._auto_compact_failures < 3
+                    ):
+                        if is_debug_enabled():
+                            log_tps_event(
+                                "auto_compact_check",
+                                {
+                                    "prompt_tokens": self.prompt_tokens,
+                                    "estimated_context": estimated_context,
+                                    "threshold": self.auto_compact_threshold,
+                                    "iterations": self._auto_compact_iterations,
+                                    "max_iterations": self.auto_compact_max_iterations,
+                                    "action": (
+                                        "compact"
+                                        if self._auto_compact_iterations
+                                        < self.auto_compact_max_iterations
+                                        else "pause"
+                                    ),
+                                },
+                            )
+                        if (
+                            self._auto_compact_iterations
+                            < self.auto_compact_max_iterations
+                        ):
+                            # Compact in the post-turn handler, then re-enter
+                            # the turn so the model finishes its task.
+                            action = "journaling" if self.journal_mode else "compacting"
+                            await self.emit(
+                                AgentEvent.ASSISTANT_TOKEN,
+                                {
+                                    "text": f"\n[Auto-compact: context at ~{estimated_context:,} tokens, {action}]\n"
+                                },
+                            )
+                            self._auto_compact_triggered = True
+                            break
+                        else:
+                            # Bound reached: pause at this safe point so the
+                            # user can /compact, /journal all, or /model to a
+                            # bigger-context model, then /resume.
+                            await self.emit(
+                                AgentEvent.ASSISTANT_TOKEN,
+                                {
+                                    "text": (
+                                        f"\n[Auto-compact limit ({self.auto_compact_max_iterations}) "
+                                        f"reached — context at ~{estimated_context:,} tokens. "
+                                        "Pausing. You can /compact, /journal all, or /model to a "
+                                        "larger-context model, then /resume.]\n"
+                                    )
+                                },
+                            )
+                            self.pause()
+                            await self._wait_if_paused()
+                            continue
 
                     # Continue loop for next LLM call
                     if is_debug_enabled():
@@ -1589,27 +2015,31 @@ class Agent:
                         # Execute the tool
                         result = await self._execute_tool_async(name, arguments)
 
+                        # Extract display text (TUI/stats expect str, not ToolResult)
+                        display_text = (
+                            result.text if isinstance(result, ToolResult) else result
+                        )
+
                         # Record tool statistics
-                        self.tool_stats.record(name, arguments, result)
+                        self.tool_stats.record(name, arguments, display_text)
 
                         # Emit result
-                        log_tool_result(name, result)
+                        log_tool_result(name, display_text)
                         await self.emit(
                             AgentEvent.TOOL_RESULT,
                             {
                                 "name": name,
-                                "result": result,
+                                "result": display_text,
                             },
                         )
 
-                        # Add tool result to messages
-                        self.messages.append(
-                            {
-                                "role": "tool",
-                                "tool_call_id": f"tc_reasoning_{i}",
-                                "content": result,
-                            }
+                        # Add tool result to messages (handles vision routing)
+                        tool_msg, extra_msgs = await self._build_tool_result_content(
+                            result, name, f"tc_reasoning_{i}"
                         )
+                        self.messages.append(tool_msg)
+                        for msg in extra_msgs:
+                            self.messages.append(msg)
 
                     # Continue loop for next LLM call
                     if is_debug_enabled():
@@ -1645,6 +2075,11 @@ class Agent:
                             "reasoning": reasoning,
                         },
                     )
+
+                # Strip image data from messages — the model has already
+                # processed them this turn. Replaces image_url blocks with
+                # a text placeholder to prevent context bloat on future turns.
+                self._strip_images_from_messages()
 
                 break
 
@@ -1687,11 +2122,20 @@ class Agent:
     def set_model(self, model: str) -> None:
         """Set the model name.
 
+        If polite mode is enabled, the lock is re-keyed to the new model so
+        coordination tracks the model actually in use. The swap is skipped
+        when the lock is held mid-turn (mirrors ``set_client``).
+
         Args:
             model: The model name to use
         """
         self.model = model
         self.tool_stats.reset()  # Reset stats on model change
+        # Re-key the polite lock to the new model (per-model coordination).
+        if self.polite_lock is not None and not self.polite_lock.is_held():
+            old_interval = self.polite_lock.interval
+            self.polite_lock.release()
+            self.set_polite(interval=old_interval)
 
     def set_client(self, client: AsyncOpenAI, models: list[str] | None = None) -> None:
         """Set the OpenAI client.
@@ -1770,10 +2214,11 @@ class Agent:
         """Enable polite mode with the given poll interval.
 
         The shared lock is keyed by the backend's base URL (derived from
-        ``self.client.base_url``) so that two agents targeting the same
-        backend coordinate correctly — whether they used a provider name
-        or a raw URL. An explicit ``provider`` override is accepted for
-        testing/diagnostics.
+        ``self.client.base_url``) *and* the current model, so that two agents
+        targeting the same backend and model coordinate correctly — whether
+        they used a provider name or a raw URL — while agents on different
+        models of the same backend run in parallel. An explicit ``provider``
+        override is accepted for testing/diagnostics.
 
         The lock is acquired at the top of ``_process_item`` and released
         in its ``finally``. Takes effect on the next ``_process_item``.
@@ -1785,16 +2230,50 @@ class Agent:
                 ``str(self.client.base_url)`` is used.
         """
         key = provider if provider is not None else str(self.client.base_url)
-        # If already enabled with the same key, just update the interval
-        # (avoids recreating the lock and dropping any in-flight hold).
-        if self.polite_lock is not None and self.polite_lock.provider == key:
+        model_key = self._polite_model_key()
+        # If already enabled with the same provider+model key, just update the
+        # interval (avoids recreating the lock and dropping any in-flight hold).
+        if (
+            self.polite_lock is not None
+            and self.polite_lock.provider == key
+            and self.polite_lock.model == model_key
+        ):
             self.polite_lock.interval = interval
             return
         self.polite_lock = PoliteLock(
             provider=key,
             interval=interval,
+            model=model_key,
             emit=self.emit,
         )
+
+    def _model_base_name(self) -> str:
+        """Base model name for the polite lock key.
+
+        A trailing thinking-level suffix (``:none``, ``:medium``, … — see
+        ``_THINKING_SUFFIXES``) is stripped so agents on the same model with
+        different thinking budgets coordinate on one lock. Any other colon
+        suffix (e.g. OpenRouter ``meta-llama/llama-3.1:free``) is part of the
+        model name and is kept.
+        """
+        model = self.model
+        if ":" not in model:
+            return model
+        base, _, suffix = model.rpartition(":")
+        if suffix.lower() in self._THINKING_SUFFIXES:
+            return base
+        return model
+
+    def _polite_model_key(self) -> Optional[str]:
+        """Model key for the polite lock filename.
+
+        The sanitized base model name (thinking-level suffix stripped, see
+        ``_model_base_name``). Returns ``None`` when no model is set
+        (provider-only key).
+        """
+        if not self.model:
+            return None
+        return _sanitize_provider(self._model_base_name())
 
     def disable_polite(self) -> None:
         """Disable polite mode. Releases the lock if currently held.
@@ -1843,7 +2322,9 @@ class Agent:
         """Trim message history to keep only the last N turns.
 
         A turn = one user message + the assistant response + any intervening
-        tool calls/results. Walks backwards counting role=="user" messages.
+        tool calls/results. Walks backwards counting turn-start user messages
+        (interrupts and image injections don't open a turn, so the cut never
+        lands in the middle of a turn).
 
         Args:
             keep_turns: Number of turns to keep
@@ -1854,9 +2335,7 @@ class Agent:
         if keep_turns <= 0 or not self.messages:
             return self.clear_messages()
 
-        user_indices = [
-            i for i, m in enumerate(self.messages) if m.get("role") == "user"
-        ]
+        user_indices = [i for i, m in enumerate(self.messages) if is_turn_start(m)]
         if len(user_indices) <= keep_turns:
             # Not enough turns to trim — nothing to do
             return 0
@@ -1867,9 +2346,7 @@ class Agent:
         self.reset_token_usage()
         return removed
 
-    async def request_clear(
-        self, mode: str = "all", keep_turns: int = 0
-    ) -> int:
+    async def request_clear(self, mode: str = "all", keep_turns: int = 0) -> int:
         """Request a clear/trim of message history via the queue.
 
         Adds a kind="clear" item to the queue so the clear happens at a

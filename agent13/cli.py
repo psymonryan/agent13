@@ -13,6 +13,7 @@ Usage:
 import json
 import os
 import sys
+from io import StringIO
 
 import argparse
 import asyncio
@@ -43,9 +44,17 @@ from agent13.skills import SkillManager, ensure_default_skills
 from agent13.prompts import get_skills_section
 from tools.security import set_session_sandbox_mode
 from agent13.config_paths import get_global_env_file
+from agent13.fileio import ConfigFileError, read_text_robust
 
-# Load environment variables from ~/.env
-load_dotenv(get_global_env_file())
+# Load environment variables from ~/.env (before config so provider
+# api_key_env_var lookups work). A corrupt .env is not fatal here -
+# load_environment() reports it properly when the config loads.
+_global_env_file = get_global_env_file()
+if _global_env_file.exists():
+    try:
+        load_dotenv(stream=StringIO(read_text_robust(_global_env_file)))
+    except ConfigFileError:
+        pass
 
 
 def print_provider_list():
@@ -76,7 +85,6 @@ async def run_batch_with_display(
     tool_response_format: str = "raw",
     prompt_manager: PromptManager = None,
     system_prompt: str = None,
-    send_reasoning: bool = False,
     remove_reasoning: bool = False,
     devel_mode: bool = False,
     skills_mode: bool = False,
@@ -113,7 +121,6 @@ async def run_batch_with_display(
         ),
         execute_tool=execute_tool,
         response_format=response_format,
-        send_reasoning=send_reasoning,
         remove_reasoning=remove_reasoning,
         devel_mode=devel_mode,
         skills_mode=skills_mode,
@@ -310,11 +317,6 @@ Provider names are read from ~/.agent13/config.toml
         help="Enable journal mode (context compaction via reflection)",
     )
     parser.add_argument(
-        "--send-reasoning",
-        action="store_true",
-        help="Include reasoning_content in message history",
-    )
-    parser.add_argument(
         "--priming-prompt",
         action="store_true",
         help="Enable priming prompt pair after journal compaction (default: off)",
@@ -323,6 +325,20 @@ Provider names are read from ~/.agent13/config.toml
         "--remove-reasoning",
         action="store_true",
         help="Strip reasoning tokens between turns",
+    )
+    parser.add_argument(
+        "--auto-compact-threshold",
+        type=int,
+        default=None,
+        metavar="TOKENS",
+        help="Auto-compact when context exceeds TOKENS (e.g. 150000). 0 or omitted = use config value",
+    )
+    parser.add_argument(
+        "--auto-compact-max",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Max auto-compact-and-continue cycles per turn before pausing. Omitted = use config value",
     )
     parser.add_argument(
         "-c",
@@ -635,7 +651,6 @@ Provider names are read from ~/.agent13/config.toml
                 tool_response_format=args.tool_response,
                 prompt_manager=prompt_manager,
                 system_prompt=system_prompt,
-                send_reasoning=args.send_reasoning,
                 remove_reasoning=args.remove_reasoning,
                 devel_mode=args.devel,
                 skills_mode=include_skills and bool(skill_manager.skills),
@@ -665,7 +680,6 @@ Provider names are read from ~/.agent13/config.toml
                 prompt_manager=prompt_manager,
                 system_prompt=system_prompt,
                 journal_mode=args.journal,
-                send_reasoning=args.send_reasoning,
                 remove_reasoning=args.remove_reasoning,
                 devel_mode=args.devel,
                 skills_mode=include_skills and bool(skill_manager.skills),
@@ -679,6 +693,12 @@ Provider names are read from ~/.agent13/config.toml
                 bell_enabled=cfg.bell_enabled,
                 bell_command=args.bell_command if args.bell_command is not None else cfg.bell_command,
                 priming_enabled=args.priming_prompt,
+                auto_compact_threshold=args.auto_compact_threshold
+                if args.auto_compact_threshold is not None
+                else cfg.auto_compact_threshold,
+                auto_compact_max_iterations=args.auto_compact_max
+                if args.auto_compact_max is not None
+                else cfg.auto_compact_max_iterations,
             )
         finally:
             await client.close()
@@ -704,7 +724,6 @@ Provider names are read from ~/.agent13/config.toml
         system_prompt=system_prompt,
         include_skills=include_skills,
         journal_mode=args.journal,
-        send_reasoning=args.send_reasoning,
         remove_reasoning=args.remove_reasoning,
         continue_session=args.continue_session,
         devel_mode=args.devel,
@@ -719,11 +738,50 @@ Provider names are read from ~/.agent13/config.toml
         bell_command=args.bell_command if args.bell_command is not None else cfg.bell_command,
         priming_enabled=args.priming_prompt,
         cursor_blink=cfg.cursor_blink,
+        auto_compact_threshold=args.auto_compact_threshold
+        if args.auto_compact_threshold is not None
+        else cfg.auto_compact_threshold,
+        auto_compact_max_iterations=args.auto_compact_max
+        if args.auto_compact_max is not None
+        else cfg.auto_compact_max_iterations,
     )
 
 
+def _force_utf8_piped_stdio():
+    """On Windows, force UTF-8 on piped stdout/stderr.
+
+    When stdout is a pipe (not a console), Windows Python encodes with
+    the locale code page (e.g. cp1252). Non-ASCII output (→, —, •) is
+    then mojibake'd or raises UnicodeEncodeError. Interactive consoles
+    use the Unicode API and are unaffected, so only reconfigure when
+    piped. POSIX is left alone (UTF-8 mode auto-engages under C locale).
+    """
+    if sys.platform != "win32":
+        return
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            if stream is not None and not stream.isatty():
+                stream.reconfigure(encoding="utf-8")
+        except Exception:
+            pass
+
+
 def main():
-    """Main entry point."""
+    """Main entry point.
+
+    Catches ConfigFileError so a corrupt user-edited config file
+    (config.toml / .env / prompts.yaml) produces one clean, actionable
+    line instead of a Python traceback (fail-fast, but presentable).
+    """
+    _force_utf8_piped_stdio()
+    try:
+        _run_cli()
+    except ConfigFileError as e:
+        print(f"error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
+def _run_cli():
     # Check if running in batch, REPL, or output mode
     is_batch = "-p" in sys.argv or "--prompt" in sys.argv
     is_repl = "--repl" in sys.argv

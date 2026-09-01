@@ -22,7 +22,30 @@ import json
 import asyncio
 import inspect
 import importlib
+from dataclasses import dataclass, field
 from typing import get_type_hints, get_origin, get_args, Callable, Union
+
+
+@dataclass
+class ToolResult:
+    """Structured tool result that can carry images alongside text.
+
+    Tools may return a plain string (backward compatible) or a ToolResult.
+    When images are present, the core routes them based on vision config.
+
+    Attributes:
+        text: The text portion of the result (always present)
+        images: List of data URIs (e.g. "data:image/png;base64,...")
+        question: Optional prompt for the sidecar vision model.
+                  If empty, a generic description template is used.
+    """
+
+    text: str
+    images: list[str] = field(default_factory=list)
+    question: str = ""
+
+    def __str__(self) -> str:
+        return self.text
 
 # Lazy import to avoid circular dependency with agent package
 _log_event = None
@@ -257,11 +280,15 @@ def _get_coercion_type(expected_type) -> type | None:
     return None
 
 
-async def execute_tool(name: str, arguments: dict) -> str:
+async def execute_tool(name: str, arguments: dict) -> "str | ToolResult":
     """Execute a registered tool by name with given arguments.
 
     This is async to support both sync and async tools.
     Sync tools are run in a thread pool to avoid blocking.
+
+    Returns:
+        str or ToolResult. Tools may return either; ToolResult carries
+        optional image data for vision routing.
     """
     # Ensure tools are discovered before execution
     _ensure_discovered()
@@ -365,7 +392,7 @@ def _coerce_arguments(func: Callable, arguments: dict) -> dict:
     return coerced_args
 
 
-async def _execute_async_tool(name: str, arguments: dict, log_event, log_error) -> str:
+async def _execute_async_tool(name: str, arguments: dict, log_event, log_error) -> "str | ToolResult":
     """Execute an async tool."""
     try:
         func = _async_registry[name]
@@ -377,6 +404,18 @@ async def _execute_async_tool(name: str, arguments: dict, log_event, log_error) 
             result = await asyncio.wait_for(func(**coerced_args), timeout=timeout)
         else:
             result = await func(**coerced_args)
+
+        # Pass through ToolResult unchanged (carries image data)
+        if isinstance(result, ToolResult):
+            log_event(
+                "tool_execution",
+                {
+                    "name": name,
+                    "arguments": arguments,
+                    "result": result.text,
+                },
+            )
+            return result
 
         result_str = (
             json.dumps(result, indent=2)
@@ -408,7 +447,7 @@ async def _execute_async_tool(name: str, arguments: dict, log_event, log_error) 
 
 async def _execute_sync_tool_in_executor(
     name: str, arguments: dict, log_event, log_error
-) -> str:
+) -> "str | ToolResult":
     """Execute a sync tool in a thread pool executor."""
     try:
         func = _registry[name]
@@ -426,6 +465,18 @@ async def _execute_sync_tool_in_executor(
             )
         else:
             result = await loop.run_in_executor(None, lambda: func(**coerced_args))
+
+        # Pass through ToolResult unchanged (carries image data)
+        if isinstance(result, ToolResult):
+            log_event(
+                "tool_execution",
+                {
+                    "name": name,
+                    "arguments": arguments,
+                    "result": result.text,
+                },
+            )
+            return result
 
         result_str = (
             json.dumps(result, indent=2)

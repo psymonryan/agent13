@@ -24,22 +24,82 @@ PRIMING_PROMPT = (
 
 PRIMING_RESPONSE = "ok"
 
+# Injected as a user message after an auto-compact so the model resumes the
+# in-progress turn (finishing the original task) instead of stopping.
+AUTO_COMPACT_CONTINUE_HINT = (
+    "[Context was compacted to fit. Continue with your previous task and complete it.]"
+)
+
 JOURNAL_USER_MESSAGE_PREFIX = "[previous user message]"
 JOURNAL_USER_MESSAGE = f'{JOURNAL_USER_MESSAGE_PREFIX} "{{original}}"'
 
 # Default compaction prompt for /compact command.
 # Users can override by adding a "compaction" entry to prompts.yaml
-# or by passing a named prompt: /compact <prompt_name>
+# or by passing a named prompt: /compact --prompt <name>
 DEFAULT_COMPACT_PROMPT = (
     "Summarize our conversation so far into a concise but complete context summary.\n"
     "Preserve:\n"
     "- All key decisions, their rationale, and current status\n"
     "- Important code, file paths, and technical details\n"
+    "- New knowledge gained by doing: how to connect to hosts/services,\n"
+    "  exact commands that work, environment quirks and gotchas\n"
     "- Open questions and unresolved issues\n"
     "- The current direction/next steps\n"
     "Skip pleasantries and hedging. Write as a direct reference document\n"
-    "that lets you continue the work seamlessly."
+    "that lets you continue the work seamlessly.\n"
+    "If you'd have to re-discover it from scratch, it belongs in the summary."
 )
+
+# Appended to the base compaction prompt when /compact is given a focus
+# ("next task") string. Steers the summary sections and next steps toward
+# the upcoming work and allows harder compression of unrelated detail.
+COMPACT_STEERING_TEMPLATE = (
+    "\nNext task: {focus}\n"
+    "- Organize the summary sections around that task\n"
+    "- Make \"next steps\" concrete actions toward it\n"
+    "- Details clearly unrelated to it can be compressed harder"
+)
+
+
+def resolve_compact_prompt(prompt_manager, arg: str) -> tuple:
+    """Resolve the /compact argument into the compaction prompt to send.
+
+    Shared by the REPL, headless, and TUI command handlers so all
+    interfaces accept the same syntax:
+
+    - (no arg)        → the 'compaction' prompt from prompts.yaml, or
+                        DEFAULT_COMPACT_PROMPT if absent
+    - --prompt <name> → swap in a named prompt (existing behavior)
+    - <free text>     → base prompt + steering block focusing the summary
+                        on the user's next task
+
+    Args:
+        prompt_manager: PromptManager for prompt lookups.
+        arg: Raw argument text after /compact (may be empty).
+
+    Returns:
+        (prompt_text, error) — exactly one is None.
+    """
+    arg = arg.strip()
+    if arg.startswith("--prompt"):
+        prompt_name = arg[len("--prompt"):].strip()
+        if not prompt_name:
+            return None, (
+                "Usage: /compact --prompt <name>\n"
+                f"Available: {', '.join(prompt_manager.prompts.keys())}"
+            )
+        candidate = prompt_manager.get_prompt(prompt_name)
+        if candidate == prompt_manager.get_prompt("default") and prompt_name != "default":
+            return None, (
+                f"Prompt '{prompt_name}' not found\n"
+                f"Available: {', '.join(prompt_manager.prompts.keys())}"
+            )
+        return candidate, None
+    base = prompt_manager.prompts.get("compaction", DEFAULT_COMPACT_PROMPT)
+    if arg:
+        return base + COMPACT_STEERING_TEMPLATE.format(focus=arg), None
+    return base, None
+
 
 # The lightweight user message that replaces the full compaction prompt
 # in history after compaction. Small so it doesn't re-bloat context.

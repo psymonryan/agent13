@@ -1102,6 +1102,11 @@ def edit_file(
         original_content = raw_content.decode("utf-8")
     except UnicodeDecodeError:
         return {"error": f"File is not valid UTF-8: {filepath}"}
+    # Normalize CRLF -> LF so snapshots and rollback are platform-safe.
+    # write_text() re-encodes \n to \r\n on Windows; a snapshot that still
+    # contains \r\n would double-encode to \r\r\n on rollback (blank line
+    # after every line).
+    original_content = original_content.replace("\r\n", "\n")
 
     # Detect line ending style
     has_trailing_newline = original_content.endswith("\n")

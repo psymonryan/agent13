@@ -298,14 +298,20 @@ def execute_retry(agent) -> CommandResult:
     Returns CommandResult with data["user_text"] on success.
     """
     from agent13.prompts import PRIMING_PROMPT, PRIMING_RESPONSE, JOURNAL_USER_MESSAGE_PREFIX
+    from agent13.message_history import content_to_text
 
-    def _strip_journal_prefix(text: str) -> str:
-        """Remove the journal anti-priming prefix if present.
+    def _strip_journal_prefix(content) -> str:
+        """Flatten a message's content and remove the journal prefix if present.
 
         After journal compaction, the last user message is rewritten to
         '[previous user message] "<original>"'.  /retry should offer the
         user their original text for editing, not the prefixed wrapper.
+
+        Content is flattened first: multimodal messages (native vision)
+        carry a list of blocks instead of a string, and old sessions loaded
+        from disk can still have one at a group boundary.
         """
+        text = content_to_text(content)
         prefix = JOURNAL_USER_MESSAGE_PREFIX + ' "'
         if text.startswith(prefix) and text.endswith('"') and len(text) > len(prefix):
             return text[len(prefix):-1]
@@ -423,6 +429,12 @@ def execute_polite(agent, args: str) -> CommandResult:
         return CommandResult(False, f"Interval must be non-negative\n{_POLITE_USAGE}")
 
     agent.set_polite(interval=interval)
+    if interval == 0:
+        return CommandResult(
+            True,
+            "Rude mode enabled",
+            {"action": "enabled", "interval": interval},
+        )
     return CommandResult(
         True,
         f"Polite mode enabled (interval {interval}s)",
@@ -497,6 +509,7 @@ class HistoryEntry:
     content: str
     tool_calls: list[dict]  # [{name, arguments}]
     is_interrupt: bool
+    is_injected: bool = False  # native-vision image injection (mid-turn)
 
 
 @dataclass
@@ -513,7 +526,11 @@ def format_history_groups(agent) -> list[HistoryGroup]:
     """Format message history as grouped entries for display.
 
     Returns structured data — each UI renders in its own format.
+    Content is flattened to text, so multimodal (image) messages never leak
+    content-block lists into the UIs.
     """
+    from agent13.message_history import content_to_text, is_injected
+
     groups = agent.history.get_message_groups()
     result = []
     for group_num, group in enumerate(groups, 1):
@@ -522,10 +539,11 @@ def format_history_groups(agent) -> list[HistoryGroup]:
         entries = []
         for idx in group[1:]:
             msg = agent.messages[idx]
+            is_user = msg.get("role") == "user"
             entries.append(
                 HistoryEntry(
                     role=msg.get("role", "unknown"),
-                    content=msg.get("content", ""),
+                    content=content_to_text(msg.get("content", "")),
                     tool_calls=[
                         {
                             "name": tc.get("function", {}).get("name", "?"),
@@ -533,15 +551,15 @@ def format_history_groups(agent) -> list[HistoryGroup]:
                         }
                         for tc in msg.get("tool_calls", [])
                     ],
-                    is_interrupt=msg.get("role") == "user"
-                    and msg.get("interrupt", False),
+                    is_interrupt=is_user and msg.get("interrupt", False),
+                    is_injected=is_user and is_injected(msg),
                 )
             )
         result.append(
             HistoryGroup(
                 number=group_num,
                 first_role=first_msg.get("role", "unknown"),
-                first_content=first_msg.get("content", ""),
+                first_content=content_to_text(first_msg.get("content", "")),
                 entries=entries,
             )
         )

@@ -29,6 +29,12 @@ class AgentEvent(Enum):
 
     # Tools
     TOOL_CALL = "tool_call"
+    TOOL_CALL_STARTED = (
+        "tool_call_started"  # Tool name known, arguments still streaming
+    )
+    TOOL_CALL_PENDING = (
+        "tool_call_pending"  # Provider buffering a tool call: alive, no name yet
+    )
     TOOL_RESULT = "tool_result"
 
     # Status
@@ -41,6 +47,9 @@ class AgentEvent(Enum):
 
     # Token usage
     TOKEN_USAGE = "token_usage"
+    CONTEXT_ESTIMATE = (
+        "context_estimate"  # Estimated current context size at a safe point
+    )
 
     # Journal
     JOURNAL_COMPACT = "journal_compact"  # History compacted via journal mode

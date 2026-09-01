@@ -35,11 +35,31 @@ def get_local_env_file() -> Path:
     return Path.cwd() / ".env"
 
 
+def _ensure_dir(path: Path) -> Path:
+    """Ensure a directory exists at *path*, return it.
+
+    Handles the case where a stale regular file occupies the path (e.g.
+    left behind by an uninstall).  ``mkdir(exist_ok=True)`` raises
+    ``FileExistsError`` in that situation because the path is not a
+    directory.
+
+    **Symlinks are never touched** — a symlink (even a broken one) is
+    treated as an intentional user configuration, e.g. linking
+    ``~/.agent13/skills`` to a shared drive.  If the symlink target is
+    unreachable the mkdir will still fail, but that is a mount/network
+    problem, not something we should silently destroy.
+    """
+    if path.is_symlink():
+        return path
+    if path.exists() and not path.is_dir():
+        path.unlink()
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
 def ensure_config_dir() -> Path:
     """Ensure the config directory exists and return it."""
-    config_dir = get_config_dir()
-    config_dir.mkdir(parents=True, exist_ok=True)
-    return config_dir
+    return _ensure_dir(get_config_dir())
 
 
 def get_global_saves_dir() -> Path:
@@ -49,9 +69,7 @@ def get_global_saves_dir() -> Path:
     location used for auto-saves when ``[saves] location = "central"`` in
     config, and the default home for all cross-project saves.
     """
-    saves_dir = get_config_dir() / "saves"
-    saves_dir.mkdir(parents=True, exist_ok=True)
-    return saves_dir
+    return _ensure_dir(get_config_dir() / "saves")
 
 
 def get_skills_dir() -> Path:
@@ -59,18 +77,28 @@ def get_skills_dir() -> Path:
 
     Creates the directory if it doesn't exist.
     """
-    skills_dir = get_config_dir() / "skills"
-    skills_dir.mkdir(parents=True, exist_ok=True)
-    return skills_dir
+    return _ensure_dir(get_config_dir() / "skills")
 
 
 def get_history_dir() -> Path:
-    """Return the history directory path (~/.agent13/).
+    """Return the history directory path (~/.agent13/history/).
 
-    Note: History files are stored directly in ~/.agent13/ with naming
-    pattern: history-{project}-{date}
+    History files are stored in ~/.agent13/history/ with naming
+    pattern: history-{project}-{date}.
+
+    The directory is created on demand. If ~/.agent13/history is itself a
+    symlink (e.g. to a shared drive) it is followed and never modified;
+    see _ensure_dir().
     """
-    return ensure_config_dir()
+    return _ensure_dir(get_config_dir() / "history")
+
+
+def get_locks_dir() -> Path:
+    """Return the locks directory path (~/.agent13/locks/).
+
+    Polite-mode lock files live here. Created on demand.
+    """
+    return _ensure_dir(get_config_dir() / "locks")
 
 
 def get_history_path(project_name: str | None = None, suffix: str = "") -> Path:
@@ -82,7 +110,7 @@ def get_history_path(project_name: str | None = None, suffix: str = "") -> Path:
         suffix: Optional suffix (e.g., "_test" for pytest).
 
     Returns:
-        Path like ~/.agent13/history-{project}{suffix}-{YYYY-MM-DD}
+        Path like ~/.agent13/history/history-{project}{suffix}-{YYYY-MM-DD}
     """
     if project_name is None:
         cwd = Path.cwd()

@@ -1,8 +1,15 @@
 """Polite mode — multi-agent coordination via a shared file lock.
 
-When multiple agents target the same provider, polite mode makes them wait for
-a shared lock before commencing a turn. The lock is held for the entire turn
-and released in the ``finally`` of ``_process_item``.
+When multiple agents target the same provider *and* model, polite mode makes
+them wait for a shared lock before commencing a turn. The lock is held for the
+entire turn and released in the ``finally`` of ``_process_item``.
+
+The lock is keyed per-provider per-model: the model key is the base model name
+with any thinking-level suffix stripped (``:none``, ``:medium``, …), so agents
+on the same model with different thinking budgets share one lock. A colon that
+is part of a known model name (OpenRouter ``meta-llama/llama-3.1:free``) is
+kept. Agents on different models of the same provider therefore coordinate on
+separate locks and run in parallel.
 
 The ``interval`` (``N``) is a pseudo-priority via poll interval: lower ``N``
 polls more often and is statistically more likely to be the next to try
@@ -38,7 +45,7 @@ from typing import Any, Callable, Coroutine, Optional
 
 from filelock import BaseFileLock, Timeout
 
-from agent13.config_paths import get_config_dir
+from agent13.config_paths import get_locks_dir
 
 
 def _sanitize_provider(provider: str) -> str:
@@ -54,8 +61,10 @@ def _sanitize_provider(provider: str) -> str:
 class PoliteLock:
     """Shared file lock for polite multi-agent coordination.
 
-    The lock file lives at ``~/.agent13/polite_{provider}.lck``. Uses
-    ``filelock`` for cross-platform, stale-lock handling via PID.
+    The lock file lives at ``~/.agent13/locks/polite_{provider}_{model}.lck``
+    (``{model}`` is the base model name, thinking-level suffix stripped; when
+    ``model`` is ``None`` the legacy ``polite_{provider}.lck`` form is used).
+    Uses ``filelock`` for cross-platform, stale-lock handling via PID.
 
     Events are emitted via the supplied ``emit`` coroutine (matching
     ``Agent.emit``'s signature):
@@ -70,17 +79,24 @@ class PoliteLock:
         self,
         provider: str,
         interval: float,
+        model: Optional[str] = None,
         emit: Optional[Callable[..., Coroutine[Any, Any, None]]] = None,
     ) -> None:
         self._interval = max(0.0, float(interval))
         self._emit = emit
         self._lock: Optional[BaseFileLock] = None
         self._provider = provider
+        self._model = model
         self._safe_name = _sanitize_provider(provider)
 
-        config_dir = get_config_dir()
-        config_dir.mkdir(parents=True, exist_ok=True)
-        self._path = config_dir / f"polite_{self._safe_name}.lck"
+        locks_dir = get_locks_dir()
+        if model is None:
+            # Legacy form — provider-only key (backward compatible).
+            self._path = locks_dir / f"polite_{self._safe_name}.lck"
+        else:
+            self._path = locks_dir / (
+                f"polite_{self._safe_name}_{_sanitize_provider(model)}.lck"
+            )
 
     @property
     def path(self) -> Path:
@@ -91,6 +107,11 @@ class PoliteLock:
     def provider(self) -> str:
         """Original provider string (name or URL)."""
         return self._provider
+
+    @property
+    def model(self) -> Optional[str]:
+        """Base model name used in the lock filename, or None."""
+        return self._model
 
     @property
     def interval(self) -> float:

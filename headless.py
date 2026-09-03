@@ -57,6 +57,7 @@ async def run_headless(
     prompt_manager: Optional[PromptManager] = None,
     debug: bool = False,
     journal_mode: bool = False,
+    skills_enabled: bool = False,
     continue_session: bool = False,
     priming_enabled: bool = False,
 ):
@@ -89,6 +90,14 @@ async def run_headless(
     skill_manager = SkillManager(lambda: get_config())
     skill_manager_ctx.set(skill_manager)
 
+    system_prompt = prompt_manager.get_prompt()
+    if skills_enabled and skill_manager.skills:
+        from agent13.prompts import get_skills_section
+
+        skills_section = get_skills_section(skill_manager.skills)
+        if skills_section:
+            system_prompt = f"{system_prompt}\n\n{skills_section}"
+
     def print_status(status: str, queue_count: int = 0):
         """Print current status in parseable format."""
         if provider:
@@ -100,11 +109,12 @@ async def run_headless(
     agent = Agent(
         client=client,
         model=model,
-        system_prompt=prompt_manager.get_prompt(),
+        system_prompt=system_prompt,
         tools=get_tools(),
         execute_tool=execute_tool,
         journal_mode=journal_mode,
         priming_enabled=priming_enabled,
+        skills_mode=skills_enabled and bool(skill_manager.skills),
     )
 
     # Load MCP server configs
@@ -502,6 +512,11 @@ Commands: /pause, /resume, /status, /quit
         ),
     )
     parser.add_argument(
+        "--skills",
+        action="store_true",
+        help="Include discovered skills in the system prompt"
+    )
+    parser.add_argument(
         "--debug",
         action="store_true",
         help="Enable debug logging"
@@ -577,6 +592,7 @@ Commands: /pause, /resume, /status, /quit
         provider=provider_name,
         debug=args.debug,
         journal_mode=args.journal,
+        skills_enabled=args.skills or bool(get_config().include_skills),
         continue_session=args.continue_session,
         priming_enabled=args.priming_prompt,
     )

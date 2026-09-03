@@ -31,8 +31,14 @@ def spawn_process(command, args=None, env=None, encoding="utf-8", timeout=30,
                 proc.send(chr(code))
             proc.sendcontrol = _sendcontrol
     else:
+        # codec_errors="replace": macOS ttys interleave kernel-echoed input
+        # bytes with app output under load (fast typing during redraws),
+        # which can split a multi-byte UTF-8 char across writes -> invalid
+        # stream. Real terminals survive it (next redraw overwrites); the
+        # strict decoder must not crash the test. Same policy as Windows.
         proc = pexpect.spawn(
             command, args=args, env=env, encoding=encoding,
+            codec_errors="replace",
             timeout=timeout, dimensions=dimensions, maxread=maxread,
         )
     proc.timeout = timeout

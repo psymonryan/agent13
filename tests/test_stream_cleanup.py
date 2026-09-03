@@ -102,6 +102,7 @@ class TestStreamCleanup:
         assert _count_tracked_asyncgens() > 0  # leaked
 
         await close_tracked_asyncgens()
+        gc.collect()  # deterministic count: weakrefs survive under load until GC runs
 
         # Most are closed; 2-3 may remain (already-closed but still
         # weakly referenced) but they're harmless

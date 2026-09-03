@@ -85,7 +85,7 @@ If your terminal says `uv` is not recognised after installing, close and reopen 
 **From GitHub release** (recommended - latest stable):
 
 ```bash
-uv tool install https://github.com/psymonryan/agent13/releases/download/v0.4.0/agent13-0.4.0-py3-none-any.whl
+uv tool install https://github.com/psymonryan/agent13/releases/download/v0.4.1/agent13-0.4.1-py3-none-any.whl
 ```
 
 **From source** (for development):

@@ -834,11 +834,16 @@ class MCPManager:
         by _session_runner). Raises whatever the SDK raises; call_tool
         decides whether to reconnect.
         """
-        async with asyncio.timeout(timeout):
+        # wait_for (not asyncio.timeout) so it works on 3.10; it covers the
+        # semaphore wait + the call and cancels the inner task on timeout,
+        # matching asyncio.timeout's semantics.
+        async def _call():
             async with self._semaphore:
                 return await server.session.call_tool(
                     tool_name, arguments, read_timeout_seconds=timeout
                 )
+
+        return await asyncio.wait_for(_call(), timeout=timeout)
 
     async def _reconnect_server(self, server_name: str) -> bool:
         """Tear down the dead session and start a fresh one. Returns True on success.

@@ -1,6 +1,6 @@
 [project]
 name = "agent13"
-version = "0.4.0"
+version = "0.4.1"
 description = "Context-lean AI agent - minimal VRAM fits in a small cupboard, a postbox or even a clock"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -20,6 +20,9 @@ dependencies = [
     "filelock",
     "httpx",
     "Pillow",
+    # tomllib is stdlib only on 3.11+; config.py/sandbox.py fall back to tomli
+    # on 3.10 (see `import tomllib` / `except ImportError: import tomli`).
+    "tomli; python_version < '3.11'",
 ]
 
 [dependency-groups]

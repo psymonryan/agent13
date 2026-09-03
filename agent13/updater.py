@@ -302,6 +302,7 @@ def format_update_notice(info: dict) -> str:
         f">> Update available: {remote_tag} (you have {local_version})",
         "",
         "  From TUI use:  /upgrade",
+        "  Or run:        agent13 --upgrade",
     ]
     if manual_cmd:
         lines.append(f"  Or run:        {manual_cmd}")

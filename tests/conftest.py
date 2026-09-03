@@ -12,8 +12,10 @@ from .mock_llm_helpers import make_models_handler, make_chat_handler
 
 
 # Create marker file at module level (before any tests run)
-# This ensures subprocess-spawned processes can detect they're under test
-_MARKER_PATH = os.path.join(os.path.dirname(__file__), ".testing")
+# This ensures subprocess-spawned processes can detect they're under test.
+# Per-pid name: concurrent pytest processes in one checkout each own their
+# marker, so one exiting can't delete another's (see history._is_testing).
+_MARKER_PATH = os.path.join(os.path.dirname(__file__), f".testing.{os.getpid()}")
 
 
 def _cleanup_marker():

@@ -13,20 +13,61 @@ from typing import Optional
 from agent13.config_paths import get_history_path as _get_history_path
 
 
-def _is_testing() -> bool:
-    """Check if we're running under pytest by looking for marker file.
+def _pid_alive(pid: int) -> bool:
+    """Best-effort liveness check for a pid.
 
-    This uses a marker file approach instead of environment variables because
-    pexpect-spawned processes don't inherit env vars reliably.
+    Uncertain cases (platform quirks, weird OSError) resolve to True —
+    treating a marker as live at worst leaves one real run with the
+    _test suffix; treating it dead would break a running test suite.
+    """
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except (PermissionError, OSError, ValueError):
+        return True
+
+
+def _is_testing() -> bool:
+    """Check if we're running under pytest by looking for marker files.
+
+    Each pytest process creates tests/.testing.<pid> (see
+    tests/conftest.py); the per-pid name lets concurrent suites in one
+    checkout coexist without deleting each other's marker.
+
+    This uses a marker file approach instead of environment variables
+    because pexpect-spawned processes don't inherit env vars reliably.
 
     Returns:
-        True if tests/.testing marker file exists.
+        True if a marker file for a live pytest process exists.
+        Stale markers (owner SIGKILL'd, so atexit never ran) are
+        removed as a side effect.
     """
-    # Look for marker file in tests directory (relative to this file)
+    # Look for marker files in tests directory (relative to this file)
     agent_dir = os.path.dirname(os.path.abspath(__file__))
     project_root = os.path.dirname(agent_dir)
-    marker_path = os.path.join(project_root, "tests", ".testing")
-    return os.path.exists(marker_path)
+    tests_dir = os.path.join(project_root, "tests")
+    try:
+        names = os.listdir(tests_dir)
+    except OSError:
+        return False
+    for name in names:
+        if not name.startswith(".testing."):
+            continue
+        marker_path = os.path.join(tests_dir, name)
+        try:
+            pid = int(name[len(".testing."):])
+        except ValueError:
+            continue
+        if _pid_alive(pid):
+            return True
+        # Owner is gone — remove the stale marker
+        try:
+            os.unlink(marker_path)
+        except OSError:
+            pass
+    return False
 
 
 def get_default_history_path() -> str:

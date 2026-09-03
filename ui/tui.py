@@ -919,6 +919,7 @@ class AgentTUI(App):
         ] = asyncio.Queue()
         self._token_processor_task: asyncio.Task | None = None
         self._agent_task: asyncio.Task | None = None
+        self._mcp_connect_task: asyncio.Task | None = None
         self._shutting_down = False  # Set in on_unmount to prevent mount errors
         self._agent_started = asyncio.Event()
         self._interrupt_requested = False  # Prevent double-cancellation
@@ -2154,7 +2155,9 @@ class AgentTUI(App):
 
         # Connect to MCP servers if requested
         if self._connect_mcp and self.agent._mcp_server_configs:
-            asyncio.create_task(self._connect_mcp_on_startup())
+            self._mcp_connect_task = asyncio.create_task(
+                self._connect_mcp_on_startup()
+            )
 
     async def _connect_mcp_on_startup(self) -> None:
         """Connect to MCP servers on startup."""
@@ -2225,6 +2228,25 @@ class AgentTUI(App):
         self.agent.stop()
         if self._agent_task:
             self._agent_task.cancel()
+
+        # Synchronously cancel MCP server subprocesses. on_unmount runs during
+        # _shutdown, but a fast quit (e.g. /quit right after MCP starts) cancels
+        # the run() coroutine, so no *awaited* teardown below it is guaranteed
+        # to run (and asyncio.run() would cancel any task we created). Cancelling
+        # the _session_runner tasks here is fully synchronous: it injects
+        # CancelledError into each runner, whose exit path unwinds the
+        # stdio_client transport and closes the child pipes while the loop is
+        # still open. That releases the transports before GC, preventing the
+        # "RuntimeError: Event loop is closed" from their __del__ at exit.
+        mcp = self.agent.mcp
+        if mcp is not None:
+            mcp._shutting_down = True  # suppress late reconnect attempts
+            for server in list(mcp.servers.values()):
+                session_task: asyncio.Task | None = server.session_task
+                if session_task is not None and not session_task.done():
+                    session_task.cancel()
+        if self._mcp_connect_task is not None:
+            self._mcp_connect_task.cancel()
 
     async def _safe_mount(self, widget: Widget) -> bool:
         """Mount a widget to the chat, safely handling unmount races.
@@ -4651,8 +4673,9 @@ class AgentTUI(App):
         compact_prompt_text, error = resolve_compact_prompt(self.prompt_manager, arg)
         if error:
             first, *rest = error.splitlines()
+            rest_text = "\n".join(rest)
             self._update_info_content(
-                f"[red]{first}[/]" + (f"\n{'\n'.join(rest)}" if rest else "")
+                f"[red]{first}[/]" + (f"\n{rest_text}" if rest else "")
             )
             return
 

@@ -36,7 +36,7 @@ from agent13.queue import AgentQueue, ItemStatus, QueueItem  # noqa: E402
 from agent13.history import History, get_default_history_path  # noqa: E402
 from agent13.prompts import PromptManager, ensure_default_prompts  # noqa: E402
 from agent13.snippets import SnippetManager  # noqa: E402
-from agent13.core import Agent, AgentStatus, PauseState, SpinnerSpeed  # noqa: E402
+from agent13.core import Agent, AgentStatus, PauseState, SpinnerSpeed, StopReason  # noqa: E402
 from agent13.message_history import MessageHistory  # noqa: E402
 from agent13.journal import JournalManager  # noqa: E402
 from agent13.llm import (  # noqa: E402
@@ -124,6 +124,7 @@ __all__ = [
     "Agent",
     "AgentStatus",
     "PauseState",
+    "StopReason",
     "SpinnerSpeed",
     "MessageHistory",
     "JournalManager",

@@ -9,7 +9,7 @@ All output is handled via callbacks, making it suitable for:
 
 import asyncio
 from typing import Callable, Awaitable, Optional
-from agent13 import Agent, AgentEvent, AgentEventData
+from agent13 import Agent, AgentEvent, AgentEventData, StopReason
 from agent13.file_injection import build_read_message
 
 
@@ -135,7 +135,7 @@ async def run_batch(
 
     finally:
         # Stop agent and clean up
-        agent.stop()
+        agent.stop(StopReason.QUIT)
         agent_task.cancel()
         try:
             await agent_task

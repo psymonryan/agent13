@@ -2,6 +2,8 @@
 
 import os
 import sys
+import asyncio
+import subprocess
 import tempfile
 import pytest
 from pathlib import Path
@@ -21,6 +23,7 @@ from agent13.sandbox import (
     format_sandbox_mode_info,
     format_all_sandbox_modes,
     get_temp_dir,
+    _kill_process_tree,
 )
 
 
@@ -965,3 +968,60 @@ class TestPowershellRouting:
             cmd = build_sandbox_command("echo hello", SandboxMode.OFF)
         if sys.platform == "win32":
             assert cmd == [r"C:\pwsh\pwsh.exe", "-NoProfile", "-NonInteractive", "-Command", "echo hello"]
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="process groups (killpg/getpgid) are POSIX-only; Windows uses taskkill")
+class TestKillProcessTree:
+    """_kill_process_tree must never SIGKILL the agent's own process group.
+
+    Regression: remote_exec used to spawn ssh WITHOUT start_new_session, so a
+    timeout _kill_process_tree() did os.killpg(agent_pgid, SIGKILL) and killed
+    the agent itself (observed overnight as "Killed: 9"). The guard falls back
+    to killing just the child when it shares our group.
+    """
+
+    async def test_kills_isolated_child_group(self):
+        """A child in its OWN group (start_new_session) is killed via killpg."""
+        proc = await asyncio.create_subprocess_exec(
+            sys.executable, "-c", "import time; time.sleep(30)",
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        assert os.getpgid(proc.pid) != os.getpgrp()
+        await _kill_process_tree(proc)
+        await asyncio.sleep(0.2)
+        assert proc.returncode is not None, "isolated child should have been killed"
+
+    def test_does_not_kill_own_process_group(self):
+        """A child in OUR group (no start_new_session) must not cause
+        _kill_process_tree to kill the parent. Runs in a subprocess so a
+        regression fails cleanly instead of SIGKILL-ing pytest."""
+        repo_root = str(Path(__file__).resolve().parent.parent)
+        script = (
+            "import asyncio, os, sys\n"
+            "from agent13.sandbox import _kill_process_tree\n"
+            "async def main():\n"
+            "    p = await asyncio.create_subprocess_exec(\n"
+            "        sys.executable, '-c', 'import time; time.sleep(30)',\n"
+            "        stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)\n"
+            "    assert os.getpgid(p.pid) == os.getpgrp()\n"
+            "    await _kill_process_tree(p)\n"
+            "    await asyncio.sleep(0.2)\n"
+            "    print('SURVIVED', p.returncode is not None)\n"
+            "asyncio.run(main())\n"
+        )
+        env = {
+            **os.environ,
+            "PYTHONPATH": repo_root + os.pathsep + os.environ.get("PYTHONPATH", ""),
+        }
+        r = subprocess.run(
+            [sys.executable, "-c", script],
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+        assert r.returncode == 0, (
+            f"parent was killed (rc={r.returncode}); group-kill guard regressed: {r.stderr}"
+        )
+        assert "SURVIVED True" in r.stdout

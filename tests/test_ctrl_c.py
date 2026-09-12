@@ -52,7 +52,7 @@ class MockAgent:
     def __init__(self):
         self.stopped = False
 
-    def stop(self):
+    def stop(self, reason=None):
         self.stopped = True
 
 

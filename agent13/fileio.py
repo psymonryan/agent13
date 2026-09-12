@@ -15,7 +15,7 @@ import locale
 from pathlib import Path
 
 
-class ConfigFileError(Exception):
+class ConfigFileError(ValueError):
     """A user-editable config file could not be read or parsed.
 
     The message is user-facing: it says what went wrong AND what to try

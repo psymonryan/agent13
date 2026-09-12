@@ -9,6 +9,7 @@ import pytest
 from agent13.config import Config
 from agent13.persistence import (
     _ensure_ctx_stem,
+    _sanitize_save_stem,
     find_latest_auto_save,
     get_auto_save_dir,
     get_auto_save_path,
@@ -745,3 +746,85 @@ class TestResolveSavePath:
         """Empty name raises ValueError."""
         with pytest.raises(ValueError):
             resolve_save_path("")
+
+
+# ---------------------------------------------------------------------------
+# _sanitize_save_stem
+# ---------------------------------------------------------------------------
+
+
+class TestSanitizeSaveStem:
+    """Tests for _sanitize_save_stem — flat, Windows-safe filenames.
+
+    Regression: /save "foo / bar" created a "foo /" subdirectory (trailing
+    space) that Windows cannot delete — Explorer and Remove-Item re-resolve
+    the name, Win32 strips the trailing space, and the delete fails with a
+    misleading "open in another program" error.
+    """
+
+    def test_slash_flattened_to_space(self):
+        assert _sanitize_save_stem("glm5.3 flash fixes for pause / resume") == (
+            "glm5.3 flash fixes for pause resume"
+        )
+
+    def test_backslash_flattened_to_space(self):
+        assert _sanitize_save_stem("a\\b") == "a b"
+
+    def test_windows_illegal_chars_replaced(self):
+        assert _sanitize_save_stem('foo:bar|baz?qux*quux') == "foo bar baz qux quux"
+
+    def test_whitespace_collapsed_and_trimmed(self):
+        assert _sanitize_save_stem("  a   b  ") == "a b"
+
+    def test_trailing_dot_stripped(self):
+        # Win32 silently drops trailing dots — "a." and "a" would collide
+        assert _sanitize_save_stem("a.") == "a"
+        assert _sanitize_save_stem("a..b.") == "a..b"
+
+    def test_reserved_device_names_suffixed(self):
+        # Windows rejects these even with an extension (NUL.txt is unusable)
+        assert _sanitize_save_stem("CON") == "CON_"
+        assert _sanitize_save_stem("com1") == "com1_"
+        assert _sanitize_save_stem("NUL.txt") == "NUL.txt_"
+
+    def test_plain_name_unchanged(self):
+        assert _sanitize_save_stem("my context name") == "my context name"
+        assert _sanitize_save_stem("v1.2-rc3") == "v1.2-rc3"
+
+    def test_all_invalid_returns_empty(self):
+        assert _sanitize_save_stem("/:*<>?|") == ""
+
+
+class TestResolveSavePathSanitization:
+    """resolve_save_path must never create subdirectories from bare names."""
+
+    def test_bare_name_with_slash_stays_flat(self, monkeypatch, tmp_path):
+        """The c122 landmine: slash in name → single flat file, no subdir."""
+        monkeypatch.setenv("AGENT13_SAVES_DIR", str(tmp_path / "saves"))
+        path = resolve_save_path("glm5.3 flash fixes for pause / resume")
+        assert path == tmp_path / "saves" / "glm5.3 flash fixes for pause resume.ctx"
+        # File sits directly in saves — no subdirectory was created
+        assert path.parent == tmp_path / "saves"
+
+    def test_bare_name_with_slash_and_ctx_suffix(self, monkeypatch, tmp_path):
+        """The .ctx strip happens before sanitization, so no doubling."""
+        monkeypatch.setenv("AGENT13_SAVES_DIR", str(tmp_path / "saves"))
+        path = resolve_save_path("foo / bar.ctx")
+        assert path == tmp_path / "saves" / "foo bar.ctx"
+
+    def test_name_empty_after_sanitization_raises(self, monkeypatch, tmp_path):
+        """A name of only invalid chars fails loudly, not silently."""
+        monkeypatch.setenv("AGENT13_SAVES_DIR", str(tmp_path / "saves"))
+        with pytest.raises(ValueError, match="empty after removing"):
+            resolve_save_path(": * | ?")
+
+    def test_save_and_load_agree_on_sanitized_name(self, monkeypatch, tmp_path):
+        """/save and /load must resolve the same raw string to the same file."""
+        monkeypatch.setenv("AGENT13_SAVES_DIR", str(tmp_path / "saves"))
+        raw = "glm5.3 flash fixes for pause / resume"
+        save_path = resolve_save_path(raw)
+        load_path = resolve_save_path(raw)
+        assert save_path == load_path
+        assert save_path == load_path == resolve_save_path(
+            "glm5.3 flash fixes for pause resume"
+        )

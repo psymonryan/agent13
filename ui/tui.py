@@ -50,6 +50,7 @@ from agent13 import (
     AgentStatus,
     PauseState,
     SpinnerSpeed,
+    StopReason,
     History,
     PromptManager,
     SnippetManager,
@@ -740,7 +741,7 @@ class AgentTUI(App):
         bell_command: str = "",
         priming_enabled: bool = False,
         cursor_blink: bool = False,
-        auto_compact_threshold: int = 0,
+        auto_compact_threshold: int = 220000,
         auto_compact_max_iterations: int = 3,
     ):
         """Initialize the TUI.
@@ -793,8 +794,15 @@ class AgentTUI(App):
         # Skill manager for skill slash commands
         self.skill_manager = skill_manager
         # Whether skills are opted in (--skills flag or config.include_skills).
-        # Gates the skill *tool* visibility to the AI; slash commands are unaffected.
+        # Drives the skill *tool*'s initial visibility AND whether the skills
+        # list starts in the system prompt. The tool is additionally ratcheted
+        # on by the first skill slash-invocation (and never switches off); the
+        # list is toggled at runtime by /skills on|off. Slash commands are
+        # always available regardless.
         self._include_skills = include_skills
+        # Current state of the skills *list* in the system prompt. Toggled by
+        # /skills on|off; initial value mirrors include_skills.
+        self._skills_list_enabled = include_skills
 
         # Snippet manager for snippet slash commands
         reserved = {cmd[1:] for cmd in self._BUILTIN_SLASH_COMMANDS}
@@ -828,10 +836,11 @@ class AgentTUI(App):
 
         # Initialize agent with tools
         config = get_config()
-        # Determine skills mode: skill tool visible only when skills are opted in
-        # (mirrors cli.py's `include_skills and bool(skill_manager.skills)` gate).
-        # Slash commands remain available regardless — this only affects what the
-        # LLM sees, per the minimal-context principle.
+        # Determine skills mode: the skill tool is visible when skills are opted
+        # in via --skills (include_skills) and skills exist — mirroring cli.py's
+        # gate. It is ALSO ratcheted on by the first skill slash-invocation and
+        # never switches off (see the /skill handler below). This only affects
+        # what the LLM sees, per the minimal-context principle.
         skills_mode = self._include_skills and bool(
             self.skill_manager and self.skill_manager.skills
         )
@@ -2155,9 +2164,7 @@ class AgentTUI(App):
 
         # Connect to MCP servers if requested
         if self._connect_mcp and self.agent._mcp_server_configs:
-            self._mcp_connect_task = asyncio.create_task(
-                self._connect_mcp_on_startup()
-            )
+            self._mcp_connect_task = asyncio.create_task(self._connect_mcp_on_startup())
 
     async def _connect_mcp_on_startup(self) -> None:
         """Connect to MCP servers on startup."""
@@ -2225,7 +2232,7 @@ class AgentTUI(App):
         # Stop the spinner timer
         if hasattr(self, "_spinner_timer") and self._spinner_timer is not None:
             self._spinner_timer.stop()
-        self.agent.stop()
+        self.agent.stop(StopReason.QUIT)
         if self._agent_task:
             self._agent_task.cancel()
 
@@ -2309,9 +2316,7 @@ class AgentTUI(App):
             return
 
         # Find the index of the first message in the last N turns
-        user_indices = [
-            i for i, m in enumerate(messages) if is_turn_start(m)
-        ]
+        user_indices = [i for i, m in enumerate(messages) if is_turn_start(m)]
         if len(user_indices) <= keep_turns:
             # Not enough turns to trim — show everything
             await self._rebuild_chat()
@@ -2554,9 +2559,7 @@ class AgentTUI(App):
                 reasoning = msg.get("reasoning_content")
                 if reasoning and reasoning.strip():
                     was_at_bottom = self._is_at_bottom()
-                    r_widget = ReasoningMessage(
-                        title="Thinking", collapsed=True
-                    )
+                    r_widget = ReasoningMessage(title="Thinking", collapsed=True)
                     r_widget.add_class("assistant-message")
                     if await self._safe_mount(r_widget):
                         await r_widget.append(reasoning)
@@ -2858,7 +2861,14 @@ class AgentTUI(App):
         self.status = display_status
 
         # Update processing state for spinner
-        if status in ("waiting", "thinking", "processing", "tooling", "journaling", "compacting"):
+        if status in (
+            "waiting",
+            "thinking",
+            "processing",
+            "tooling",
+            "journaling",
+            "compacting",
+        ):
             self.processing = True
             # Note: TPS timing reset is handled by STREAM_START event only
             # (see on_stream_start handler). Do NOT reset here - status changes
@@ -3111,9 +3121,7 @@ class AgentTUI(App):
         ctx_str = f"Ctx: {total_str}"
 
         # Turn count (hidden when zero)
-        turn_count = sum(
-            1 for m in self.agent.messages if is_turn_start(m)
-        )
+        turn_count = sum(1 for m in self.agent.messages if is_turn_start(m))
         trn_str = f" | trn: {turn_count}" if turn_count > 0 else ""
         # MCP connection status (only show when connected)
         mcp_str = ""
@@ -3148,10 +3156,7 @@ class AgentTUI(App):
             if is_debug_enabled():
                 log_tps_event("sanity_check_failed", {"absurd_tps": self._last_tps})
         # Build right side: dur: | Ctx: | trn: | mcp: | jnl: | pol: | Tools: | tps:
-        right_side = (
-            f"{elapsed_str}{ctx_str}{trn_str}{mcp_str}{jnl_str}{pol_str}{tools_str}{tps_str}"
-            .strip()
-        )
+        right_side = f"{elapsed_str}{ctx_str}{trn_str}{mcp_str}{jnl_str}{pol_str}{tools_str}{tps_str}".strip()
         self._status_right.update(right_side)
 
     def watch_status(self, old: str, new: str) -> None:
@@ -3408,7 +3413,7 @@ class AgentTUI(App):
         elif command == "auto_compact_max":
             self._handle_auto_compact_max_command(args)
         elif command in ("quit", "exit"):
-            self.agent.stop()
+            self.agent.stop(StopReason.QUIT)
             self.exit()
         else:
             # Check for skill invocation
@@ -3417,6 +3422,12 @@ class AgentTUI(App):
                 if skill:
                     content = self.skill_manager.format_skill_content(command)
                     if content:
+                        # Ratchet the skill tool on (one-way): the first skill use
+                        # enables the tool for the rest of the session, even without
+                        # --skills. No-op if --skills already enabled it. Never
+                        # switches off again (avoids a repeated prompt re-process).
+                        if not self.agent.skills_mode:
+                            self.agent.set_skills_mode(True)
                         if args:
                             content = f"{content}\n\n{args}"
                         asyncio.create_task(self._send_message(content))
@@ -3493,7 +3504,9 @@ class AgentTUI(App):
         if model:
             self.model = model
             self.agent.set_model(self.model)
-            self._update_info_content(f"[green]Model set to: {escape_markup(self.model)}[/]")
+            self._update_info_content(
+                f"[green]Model set to: {escape_markup(self.model)}[/]"
+            )
             self.update_status()
         else:
             self._update_info_content(f"[red]Unknown model: {escape_markup(args)}[/]")
@@ -3526,9 +3539,7 @@ class AgentTUI(App):
                 if g.first_role == "user"
                 else f"[bold]{g.first_role}:[/]"
             )
-            lines.append(
-                f"  [cyan]{g.number}.[/] {role_tag} {escape_markup(display)}"
-            )
+            lines.append(f"  [cyan]{g.number}.[/] {role_tag} {escape_markup(display)}")
 
             for entry in g.entries:
                 if entry.role == "tool":
@@ -3810,7 +3821,7 @@ class AgentTUI(App):
             f"  bell-cmd: [yellow]{escape_markup(self._bell.command) if self._bell.command else '(terminal bell)'}[/]\n"
             f"  remove-reasoning: [yellow]{'on' if sd.remove_reasoning else 'off'}[/]\n"
             f"  devel: [yellow]{'on' if sd.devel_mode else 'off'}[/]\n"
-            f"  skills: [yellow]{'on' if sd.skills_mode else 'off'}[/]\n"
+            f"  skill tool: [yellow]{'on' if sd.skills_mode else 'off'}[/]\n"
             f"  journal: [yellow]{'on' if sd.journal_mode else 'off'}[/]"
         )
         self._info_pane_mode = "status"
@@ -3861,7 +3872,9 @@ class AgentTUI(App):
         name = args.strip()
         if self.prompt_manager.set_active(name):
             self.agent.set_system_prompt(self.prompt_manager.get_prompt())
-            self._update_info_content(f"[green]Switched to prompt: {escape_markup(name)}[/]")
+            self._update_info_content(
+                f"[green]Switched to prompt: {escape_markup(name)}[/]"
+            )
         else:
             self._update_info_content(
                 f"[red]Prompt not found: {escape_markup(name)}[/]"
@@ -4241,8 +4254,7 @@ class AgentTUI(App):
         input_field.focus()
         self.update_status()
         self._update_info_content(
-            "[dim]Last message removed and loaded for editing. "
-            "Press Enter to retry.[/]"
+            "[dim]Last message removed and loaded for editing. Press Enter to retry.[/]"
         )
 
     def _handle_prioritise_command(self, args: str) -> None:
@@ -4321,9 +4333,7 @@ class AgentTUI(App):
             return
 
         if not model_names:
-            self._update_info_content(
-                "[red]No models available from provider[/]"
-            )
+            self._update_info_content("[red]No models available from provider[/]")
             return
 
         # Update model list
@@ -4355,19 +4365,15 @@ class AgentTUI(App):
                 lines.append("  Session override: [dim]none (using config default)[/]")
             lines.append(f"  Config default: [dim]{config_default.value}[/]")
             if pinned:
-                lines.append(
-                    f"  Pinned for this project: [yellow]{pinned.value}[/]"
-                )
+                lines.append("  Pinned: [yellow]yes[/]")
             else:
-                lines.append("  Pinned for this project: [dim]none[/]")
+                lines.append("  Pinned: [dim]no[/]")
             lines.append("")
             lines.append(format_all_sandbox_modes())
             lines.append("")
             lines.append("[dim]/sandbox <mode>  set session mode[/]")
             lines.append("[dim]/sandbox pin     pin current mode for this project[/]")
-            lines.append(
-                "[dim]/sandbox unpin   remove pin for this project[/]"
-            )
+            lines.append("[dim]/sandbox unpin   remove pin for this project[/]")
             self._update_info_content("\n".join(lines))
             return
 
@@ -4424,7 +4430,9 @@ class AgentTUI(App):
 
         try:
             os.chdir(target)
-            self._update_info_content(f"[green]Working directory changed to: {escape_markup(str(target))}[/]")
+            self._update_info_content(
+                f"[green]Working directory changed to: {escape_markup(str(target))}[/]"
+            )
         except OSError as e:
             self._update_info_content(
                 f"[red]Cannot change directory: {escape_markup(str(e))}[/]"
@@ -4478,9 +4486,7 @@ class AgentTUI(App):
 
             async def do_disconnect():
                 await self.agent.disconnect_mcp()
-                self._update_info_content(
-                    "[dim]MCP servers disconnected[/]"
-                )
+                self._update_info_content("[dim]MCP servers disconnected[/]")
 
             asyncio.create_task(do_disconnect())
 
@@ -4545,14 +4551,20 @@ class AgentTUI(App):
             combos = stats.param_combos.get(name, {})
             if combos and len(combos) > 1:
                 combo_successes = stats.param_combo_successes.get(name, {})
-                for combo, count in sorted(combos.items(), key=lambda x: x[1], reverse=True):
+                for combo, count in sorted(
+                    combos.items(), key=lambda x: x[1], reverse=True
+                ):
                     cs = combo_successes.get(combo, 0)
                     lines.append(f"    [dim]{combo}={cs}/{count}[/]")
 
         self._update_info_content("\n".join(lines))
 
     def _handle_skills_command(self, args: str) -> None:
-        """Handle /skills command - toggle skills mode or list available skills.
+        """Handle /skills command - toggle the skills list or list available skills.
+
+        on/off toggle the skills *list* (descriptions in the system prompt); 'on'
+        also enables the *tool*. The tool is enabled by --skills, by /skills on,
+        or by the first skill invocation — and never switches off.
 
         Args:
             args: Subcommand - 'on', 'off', 'list', 'status', or empty (lists)
@@ -4564,27 +4576,34 @@ class AgentTUI(App):
         args = args.strip().lower()
 
         if args == "on":
+            self._skills_list_enabled = True
             self.agent.set_skills_mode(True)
             self._rebuild_system_prompt_with_skills(True)
             self._update_info_content(
-                "[green]Skills mode enabled[/]\n"
-                "The AI can now see and use the skill tool. "
-                "Skill descriptions added to system prompt."
+                "[green]Skills enabled[/]\n"
+                "Skill descriptions added to system prompt and the "
+                "skill tool is available."
             )
         elif args == "off":
-            self.agent.set_skills_mode(False)
+            self._skills_list_enabled = False
             self._rebuild_system_prompt_with_skills(False)
             self._update_info_content(
-                "[yellow]Skills mode disabled[/]\n"
-                "The skill tool is now hidden from the AI. "
-                "You can still invoke skills directly via slash commands."
+                "[yellow]Skills list disabled[/]\n"
+                "Skill descriptions removed from the system prompt. "
+                "Note: the skill tool, once enabled, has no off-switch. "
+                "You can still invoke skills via slash commands."
             )
         elif args == "status":
-            status = "on" if self.agent.skills_mode else "off"
-            color = "green" if self.agent.skills_mode else "yellow"
             count = len(self.skill_manager.skills) if self.skill_manager.skills else 0
+            tool_color = "green" if self.agent.skills_mode else "dim"
             self._update_info_content(
-                f"[{color}]Skills mode: {status}[/]\n{count} skill(s) available"
+                "[bold]Skills status[/]\n"
+                "  List in prompt: "
+                f"{'on' if self._skills_list_enabled else 'off'}\n"
+                "  Skill tool:     "
+                f"[{tool_color}]{'on' if self.agent.skills_mode else 'off'}[/] "
+                "(auto-enables after first skill use)\n"
+                f"  {count} skill(s) available"
             )
         else:
             # Default: list skills (also handles 'list' subcommand)
@@ -4594,7 +4613,7 @@ class AgentTUI(App):
                 return
 
             status = "on" if self.agent.skills_mode else "off"
-            lines = [f"[bold]Available skills[/] (mode: {status})", ""]
+            lines = [f"[bold]Available skills[/] (tool: {status})", ""]
             for name, info in sorted(skills.items()):
                 desc = (
                     info.description[:60] + "..."
@@ -4606,7 +4625,10 @@ class AgentTUI(App):
                 )
 
             lines.append("")
-            lines.append("[dim]Use /skills on|off to toggle AI visibility[/]")
+            lines.append(
+                "[dim]Invoke a skill to enable the tool · "
+                "/skills on|off toggles the list[/]"
+            )
             self._update_info_content("\n".join(lines))
 
     def _rebuild_system_prompt_with_skills(self, include: bool) -> None:
@@ -4980,9 +5002,7 @@ class AgentTUI(App):
                     "  [yellow]/bell-command[/] - Show current status"
                 )
                 return
-            self._update_info_content(
-                f"[green]Bell command: {escape_markup(args)}[/]"
-            )
+            self._update_info_content(f"[green]Bell command: {escape_markup(args)}[/]")
 
     def _handle_auto_compact_threshold_command(self, args: str) -> None:
         """Handle /auto_compact_threshold - set or show the auto-compact threshold.
@@ -5042,9 +5062,7 @@ class AgentTUI(App):
             if max_iter < 1:
                 raise ValueError("must be >= 1")
             self.agent.auto_compact_max_iterations = max_iter
-            self._update_info_content(
-                f"[green]Auto-compact max cycles: {max_iter}[/]"
-            )
+            self._update_info_content(f"[green]Auto-compact max cycles: {max_iter}[/]")
         except ValueError:
             self._update_info_content(
                 "[red]Usage: /auto_compact_max N[/]\n"
@@ -5384,9 +5402,7 @@ class AgentTUI(App):
             last = self._pending_tool_widgets[-1]
             if getattr(last, "_pending_unknown", False):
                 last._pending_unknown = False
-                last.update(
-                    self._tool_call_markup(message.name, {}, pending=True)
-                )
+                last.update(self._tool_call_markup(message.name, {}, pending=True))
                 return
 
         was_at_bottom = self._is_at_bottom()
@@ -6097,7 +6113,7 @@ class AgentTUI(App):
     def action_force_quit(self) -> None:
         """Quit the application with clean shutdown via /quit command."""
         # Stop the agent first
-        self.agent.stop()
+        self.agent.stop(StopReason.QUIT)
         # Cancel the agent task if running
         if self._agent_task and not self._agent_task.done():
             self._agent_task.cancel()

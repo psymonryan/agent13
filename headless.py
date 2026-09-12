@@ -40,7 +40,7 @@ from typing import Optional
 from openai import AsyncOpenAI
 
 from agent13.config import resolve_provider_arg, create_client, get_config
-from agent13.core import Agent, AgentEvent
+from agent13.core import Agent, AgentEvent, StopReason
 from agent13.prompts import PromptManager
 from agent13.debug_log import init_debug
 from agent13.models import fetch_models, select_model
@@ -412,39 +412,63 @@ async def run_headless(
                             count = len(agent._mcp_server_configs) if agent._mcp_server_configs else 0
                             print(f"MCP: Not initialized ({count} servers configured). Use /mcp connect", flush=True)
                 elif cmd.startswith("/save"):
-                    # Handle /save command
-                    parts = line.split(maxsplit=2)
-                    if len(parts) < 2:
+                    # Handle /save command (same semantics as TUI /save:
+                    # -y anywhere, rest of the line is the name)
+                    parts = line.split(maxsplit=1)
+                    if len(parts) < 2 or not parts[1].strip():
                         print("USAGE: /save <name> [-y]", flush=True)
                     else:
-                        name = parts[1]
-                        force = len(parts) > 2 and parts[2] == "-y"
-                        from agent13.persistence import save_context, get_saves_dir
-                        saves_dir = get_saves_dir()
-                        saves_dir.mkdir(parents=True, exist_ok=True)
-                        path = saves_dir / f"{name}.ctx"
-                        if path.exists() and not force:
-                            print(f"EXISTS: {path}. Use /save {name} -y to overwrite", flush=True)
+                        tokens = parts[1].strip().split()
+                        force = "-y" in tokens
+                        name = " ".join(t for t in tokens if t != "-y").strip()
+                        from agent13.persistence import (
+                            save_context,
+                            resolve_save_path,
+                        )
+                        try:
+                            path = resolve_save_path(name)
+                        except ValueError as e:
+                            print(f"ERROR: {e}", flush=True)
                         else:
-                            save_context(agent, str(path))
-                            print(f"SAVED: {path}", flush=True)
+                            if path.exists() and not force:
+                                print(
+                                    f"EXISTS: {path}. Use /save {name} -y to overwrite",
+                                    flush=True,
+                                )
+                            else:
+                                save_context(agent, str(path))
+                                print(f"SAVED: {path}", flush=True)
                 elif cmd.startswith("/load"):
                     # Handle /load command
                     parts = line.split(maxsplit=1)
-                    if len(parts) < 2:
+                    if len(parts) < 2 or not parts[1].strip():
                         print("USAGE: /load <name>", flush=True)
                     else:
-                        name = parts[1]
-                        from agent13.persistence import load_context, get_saves_dir
-                        path = get_saves_dir() / f"{name}.ctx"
-                        if not path.exists():
-                            print(f"NOT_FOUND: {path}", flush=True)
+                        name = parts[1].strip()
+                        from agent13.persistence import (
+                            load_context,
+                            resolve_save_path,
+                        )
+                        try:
+                            path = resolve_save_path(name)
+                        except ValueError as e:
+                            print(f"ERROR: {e}", flush=True)
                         else:
-                            success, msg = load_context(agent, str(path))
-                            if success:
-                                print(f"LOADED: {path} ({msg})", flush=True)
+                            if not path.exists():
+                                print(f"NOT_FOUND: {path}", flush=True)
                             else:
-                                print(f"LOAD_ERROR: {msg}", flush=True)
+                                success, msg, incomplete = load_context(
+                                    agent, str(path)
+                                )
+                                if success:
+                                    print(f"LOADED: {path} ({msg})", flush=True)
+                                    if incomplete:
+                                        print(
+                                            "INCOMPLETE_TURN: use /resume to continue",
+                                            flush=True,
+                                        )
+                                else:
+                                    print(f"LOAD_ERROR: {msg}", flush=True)
                 elif cmd.startswith("/compact"):
                     from agent13.prompts import resolve_compact_prompt
 
@@ -475,7 +499,7 @@ async def run_headless(
             auto_path = get_auto_save_path()
             save_context(agent, str(auto_path))
             print(f"AUTO_SAVED: {auto_path}", flush=True)
-        agent.stop()
+        agent.stop(StopReason.QUIT)
         reader_task.cancel()
         try:
             await asyncio.wait_for(agent_task, timeout=2.0)
@@ -514,7 +538,7 @@ Commands: /pause, /resume, /status, /quit
     parser.add_argument(
         "--skills",
         action="store_true",
-        help="Include discovered skills in the system prompt"
+        help="Show discovered skills in the system prompt and enable the skill tool"
     )
     parser.add_argument(
         "--debug",

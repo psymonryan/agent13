@@ -209,6 +209,20 @@ class PauseState(Enum):
     PAUSED = "paused"  # Paused at safe point
 
 
+class StopReason(Enum):
+    """Why the agent was asked to stop.
+
+    Distinguishes user interrupts (ESC — history needs repair so the next
+    message has valid role alternation) from clean shutdowns (quit/app exit
+    — history must be left untouched so a mid-turn pause survives the
+    auto-save and /resume after --continue can pick it up exactly where it
+    stopped, preserving the backend kv-cache prefix).
+    """
+
+    INTERRUPT = "interrupt"  # ESC — repair history at cancellation point
+    QUIT = "quit"  # Clean shutdown — preserve mid-turn state for auto-save
+
+
 class SpinnerSpeed(Enum):
     """Spinner animation speed — single source of truth.
 
@@ -271,7 +285,7 @@ class Agent:
         devel_mode: bool = False,
         skills_mode: bool = False,
         priming_enabled: bool = False,
-        auto_compact_threshold: int = 0,
+        auto_compact_threshold: int = 220000,
         auto_compact_max_iterations: int = 3,
     ):
         """Initialize the agent.
@@ -359,6 +373,8 @@ class Agent:
         # Set by /resume to signal run() to call continue_incomplete_turn()
         # at the next loop iteration (inside run(), not a separate task).
         self._incomplete_turn_pending: bool = False
+        # Why stop() was called — gates history repair on cancel (Fix 1).
+        self._stop_reason: StopReason = StopReason.INTERRUPT
 
         # Polite mode (multi-agent lock coordination); None = disabled.
         self.polite_lock: Optional[PoliteLock] = None
@@ -543,7 +559,15 @@ class Agent:
         Raises asyncio.CancelledError when interrupted by the user.
         """
         self._running = True
+        # A stop() issued in the create_task()→run() window (a quit sequence
+        # firing before this task's first line) has already set _stop_event
+        # with its reason — it targets this run, so honour it. Otherwise
+        # reset to INTERRUPT so a reason left by an earlier run never leaks
+        # into this run's cancel handling.
+        _stop_pending = self._stop_event.is_set()
         self._stop_event.clear()
+        if not _stop_pending:
+            self._stop_reason = StopReason.INTERRUPT
 
         # Clear any stale pause state unconditionally on (re)start
         was_paused = self._pause_state == PauseState.PAUSED
@@ -644,7 +668,7 @@ class Agent:
             # finally block can clean up.
             current_id = self.queue.current.id if self.queue.current else None
             log_queue_interrupt(current_id)
-            self.history.repair_interrupted()
+            self._repair_history_if_interrupted()
             if self.queue.current:
                 self.queue.complete_current()
                 log_queue_complete(current_id, "interrupted")
@@ -661,11 +685,35 @@ class Agent:
             self._status = AgentStatus.IDLE
             await self.emit(AgentEvent.STOPPED, {})
 
-    def stop(self) -> None:
-        """Signal the agent to stop processing."""
+    def stop(self, reason: StopReason = StopReason.INTERRUPT) -> None:
+        """Signal the agent to stop processing.
+
+        Args:
+            reason: Why we're stopping. INTERRUPT (ESC) marks the history
+                for repair at the cancellation point. QUIT (app exit)
+                leaves history untouched so a mid-turn pause survives the
+                auto-save and --continue can resume it exactly.
+
+        Works even if called before run() has executed its first line
+        (the create_task()→run() window): run() detects the pending stop
+        via _stop_event and honours the recorded reason instead of
+        resetting it.
+        """
+        self._stop_reason = reason
         self._running = False
         self._stop_event.set()
         self._pause_event.set()  # Unblock if paused so run() can exit
+
+    def _repair_history_if_interrupted(self) -> None:
+        """Repair history on a true interrupt (ESC); preserve mid-turn on quit.
+
+        Called from both CancelledError handlers (run() between items and
+        _process_item mid-item). On a quit-path stop (StopReason.QUIT) the
+        history must stay mid-turn so the auto-save preserves the exact
+        resume point (kv-cache prefix) for --continue + /resume.
+        """
+        if self._stop_reason == StopReason.INTERRUPT:
+            self.history.repair_interrupted()
 
     def pause(self) -> bool:
         """Request the agent to pause.
@@ -1454,9 +1502,7 @@ class Agent:
             #     (framework glitches, executor issues) transparently.
             if isinstance(e, asyncio.CancelledError):
                 log_error(e, {"context": "process_item_cancelled", "item_id": item.id})
-                # Repair message history (add [Interrupted] assistant
-                # message if needed) so role alternation is preserved.
-                self.history.repair_interrupted()
+                self._repair_history_if_interrupted()
                 await self.emit(
                     AgentEvent.ERROR,
                     {
@@ -1498,6 +1544,37 @@ class Agent:
         else:
             await self._set_status(AgentStatus.IDLE)
 
+    def _jit_repair_loaded_turn(self) -> None:
+        """JIT safety net: close a loaded mid-turn history if the API requires it.
+
+        If the user typed a new message after --continue / /load without
+        /resume first, the history must be API-valid before the LLM call:
+        - pending tool_calls: synthesize missing tool results + [Interrupted]
+          marker so the request doesn't 400 (API requires a result for every
+          tool_call);
+        - trailing user message: append the [Interrupted] marker, otherwise
+          the new message would be consecutive users (breaks role alternation
+          on strict backends).
+        A trailing tool result or a complete assistant message needs NO
+        repair — tool-then-user is valid, and inserting a marker would break
+        the kv-cache prefix. /resume paths clear the flag first
+        (continue_incomplete_turn), so they're unaffected.
+
+        Called at _llm_turn entry (deterministic call site), not in
+        _stream_and_emit — that's an async generator shared with the
+        reflection path, where pre-yield code runs lazily on first
+        iteration and any future caller would silently inherit the history
+        mutation.
+        """
+        if self._incomplete_turn_loaded:
+            last = self.history.messages[-1] if self.history.messages else None
+            if last is not None and (
+                last.get("role") == "user"
+                or (last.get("role") == "assistant" and last.get("tool_calls"))
+            ):
+                self.history.repair_interrupted()
+            self._incomplete_turn_loaded = False
+
     async def _llm_turn(self, _polite_acquired: bool = False) -> None:
         """Execute one LLM turn (may include multiple tool call rounds).
 
@@ -1510,6 +1587,7 @@ class Agent:
                 tool execution) and re-acquired before the next stream. This
                 frees the GPU for other agents during long-running tools.
         """
+        self._jit_repair_loaded_turn()
         if is_debug_enabled():
             log_tps_event("agent_llm_turn_start", {"note": "Starting new LLM turn"})
         while self._running:

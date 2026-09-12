@@ -22,6 +22,17 @@ Usage:
 import hashlib
 import json
 import os
+import sys
+
+# 'resource' is POSIX-only; Windows has no such module. We need it only for
+# peak-RSS sampling in log_rss(), so degrade to None there and let log_rss
+# no-op on platforms that lack it. Importing it unconditionally at module
+# scope made every test module that imports debug_log fail to collect on
+# Windows (ModuleNotFoundError), silently zeroing the whole CI run.
+try:
+    import resource
+except ImportError:  # pragma: no cover - Windows
+    resource = None
 import traceback
 from datetime import datetime
 from pathlib import Path
@@ -64,6 +75,7 @@ def init_debug(log_dir: Optional[Path] = None) -> None:
 
     # Write session header
     log_event("session_start", {"pid": os.getpid()})
+    log_rss(note="session_start")
 
 
 def is_debug_enabled() -> bool:
@@ -179,6 +191,38 @@ def log_api_request(
     if params:
         data["params"] = params
     log_event("api_request", data)
+    log_rss()
+
+
+def log_rss(note: str = "") -> None:
+    """Log peak resident set size (memory-growth diagnostic).
+
+    Emits a ``mem_rss`` event carrying the process's high-water-mark RSS.
+    Sampled on every API request, so the debug log shows whether memory
+    climbs toward a kill (macOS memory-pressure SIGKILL) over a long
+    session. Peak RSS (ru_maxrss) is monotonic - it reveals growth even
+    when current RSS fluctuates. No-op when debug logging is disabled.
+
+    Args:
+        note: Optional label (e.g. "session_start").
+    """
+    if not _debug_enabled or _log_file is None:
+        return
+    if resource is None:  # Windows: no 'resource' module
+        return
+    try:
+        ru_max = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    except Exception:
+        return
+    # macOS reports ru_maxrss in bytes; Linux in kilobytes.
+    rss_bytes = ru_max if sys.platform == "darwin" else ru_max * 1024
+    data = {
+        "peak_rss_bytes": rss_bytes,
+        "peak_rss_mb": round(rss_bytes / (1024 * 1024), 1),
+    }
+    if note:
+        data["note"] = note
+    log_event("mem_rss", data)
 
 
 def _short_hash(content: str) -> str:

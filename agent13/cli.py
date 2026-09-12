@@ -309,7 +309,7 @@ Provider names are read from ~/.agent13/config.toml
     parser.add_argument(
         "--skills",
         action="store_true",
-        help="Include discovered skills in the system prompt",
+        help="Show discovered skills in the system prompt and enable the skill tool",
     )
     parser.add_argument(
         "--journal",
@@ -419,6 +419,15 @@ Provider names are read from ~/.agent13/config.toml
             "Can be used multiple times: --read file1.py --read file2.md"
         ),
     )
+    parser.add_argument(
+        "--io-format",
+        choices=["text", "json"],
+        default="text",
+        help=(
+            "I/O format: 'text' (default, human-readable) or 'json' "
+            "(NDJSON pipe mode: read JSON turns from stdin, emit JSON events on stdout)"
+        ),
+    )
 
     args = parser.parse_args()
     # Track whether --clipboard was explicitly passed (vs default)
@@ -450,6 +459,23 @@ Provider names are read from ~/.agent13/config.toml
             )
             sys.exit(1)
         args.repl = True
+
+    # Pipe mode (--io-format json) conflict validation
+    if args.io_format == "json":
+        _pipe_conflicts = []
+        if args.prompt:
+            _pipe_conflicts.append("-p/--prompt (prompts come from stdin)")
+        if args.repl:
+            _pipe_conflicts.append("--repl")
+        if args.output:
+            _pipe_conflicts.append("--output (stdout is the protocol channel)")
+        if _pipe_conflicts:
+            print(
+                f"Error: --io-format json cannot be used with: "
+                f"{', '.join(_pipe_conflicts)}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
 
     # Ensure default skills are available for new users
     ensure_default_skills()
@@ -540,9 +566,19 @@ Provider names are read from ~/.agent13/config.toml
     )
 
     # Initialize client
-    client = create_client(
-        base_url, api_key, read_timeout=read_timeout, connect_timeout=connect_timeout
-    )
+    if args.provider == "fake":
+        # Built-in offline provider: deterministic, no network. The fake
+        # client's models.list() returns empty, so the model fetch/select
+        # steps below fall through to using --model as-is (or "fake").
+        from agent13.fake import FakeOpenAIClient
+
+        if not args.model:
+            args.model = "fake"
+        client = FakeOpenAIClient()
+    else:
+        client = create_client(
+            base_url, api_key, read_timeout=read_timeout, connect_timeout=connect_timeout
+        )
 
     # Fetch models
     try:
@@ -634,6 +670,42 @@ Provider names are read from ~/.agent13/config.toml
         skills_section = get_skills_section(skill_manager.skills)
         if skills_section:
             system_prompt = f"{system_prompt}\n\n{skills_section}"
+
+    # Pipe mode (--io-format json)
+    if args.io_format == "json":
+        from agent13.pipemode import run_pipe_mode
+
+        if include_skills and skill_manager.skills:
+            skill_manager_ctx.set(skill_manager)
+        try:
+            await run_pipe_mode(
+                client=client,
+                model=model,
+                provider=provider_name,
+                debug=args.debug,
+                prompt_manager=prompt_manager,
+                system_prompt=system_prompt,
+                journal_mode=args.journal,
+                remove_reasoning=args.remove_reasoning,
+                devel_mode=args.devel,
+                skills_mode=include_skills and bool(skill_manager.skills),
+                skill_manager=skill_manager,
+                continue_session=args.continue_session,
+                read_files=args.read,
+                polite_interval=args.polite,
+                priming_enabled=args.priming_prompt,
+                auto_compact_threshold=args.auto_compact_threshold
+                if args.auto_compact_threshold is not None
+                else cfg.auto_compact_threshold,
+                auto_compact_max_iterations=args.auto_compact_max
+                if args.auto_compact_max is not None
+                else cfg.auto_compact_max_iterations,
+            )
+        finally:
+            await client.close()
+            await close_tracked_asyncgens()
+        log_session_end()
+        sys.exit(0)
 
     # Batch mode
     if args.prompt:
@@ -782,12 +854,14 @@ def main():
 
 
 def _run_cli():
-    # Check if running in batch, REPL, or output mode
+    # Check if running in batch, REPL, output, or pipe mode
     is_batch = "-p" in sys.argv or "--prompt" in sys.argv
     is_repl = "--repl" in sys.argv
     is_output = "--output" in sys.argv
+    _io_fmt_idx = sys.argv.index("--io-format") + 1 if "--io-format" in sys.argv else -1
+    is_pipe = _io_fmt_idx >= 0 and _io_fmt_idx < len(sys.argv) and sys.argv[_io_fmt_idx] == "json"
 
-    if is_batch or is_repl or is_output:
+    if is_batch or is_repl or is_output or is_pipe:
         # Batch mode - run async directly
         try:
             asyncio.run(async_main())

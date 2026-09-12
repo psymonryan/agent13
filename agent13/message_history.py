@@ -364,6 +364,8 @@ class MessageHistory:
         A turn is incomplete if:
         - Last message is assistant with tool_calls (tools not yet executed)
         - Last message is tool (results not yet processed by LLM)
+        - Last message is user (no assistant reply — e.g. quit while
+          streaming; the next user message would be consecutive users)
 
         Returns:
             True if the turn is incomplete and needs to be resumed.
@@ -379,6 +381,10 @@ class MessageHistory:
 
         # Case 2: Tool result waiting for LLM to process
         if last_msg.get("role") == "tool":
+            return True
+
+        # Case 3: User message with no assistant reply
+        if last_msg.get("role") == "user":
             return True
 
         return False

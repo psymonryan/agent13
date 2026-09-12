@@ -261,7 +261,7 @@ class Config:
     bell_enabled: bool = True  # Whether bell is active
     bell_command: str = ""  # External command to run instead of terminal bell
     cursor_blink: bool = False  # Whether input cursor blinks (false = tmux-friendly)
-    auto_compact_threshold: int = 0  # Token threshold for auto-compact (0 = disabled)
+    auto_compact_threshold: int = 220000  # Token threshold for auto-compact (0 = disabled)
     auto_compact_max_iterations: int = 3  # Max compact-and-continue cycles per turn
     vision: Optional[VisionConfig] = None  # Vision/image routing config
 
@@ -302,37 +302,37 @@ class Config:
         # Parse providers
         providers_data = data.get("providers", [])
         if not isinstance(providers_data, list):
-            raise ValueError("'providers' must be a list")
+            raise ConfigFileError("'providers' must be a list")
 
         for i, provider_data in enumerate(providers_data):
             if not isinstance(provider_data, dict):
-                raise ValueError(f"Provider {i} must be a table/dict")
+                raise ConfigFileError(f"Provider {i} must be a table/dict")
 
             name = provider_data.get("name")
             if not name:
-                raise ValueError(f"Provider {i} missing 'name' field")
+                raise ConfigFileError(f"Provider {i} missing 'name' field")
             if not isinstance(name, str):
-                raise ValueError(f"Provider {i} 'name' must be a string")
+                raise ConfigFileError(f"Provider {i} 'name' must be a string")
 
             api_base = provider_data.get("api_base")
             if not api_base:
-                raise ValueError(f"Provider '{name}' missing 'api_base' field")
+                raise ConfigFileError(f"Provider '{name}' missing 'api_base' field")
             if not isinstance(api_base, str):
-                raise ValueError(f"Provider '{name}' 'api_base' must be a string")
+                raise ConfigFileError(f"Provider '{name}' 'api_base' must be a string")
 
             api_key_env_var = provider_data.get("api_key_env_var", "")
             if not isinstance(api_key_env_var, str):
-                raise ValueError(
+                raise ConfigFileError(
                     f"Provider '{name}' 'api_key_env_var' must be a string"
                 )
 
             read_timeout = provider_data.get("read_timeout", 2400.0)
             if not isinstance(read_timeout, (int, float)):
-                raise ValueError(f"Provider '{name}' 'read_timeout' must be a number")
+                raise ConfigFileError(f"Provider '{name}' 'read_timeout' must be a number")
 
             connect_timeout = provider_data.get("connect_timeout", 30.0)
             if not isinstance(connect_timeout, (int, float)):
-                raise ValueError(
+                raise ConfigFileError(
                     f"Provider '{name}' 'connect_timeout' must be a number"
                 )
 
@@ -349,11 +349,11 @@ class Config:
         # Parse MCP servers
         mcp_data = data.get("mcp_servers", [])
         if not isinstance(mcp_data, list):
-            raise ValueError("'mcp_servers' must be a list")
+            raise ConfigFileError("'mcp_servers' must be a list")
 
         for i, server_data in enumerate(mcp_data):
             if not isinstance(server_data, dict):
-                raise ValueError(f"MCP server {i} must be a table/dict")
+                raise ConfigFileError(f"MCP server {i} must be a table/dict")
 
             config_obj = MCPServerConfig(
                 name=server_data.get("name"),
@@ -373,7 +373,7 @@ class Config:
             # Validate and collect errors
             errors = config_obj.validate()
             if errors:
-                raise ValueError(
+                raise ConfigFileError(
                     f"MCP server '{config_obj.name}' config errors: {errors}"
                 )
 
@@ -434,15 +434,42 @@ class Config:
             if isinstance(bc, str):
                 config.bell_command = bc
 
-        # Parse [auto_compact] section
-        auto_compact_data = data.get("auto_compact", {})
-        if isinstance(auto_compact_data, dict):
-            ac_threshold = auto_compact_data.get("threshold", 0)
-            if isinstance(ac_threshold, (int, float)) and ac_threshold >= 0:
-                config.auto_compact_threshold = int(ac_threshold)
-            ac_max = auto_compact_data.get("max_iterations", 3)
-            if isinstance(ac_max, (int, float)) and ac_max >= 1:
-                config.auto_compact_max_iterations = int(ac_max)
+        # Parse [auto_compact] section. Fail fast on a bad value - a user
+        # typo like threshold = "220k" must surface at startup, never be
+        # silently dropped. Absent keys fall back to the dataclass defaults.
+        if "auto_compact" in data:
+            auto_compact_data = data["auto_compact"]
+            if not isinstance(auto_compact_data, dict):
+                raise ConfigFileError("[auto_compact] must be a table")
+            if "threshold" in auto_compact_data:
+                threshold = auto_compact_data["threshold"]
+                if isinstance(threshold, bool) or not isinstance(
+                    threshold, (int, float)
+                ):
+                    raise ConfigFileError(
+                        f"[auto_compact] 'threshold' must be an integer number "
+                        f"of tokens, got {threshold!r}. "
+                        f"Use e.g. threshold = 220000 (or 0 to disable)."
+                    )
+                if threshold < 0:
+                    raise ConfigFileError(
+                        f"[auto_compact] 'threshold' must be >= 0, got {threshold}"
+                    )
+                config.auto_compact_threshold = int(threshold)
+            if "max_iterations" in auto_compact_data:
+                max_iter = auto_compact_data["max_iterations"]
+                if isinstance(max_iter, bool) or not isinstance(
+                    max_iter, (int, float)
+                ):
+                    raise ConfigFileError(
+                        f"[auto_compact] 'max_iterations' must be an integer, "
+                        f"got {max_iter!r}. Use e.g. max_iterations = 3."
+                    )
+                if max_iter < 1:
+                    raise ConfigFileError(
+                        f"[auto_compact] 'max_iterations' must be >= 1, got {max_iter}"
+                    )
+                config.auto_compact_max_iterations = int(max_iter)
 
         # Parse [ui] section
         ui_data = data.get("ui", {})
@@ -456,16 +483,16 @@ class Config:
         if isinstance(vision_data, dict):
             mode = vision_data.get("mode", "sidecar")
             if not isinstance(mode, str) or mode not in ("sidecar", "native", "auto"):
-                raise ValueError(f"[vision] 'mode' must be 'sidecar', 'native', or 'auto', got '{mode}'")
+                raise ConfigFileError(f"[vision] 'mode' must be 'sidecar', 'native', or 'auto', got '{mode}'")
             sidecar_provider = vision_data.get("sidecar_provider", "")
             if not isinstance(sidecar_provider, str):
-                raise ValueError("[vision] 'sidecar_provider' must be a string")
+                raise ConfigFileError("[vision] 'sidecar_provider' must be a string")
             sidecar_model = vision_data.get("sidecar_model", "")
             if not isinstance(sidecar_model, str):
-                raise ValueError("[vision] 'sidecar_model' must be a string")
+                raise ConfigFileError("[vision] 'sidecar_model' must be a string")
             patterns = vision_data.get("native_vision_patterns", [])
             if not isinstance(patterns, list):
-                raise ValueError("[vision] 'native_vision_patterns' must be a list")
+                raise ConfigFileError("[vision] 'native_vision_patterns' must be a list")
             config.vision = VisionConfig(
                 mode=mode,
                 sidecar_provider=sidecar_provider,
@@ -517,12 +544,12 @@ class Config:
         for provider in self.providers:
             # Check for duplicate names
             if provider.name in seen_names:
-                raise ValueError(f"Duplicate provider name: {provider.name}")
+                raise ConfigFileError(f"Duplicate provider name: {provider.name}")
             seen_names.add(provider.name)
 
             # Validate name format (alphanumeric, underscore, hyphen)
             if not re.match(r"^[a-zA-Z0-9_-]+$", provider.name):
-                raise ValueError(
+                raise ConfigFileError(
                     f"Provider name '{provider.name}' must be alphanumeric with underscores/hyphens only"
                 )
 
@@ -530,11 +557,11 @@ class Config:
             try:
                 parsed = urllib.parse.urlparse(provider.api_base)
                 if not parsed.scheme or not parsed.netloc:
-                    raise ValueError(
+                    raise ConfigFileError(
                         f"Provider '{provider.name}' has invalid api_base URL: {provider.api_base}"
                     )
             except Exception as e:
-                raise ValueError(
+                raise ConfigFileError(
                     f"Provider '{provider.name}' has invalid api_base: {e}"
                 )
 
@@ -635,6 +662,11 @@ def resolve_provider_arg(provider_arg: str) -> tuple[str, str, float, float]:
         ValueError: If provider name not found in config
         ValueError: If required API key environment variable not set
     """
+    # Built-in offline provider (no config entry, no network). base_url /
+    # api_key are sentinels; cli.py swaps in FakeOpenAIClient for this name.
+    if provider_arg == "fake":
+        return "fake", "fake", 0.0, 0.0
+
     # Check if it looks like a URL
     if provider_arg.startswith("http://") or provider_arg.startswith("https://"):
         # Direct URL - use OPENAI_API_KEY

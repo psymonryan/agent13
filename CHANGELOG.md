@@ -5,6 +5,32 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.2] - 2026-09-12
+
+### Changed
+
+### Added
+
+- Add initial code for pipe mode: --io-format json NDJSON protocol (support for running in claude-like mode)
+- Add built-in offline fake provider for NDJSON pipe testing
+
+### Fixed
+
+- fix: /pause /quit --continue /resume cycle - preserve mid-turn state on quit (StopReason)
+- fix: isolate ssh child in own process group (no self-kill on remote timeout)
+- fix(windows): sanitize bare save names to flat filenames
+- fix: explicit UTF-8 on all file I/O - UnicodeEncodeError crash on Windows (cp1252 locale)
+
+### Changed
+
+- skill tool now ratchets on when you invoke a skill (`/skill-name`), enabling it for the rest of the session so the skill can load other skills by name. It's off by default (or on from the start with `--skills`)
+- Auto-compact is now on by default (set to 220k with Qwen-3.8 in mind)
+- config: stricter fail fast on invalid values during parsing
+- sandbox: clarify /sandbox status - show Pinned yes/no instead of pinned mode value
+- honour stop() in create_task→run window; centralize interrupt repair; move JIT repair to _llm_turn entry
+- extract REPL wait_stream_exit() helper; headless exit uses StopReason.QUIT
+- updated libraries in preparation for release
+
 ## [0.4.1] - 2026-09-03
 
 ### Changed

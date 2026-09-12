@@ -111,13 +111,19 @@ class MockAgent:
         self.session_date = datetime.date.today().isoformat()
         # Provide pause_state and status like real Agent
         from agent13.core import PauseState, AgentStatus
+
         self.pause_state = PauseState.RUNNING
         self.status = AgentStatus.IDLE
         self.PauseState = PauseState
         self.AgentStatus = AgentStatus
         # Status-related attributes (needed by gather_status)
         self.mcp = None
-        self.tool_stats = type("ToolStats", (), {"total_successes": 0, "total_calls": 0, "calls": {}, "successes": {}})()
+        self.tool_stats = type(
+            "ToolStats",
+            (),
+            {"total_successes": 0, "total_calls": 0, "calls": {}, "successes": {}},
+        )()
+        self._incomplete_turn_loaded = False
         self.journal_mode = False
         self.devel_mode = False
         self.skills_mode = False
@@ -125,8 +131,21 @@ class MockAgent:
         self._mcp_server_configs = {}
 
     @property
+    def has_incomplete_turn(self) -> bool:
+        return self._incomplete_turn_loaded
+
+    def mark_incomplete_turn(self, incomplete: bool) -> None:
+        self._incomplete_turn_loaded = incomplete
+
+    def request_continue_incomplete(self) -> None:
+        self._calls.append(("request_continue_incomplete",))
+
+    @property
     def is_idle(self) -> bool:
-        return self.pause_state == self.PauseState.RUNNING and self.status == self.AgentStatus.IDLE
+        return (
+            self.pause_state == self.PauseState.RUNNING
+            and self.status == self.AgentStatus.IDLE
+        )
 
     def on_event(self, handler):
         self._handlers.append(handler)
@@ -139,7 +158,9 @@ class MockAgent:
         except asyncio.CancelledError:
             pass
 
-    async def add_message(self, text, priority=False, interrupt=False, kind="prompt", data=None):
+    async def add_message(
+        self, text, priority=False, interrupt=False, kind="prompt", data=None
+    ):
         self._calls.append(("add_message", text, priority, interrupt, kind, data))
         msg = {"role": "user", "content": text}
         if interrupt:
@@ -147,6 +168,7 @@ class MockAgent:
         self.messages.append(msg)
         # Simulate agent becoming busy (like real Agent does)
         from agent13.core import AgentStatus
+
         self.status = AgentStatus.PROCESSING
 
     def clear_messages(self):
@@ -168,7 +190,7 @@ class MockAgent:
         self.is_paused = False
         self.pause_state = self.PauseState.RUNNING
 
-    def stop(self):
+    def stop(self, reason=None):
         self._calls.append(("stop",))
 
     async def request_load(self, path):
@@ -220,7 +242,7 @@ class MockHistoryStore:
 # ── Scenario runner ──────────────────────────────────────────────────
 
 
-async def run_scenario(inputs, prompt_manager=None):
+async def run_scenario(inputs, prompt_manager=None, agent_config=None):
     """Run a REPL scenario with scripted inputs.
 
     Args:
@@ -231,6 +253,8 @@ async def run_scenario(inputs, prompt_manager=None):
         prompt_manager: Optional PromptManager to inject (e.g. backed by a
                 temp file for hermetic prompt lookups). Defaults to the
                 real PromptManager (~/.agent13/prompts.yaml).
+        agent_config: Optional callable invoked with the mock agent right
+                after creation (e.g. to set the incomplete-turn flag).
 
     Returns:
         (output_text, agent) tuple — captured stdout and mock agent
@@ -241,20 +265,16 @@ async def run_scenario(inputs, prompt_manager=None):
     def capture_agent(*args, **kwargs):
         agent = MockAgent()
         created_agents.append(agent)
+        if agent_config is not None:
+            agent_config(agent)
         return agent
 
     captured_stdout = io.StringIO()
 
     with ExitStack() as stack:
-        stack.enter_context(
-            patch("agent13.repl.Agent", side_effect=capture_agent)
-        )
-        stack.enter_context(
-            patch("agent13.repl.History", MockHistoryStore)
-        )
-        stack.enter_context(
-            patch("agent13.repl.get_filtered_tools", return_value=[])
-        )
+        stack.enter_context(patch("agent13.repl.Agent", side_effect=capture_agent))
+        stack.enter_context(patch("agent13.repl.History", MockHistoryStore))
+        stack.enter_context(patch("agent13.repl.get_filtered_tools", return_value=[]))
         stack.enter_context(
             patch(
                 "agent13.repl.get_config",
@@ -262,9 +282,7 @@ async def run_scenario(inputs, prompt_manager=None):
             )
         )
         stack.enter_context(patch("agent13.repl.RichDisplay"))
-        stack.enter_context(
-            patch("builtins.input", side_effect=feeder.do_input)
-        )
+        stack.enter_context(patch("builtins.input", side_effect=feeder.do_input))
         stack.enter_context(
             patch.object(sys.stdin, "readline", side_effect=feeder.do_stdin_readline)
         )
@@ -462,17 +480,13 @@ class TestMultiLineMode:
 
     async def test_multi_shows_prompt(self):
         """User sees multi-line mode confirmation."""
-        output, agent = await run_scenario(
-            ["/multi", "line", ".", "", "/quit"]
-        )
+        output, agent = await run_scenario(["/multi", "line", ".", "", "/quit"])
 
         assert "Multi-line mode" in output
 
     async def test_multi_records_in_history(self):
         """Multi-line message is recorded in History as single entry."""
-        output, agent = await run_scenario(
-            ["/multi", "a", "b", ".", "", "/quit"]
-        )
+        output, agent = await run_scenario(["/multi", "a", "b", ".", "", "/quit"])
 
         call = find_call(agent, "add_message")
         assert call[1] == "a\nb"
@@ -496,9 +510,7 @@ class TestBackslashContinuation:
 
     async def test_backslash_strips_backslash(self):
         """Trailing backslash is removed from the assembled message."""
-        output, agent = await run_scenario(
-            ["hello \\", "world", ".", "", "/quit"]
-        )
+        output, agent = await run_scenario(["hello \\", "world", ".", "", "/quit"])
 
         call = find_call(agent, "add_message")
         # Should NOT contain a backslash
@@ -507,11 +519,13 @@ class TestBackslashContinuation:
 
     async def test_backslash_shows_mode_indicator(self):
         """User sees confirmation that backslash continuation is active."""
-        output, agent = await run_scenario(
-            ["test \\", "line", ".", "", "/quit"]
-        )
+        output, agent = await run_scenario(["test \\", "line", ".", "", "/quit"])
 
-        assert "Multi-line" in output or "\\\\" in output or "continuation" in output.lower()
+        assert (
+            "Multi-line" in output
+            or "\\\\" in output
+            or "continuation" in output.lower()
+        )
 
     async def test_backslash_multiple_continuations(self):
         """Three lines via backslash — only the FIRST backslash triggers
@@ -559,9 +573,7 @@ class TestMultiLineWithPrefix:
 
     async def test_multi_slash_not_interpreted_as_command(self):
         """/multi then '/something' — sent as message, not command."""
-        output, agent = await run_scenario(
-            ["/multi", "/something", ".", "", "/quit"]
-        )
+        output, agent = await run_scenario(["/multi", "/something", ".", "", "/quit"])
 
         call = find_call(agent, "add_message")
         assert call is not None
@@ -588,9 +600,7 @@ class TestMultiLineCancellation:
 
     async def test_multi_ctrl_c_exits(self):
         """Ctrl+C in multi-line — cancels buffer and exits REPL."""
-        output, agent = await run_scenario(
-            ["/multi", "some text", INT]
-        )
+        output, agent = await run_scenario(["/multi", "some text", INT])
 
         assert "cancelled" in output.lower() or "Multi-line" in output
         assert "Goodbye!" in output
@@ -598,9 +608,7 @@ class TestMultiLineCancellation:
     async def test_multi_empty_dot_cancels(self):
         """'.' with empty buffer — silent cancel, back to normal."""
         # /multi, then immediately "." — buffer is empty
-        output, agent = await run_scenario(
-            ["/multi", ".", "/quit"]
-        )
+        output, agent = await run_scenario(["/multi", ".", "/quit"])
 
         assert "cancelled" in output.lower() or "empty" in output.lower()
         # Should NOT have sent a message
@@ -609,9 +617,7 @@ class TestMultiLineCancellation:
 
     async def test_multi_slash_cancel(self):
         """/cancel during multi-line — cancels and returns to prompt."""
-        output, agent = await run_scenario(
-            ["/multi", "line one", "/cancel", "/quit"]
-        )
+        output, agent = await run_scenario(["/multi", "line one", "/cancel", "/quit"])
 
         assert "cancelled" in output.lower()
         call = find_call(agent, "add_message")
@@ -619,9 +625,7 @@ class TestMultiLineCancellation:
 
     async def test_multi_slash_quit_exits(self):
         """/quit during multi-line — exits REPL."""
-        output, agent = await run_scenario(
-            ["/multi", "line one", "/quit"]
-        )
+        output, agent = await run_scenario(["/multi", "line one", "/quit"])
 
         assert "Goodbye!" in output
         # Buffer should NOT be sent
@@ -651,9 +655,7 @@ class TestEOF:
 
     async def test_eof_in_multi_mode(self):
         """Ctrl+D during multi-line — cancels and exits."""
-        output, agent = await run_scenario(
-            ["/multi", "some text", EOF]
-        )
+        output, agent = await run_scenario(["/multi", "some text", EOF])
 
         assert "Goodbye!" in output
         # No traceback
@@ -676,9 +678,7 @@ class TestClearCommand:
 
     async def test_clear_while_processing(self):
         """/clear while processing — preserves history, prints message."""
-        output, agent = await run_scenario(
-            ["hello", "", "/clear", "/quit"]
-        )
+        output, agent = await run_scenario(["hello", "", "/clear", "/quit"])
 
         call = find_call(agent, "request_clear")
         assert call is None
@@ -715,18 +715,14 @@ class TestHistoryCommand:
 
     async def test_history_after_send(self):
         """/history after sending a message — shows the message."""
-        output, agent = await run_scenario(
-            ["hello world", "", "/history", "/quit"]
-        )
+        output, agent = await run_scenario(["hello world", "", "/history", "/quit"])
 
         assert "Message history" in output
         assert "hello world" in output
 
     async def test_history_shows_groups(self):
         """/history shows grouped messages."""
-        output, agent = await run_scenario(
-            ["first message", "", "/history", "/quit"]
-        )
+        output, agent = await run_scenario(["first message", "", "/history", "/quit"])
 
         assert "groups" in output.lower()
 
@@ -747,9 +743,7 @@ class TestQueueCommand:
         """/queue after sending priority message — may show items."""
         # Priority messages are sent immediately (not queued), so
         # the queue might be empty. This tests the command works.
-        output, agent = await run_scenario(
-            ["!priority", "", "/queue", "/quit"]
-        )
+        output, agent = await run_scenario(["!priority", "", "/queue", "/quit"])
 
         # Command should not error
         assert "Unknown command" not in output
@@ -775,9 +769,7 @@ class TestDeleteCommand:
 
     async def test_delete_history_group(self):
         """/delete h 1 after sending a message."""
-        output, agent = await run_scenario(
-            ["hello", "", "/delete h 1", "/quit"]
-        )
+        output, agent = await run_scenario(["hello", "", "/delete h 1", "/quit"])
 
         assert "Deleted" in output
 
@@ -792,9 +784,7 @@ class TestDeleteCommand:
     async def test_delete_queue_item(self):
         """/delete q N — removes queue item."""
         # Add something to the queue manually, then delete
-        output, agent = await run_scenario(
-            ["/delete q 1", "/quit"]
-        )
+        output, agent = await run_scenario(["/delete q 1", "/quit"])
 
         assert "Invalid" in output or "empty" in output.lower()
 
@@ -825,9 +815,7 @@ class TestDeleteCommand:
     async def test_delete_queue_last(self):
         """/delete q last — deletes last queue item."""
         # Queue is empty, should error gracefully
-        output, agent = await run_scenario(
-            ["/delete q last", "/quit"]
-        )
+        output, agent = await run_scenario(["/delete q last", "/quit"])
 
         assert "No items" in output or "Invalid" in output
 
@@ -923,9 +911,7 @@ class TestStatusCommand:
 
     async def test_status_shows_message_count(self):
         """/status shows message count."""
-        output, agent = await run_scenario(
-            ["hello", "", "/status", "/quit"]
-        )
+        output, agent = await run_scenario(["hello", "", "/status", "/quit"])
 
         assert "messages" in output.lower()
 
@@ -1080,6 +1066,25 @@ class TestPauseResume:
         assert "Not paused" in output
 
 
+class TestResumeIncompleteTurn:
+    """/resume on a loaded context that ended mid-turn (no pause involved)."""
+
+    async def test_resume_incomplete_turn_signals_continue(self):
+        """/resume with a loaded incomplete turn signals run() to continue —
+        and the /resume text is NOT sent as a phantom user message."""
+
+        def setup(agent):
+            agent.mark_incomplete_turn(True)
+
+        output, agent = await run_scenario(["/resume", "", "/quit"], agent_config=setup)
+
+        assert "Continuing incomplete turn..." in output
+        assert find_call(agent, "request_continue_incomplete") is not None
+        # No phantom message: the command text must not leak into the queue
+        texts = [c[1] for c in find_calls(agent, "add_message")]
+        assert "/resume" not in texts
+
+
 # ── Edge cases ─────────────────────────────────────────────────────
 
 
@@ -1104,9 +1109,7 @@ class TestEdgeCases:
         so assembled text ending with \\ would re-enter multi-line mode.
         Fixed: added 'and not from_multi' to the backslash check.
         """
-        output, agent = await run_scenario(
-            ["/multi", "line with \\", ".", "", "/quit"]
-        )
+        output, agent = await run_scenario(["/multi", "line with \\", ".", "", "/quit"])
 
         # Message should be sent — trailing backslash is literal content
         call = find_call(agent, "add_message")
@@ -1117,9 +1120,7 @@ class TestEdgeCases:
 
     async def test_history_adds_slash_commands(self):
         """Slash commands are NOT added to history (only messages)."""
-        output, agent = await run_scenario(
-            ["/help", "real message", "", "/quit"]
-        )
+        output, agent = await run_scenario(["/help", "real message", "", "/quit"])
 
         # /help should not have been recorded as a message
         calls = find_calls(agent, "add_message")
@@ -1128,9 +1129,7 @@ class TestEdgeCases:
 
     async def test_empty_prefix_then_real_message(self):
         """Bare '!!' then real message — only real message sent."""
-        output, agent = await run_scenario(
-            ["!!", "actual content", "", "/quit"]
-        )
+        output, agent = await run_scenario(["!!", "actual content", "", "/quit"])
 
         calls = find_calls(agent, "add_message")
         assert len(calls) == 1
@@ -1165,15 +1164,9 @@ async def run_scenario_persistence(inputs, tmp_path):
     saves_dir.mkdir(exist_ok=True)
 
     with ExitStack() as stack:
-        stack.enter_context(
-            patch("agent13.repl.Agent", side_effect=capture_agent)
-        )
-        stack.enter_context(
-            patch("agent13.repl.History", MockHistoryStore)
-        )
-        stack.enter_context(
-            patch("agent13.repl.get_filtered_tools", return_value=[])
-        )
+        stack.enter_context(patch("agent13.repl.Agent", side_effect=capture_agent))
+        stack.enter_context(patch("agent13.repl.History", MockHistoryStore))
+        stack.enter_context(patch("agent13.repl.get_filtered_tools", return_value=[]))
         stack.enter_context(
             patch(
                 "agent13.repl.get_config",
@@ -1181,13 +1174,9 @@ async def run_scenario_persistence(inputs, tmp_path):
             )
         )
         stack.enter_context(patch("agent13.repl.RichDisplay"))
+        stack.enter_context(patch("builtins.input", side_effect=feeder.do_input))
         stack.enter_context(
-            patch("builtins.input", side_effect=feeder.do_input)
-        )
-        stack.enter_context(
-            patch.object(
-                sys.stdin, "readline", side_effect=feeder.do_stdin_readline
-            )
+            patch.object(sys.stdin, "readline", side_effect=feeder.do_stdin_readline)
         )
         stack.enter_context(patch("sys.stdout", captured_stdout))
         stack.enter_context(patch("readline.read_history_file"))
@@ -1197,9 +1186,7 @@ async def run_scenario_persistence(inputs, tmp_path):
         stack.enter_context(patch("os.makedirs"))
         # Persistence mocks - use real tmp_path
         stack.enter_context(
-            patch(
-                "agent13.persistence.get_saves_dir", return_value=saves_dir
-            )
+            patch("agent13.persistence.get_saves_dir", return_value=saves_dir)
         )
 
         from agent13.repl import run_repl
@@ -1236,18 +1223,14 @@ class TestSaveCommand:
 
     async def test_save_no_name_shows_usage(self, tmp_path):
         """User types /save with no name - sees usage with -y flag info."""
-        output, _ = await run_scenario_persistence(
-            ["/save", "/quit"], tmp_path
-        )
+        output, _ = await run_scenario_persistence(["/save", "/quit"], tmp_path)
 
         assert "Usage" in output
         assert "-y" in output
 
     async def test_save_invalid_name(self, tmp_path):
         """User types /save with name starting with dash - sees error."""
-        output, _ = await run_scenario_persistence(
-            ["/save -bad", "/quit"], tmp_path
-        )
+        output, _ = await run_scenario_persistence(["/save -bad", "/quit"], tmp_path)
 
         assert "Error" in output or "valid" in output.lower()
 
@@ -1294,9 +1277,7 @@ class TestSaveCommand:
 
     async def test_save_empty_conversation(self, tmp_path):
         """User saves with no messages - still works."""
-        output, _ = await run_scenario_persistence(
-            ["/save empty", "/quit"], tmp_path
-        )
+        output, _ = await run_scenario_persistence(["/save empty", "/quit"], tmp_path)
 
         assert "Saved" in output
         assert "0 messages" in output
@@ -1316,9 +1297,7 @@ class TestLoadCommand:
         (saves_dir / "project-a.ctx").write_text("{}")
         (saves_dir / "project-b.ctx").write_text("{}")
 
-        output, _ = await run_scenario_persistence(
-            ["/load", "/quit"], tmp_path
-        )
+        output, _ = await run_scenario_persistence(["/load", "/quit"], tmp_path)
 
         assert "Available saves" in output
         assert "project-a" in output
@@ -1326,9 +1305,7 @@ class TestLoadCommand:
 
     async def test_load_no_saves_found(self, tmp_path):
         """User types /load with no name and no saves exist."""
-        output, _ = await run_scenario_persistence(
-            ["/load", "/quit"], tmp_path
-        )
+        output, _ = await run_scenario_persistence(["/load", "/quit"], tmp_path)
 
         assert "No saves found" in output
 
@@ -1493,13 +1470,12 @@ class TestLoadCommand:
         saves_dir.mkdir(exist_ok=True)
         (saves_dir / "corrupt.ctx").write_text("not valid json {{{")
 
-        output, _ = await run_scenario_persistence(
-            ["/load corrupt", "/quit"], tmp_path
-        )
+        output, _ = await run_scenario_persistence(["/load corrupt", "/quit"], tmp_path)
 
         assert "Error" in output
         # Should NOT have crashed
         assert "Traceback" not in output
+
 
 # -- Feature: /model command ---------------------------------------------
 
@@ -1521,15 +1497,9 @@ async def run_scenario_with_models(inputs, model_names):
     captured_stdout = io.StringIO()
 
     with ExitStack() as stack:
-        stack.enter_context(
-            patch("agent13.repl.Agent", side_effect=capture_agent)
-        )
-        stack.enter_context(
-            patch("agent13.repl.History", MockHistoryStore)
-        )
-        stack.enter_context(
-            patch("agent13.repl.get_filtered_tools", return_value=[])
-        )
+        stack.enter_context(patch("agent13.repl.Agent", side_effect=capture_agent))
+        stack.enter_context(patch("agent13.repl.History", MockHistoryStore))
+        stack.enter_context(patch("agent13.repl.get_filtered_tools", return_value=[]))
         stack.enter_context(
             patch(
                 "agent13.repl.get_config",
@@ -1537,9 +1507,7 @@ async def run_scenario_with_models(inputs, model_names):
             )
         )
         stack.enter_context(patch("agent13.repl.RichDisplay"))
-        stack.enter_context(
-            patch("builtins.input", side_effect=feeder.do_input)
-        )
+        stack.enter_context(patch("builtins.input", side_effect=feeder.do_input))
         stack.enter_context(
             patch.object(sys.stdin, "readline", side_effect=feeder.do_stdin_readline)
         )
@@ -1672,15 +1640,9 @@ async def run_scenario_with_provider_patches(inputs, provider_side_effect=None):
     mock_models_list = ["mock-alpha", "mock-beta"]
 
     with ExitStack() as stack:
-        stack.enter_context(
-            patch("agent13.repl.Agent", side_effect=capture_agent)
-        )
-        stack.enter_context(
-            patch("agent13.repl.History", MockHistoryStore)
-        )
-        stack.enter_context(
-            patch("agent13.repl.get_filtered_tools", return_value=[])
-        )
+        stack.enter_context(patch("agent13.repl.Agent", side_effect=capture_agent))
+        stack.enter_context(patch("agent13.repl.History", MockHistoryStore))
+        stack.enter_context(patch("agent13.repl.get_filtered_tools", return_value=[]))
         stack.enter_context(
             patch(
                 "agent13.repl.get_config",
@@ -1688,9 +1650,7 @@ async def run_scenario_with_provider_patches(inputs, provider_side_effect=None):
             )
         )
         stack.enter_context(patch("agent13.repl.RichDisplay"))
-        stack.enter_context(
-            patch("builtins.input", side_effect=feeder.do_input)
-        )
+        stack.enter_context(patch("builtins.input", side_effect=feeder.do_input))
         stack.enter_context(
             patch.object(sys.stdin, "readline", side_effect=feeder.do_stdin_readline)
         )
@@ -1701,11 +1661,19 @@ async def run_scenario_with_provider_patches(inputs, provider_side_effect=None):
         stack.enter_context(patch("readline.write_history_file"))
         stack.enter_context(patch("os.makedirs"))
         stack.enter_context(
-            patch("agent13.repl.resolve_provider_arg", side_effect=provider_mock.side_effect if provider_side_effect else provider_mock)
+            patch(
+                "agent13.repl.resolve_provider_arg",
+                side_effect=provider_mock.side_effect
+                if provider_side_effect
+                else provider_mock,
+            )
         )
         # Mock resolve_provider_selection to pass through the name directly
         stack.enter_context(
-            patch("agent13.repl.resolve_provider_selection", side_effect=lambda choice: choice)
+            patch(
+                "agent13.repl.resolve_provider_selection",
+                side_effect=lambda choice: choice,
+            )
         )
         stack.enter_context(
             patch("agent13.repl.create_client", return_value=MagicMock())
@@ -1782,13 +1750,21 @@ class TestProviderCommand:
         with ExitStack() as stack:
             stack.enter_context(patch("agent13.repl.Agent", side_effect=capture_agent))
             stack.enter_context(patch("agent13.repl.History", MockHistoryStore))
-            stack.enter_context(patch("agent13.repl.get_filtered_tools", return_value=[]))
             stack.enter_context(
-                patch("agent13.repl.get_config", return_value=MagicMock(mcp_servers=None))
+                patch("agent13.repl.get_filtered_tools", return_value=[])
+            )
+            stack.enter_context(
+                patch(
+                    "agent13.repl.get_config", return_value=MagicMock(mcp_servers=None)
+                )
             )
             stack.enter_context(patch("agent13.repl.RichDisplay"))
             stack.enter_context(patch("builtins.input", side_effect=feeder.do_input))
-            stack.enter_context(patch.object(sys.stdin, "readline", side_effect=feeder.do_stdin_readline))
+            stack.enter_context(
+                patch.object(
+                    sys.stdin, "readline", side_effect=feeder.do_stdin_readline
+                )
+            )
             stack.enter_context(patch("sys.stdout", captured_stdout))
             stack.enter_context(patch("readline.read_history_file"))
             stack.enter_context(patch("readline.set_history_length"))
@@ -1797,7 +1773,10 @@ class TestProviderCommand:
             stack.enter_context(patch("os.makedirs"))
             # "1" resolves to "test_provider", then resolve_provider_arg succeeds
             stack.enter_context(
-                patch("agent13.repl.resolve_provider_selection", return_value="test_provider")
+                patch(
+                    "agent13.repl.resolve_provider_selection",
+                    return_value="test_provider",
+                )
             )
             stack.enter_context(
                 patch(
@@ -1864,9 +1843,15 @@ class TestSandboxCommand:
         from agent13.sandbox import SandboxMode
 
         with (
-            patch("agent13.repl.get_current_sandbox_mode", return_value=SandboxMode.PERMISSIVE_OPEN),
+            patch(
+                "agent13.repl.get_current_sandbox_mode",
+                return_value=SandboxMode.PERMISSIVE_OPEN,
+            ),
             patch("agent13.repl.get_session_sandbox_mode", return_value=None),
-            patch("agent13.repl.get_default_sandbox_mode", return_value=SandboxMode.PERMISSIVE_OPEN),
+            patch(
+                "agent13.repl.get_default_sandbox_mode",
+                return_value=SandboxMode.PERMISSIVE_OPEN,
+            ),
         ):
             output, _ = await run_scenario(["/sandbox", "/quit"])
 
@@ -1896,9 +1881,18 @@ class TestSandboxCommand:
         from agent13.sandbox import SandboxMode
 
         with (
-            patch("agent13.repl.get_current_sandbox_mode", return_value=SandboxMode.RESTRICTIVE_CLOSED),
-            patch("agent13.repl.get_session_sandbox_mode", return_value=SandboxMode.RESTRICTIVE_CLOSED),
-            patch("agent13.repl.get_default_sandbox_mode", return_value=SandboxMode.PERMISSIVE_OPEN),
+            patch(
+                "agent13.repl.get_current_sandbox_mode",
+                return_value=SandboxMode.RESTRICTIVE_CLOSED,
+            ),
+            patch(
+                "agent13.repl.get_session_sandbox_mode",
+                return_value=SandboxMode.RESTRICTIVE_CLOSED,
+            ),
+            patch(
+                "agent13.repl.get_default_sandbox_mode",
+                return_value=SandboxMode.PERMISSIVE_OPEN,
+            ),
         ):
             output, _ = await run_scenario(["/sandbox", "/quit"])
 
@@ -2057,12 +2051,8 @@ class TestMcpCommand:
         captured_stdout = io.StringIO()
 
         with ExitStack() as stack:
-            stack.enter_context(
-                patch("agent13.repl.Agent", side_effect=capture_agent)
-            )
-            stack.enter_context(
-                patch("agent13.repl.History", MockHistoryStore)
-            )
+            stack.enter_context(patch("agent13.repl.Agent", side_effect=capture_agent))
+            stack.enter_context(patch("agent13.repl.History", MockHistoryStore))
             stack.enter_context(
                 patch("agent13.repl.get_filtered_tools", return_value=[])
             )
@@ -2073,11 +2063,11 @@ class TestMcpCommand:
                 )
             )
             stack.enter_context(patch("agent13.repl.RichDisplay"))
+            stack.enter_context(patch("builtins.input", side_effect=feeder.do_input))
             stack.enter_context(
-                patch("builtins.input", side_effect=feeder.do_input)
-            )
-            stack.enter_context(
-                patch.object(sys.stdin, "readline", side_effect=feeder.do_stdin_readline)
+                patch.object(
+                    sys.stdin, "readline", side_effect=feeder.do_stdin_readline
+                )
             )
             stack.enter_context(patch("sys.stdout", captured_stdout))
             stack.enter_context(patch("readline.read_history_file"))

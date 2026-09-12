@@ -191,10 +191,13 @@ def _validate_b64_payload(b64: str) -> str:
 async def _run_ssh_probe(host: str, remote_cmd: str, timeout: float) -> dict:
     """Run a short ssh command capturing output (used for auto-detect)."""
     try:
+        # start_new_session: run ssh in its own process group so a timeout
+        # _kill_process_tree() cannot SIGKILL the agent's own group.
         process = await asyncio.create_subprocess_exec(
             "ssh", host, remote_cmd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            start_new_session=True,
         )
     except FileNotFoundError:
         return {
@@ -266,11 +269,14 @@ async def run_remote_command(
     argv = build_remote_argv(host, shell)
 
     try:
+        # start_new_session: ssh gets its own process group, so a timeout
+        # _kill_process_tree() only kills ssh (not the agent's own group).
         process = await asyncio.create_subprocess_exec(
             *argv,
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            start_new_session=True,
         )
     except FileNotFoundError:
         return {

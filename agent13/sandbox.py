@@ -1035,8 +1035,18 @@ async def _kill_process_tree(proc: asyncio.subprocess.Process) -> None:
             )
             await killer.wait()
         else:
-            # Unix: kill the process group
-            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            # Unix: kill the child's process group. Guard against the child
+            # having been spawned in OUR OWN group (no start_new_session) -
+            # a group-kill there would SIGKILL the agent itself. Fall back
+            # to killing just the child in that case.
+            try:
+                child_pgid = os.getpgid(proc.pid)
+            except (ProcessLookupError, OSError):
+                child_pgid = None
+            if child_pgid is not None and child_pgid != os.getpgrp():
+                os.killpg(child_pgid, signal.SIGKILL)
+            else:
+                proc.kill()
         await proc.wait()
     except (ProcessLookupError, PermissionError, OSError):
         pass  # Process already dead

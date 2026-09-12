@@ -33,16 +33,48 @@ def _ensure_ctx_stem(name: str) -> str:
     return name
 
 
+# Characters illegal in a Windows filename (MS-FSCC 5.9), plus control chars.
+_WIN_INVALID_CHARS = re.compile(r'[<>:"|?*\x00-\x1f]')
+# Device names Windows refuses even with an extension (CON.txt, COM1.ctx, ...).
+_WIN_RESERVED = {
+    "CON", "PRN", "AUX", "NUL",
+    *(f"COM{i}" for i in range(1, 10)),
+    *(f"LPT{i}" for i in range(1, 10)),
+}
+
+
+def _sanitize_save_stem(stem: str) -> str:
+    """Make a bare save name a safe flat filename on Windows and macOS.
+
+    Bare names are stored flat in the saves directory, so a path separator
+    in the name would silently create a subdirectory — e.g.
+    ``/save foo / bar`` creates ``saves/foo / bar.ctx`` inside a directory
+    ``saves/foo /`` whose trailing space is legal on macOS but undeletable
+    on Windows (Win32 strips trailing spaces when re-resolving the name, so
+    Explorer and Remove-Item report a misleading "open in another program").
+    Flatten separators, drop Windows-illegal characters, collapse runs of
+    whitespace, and trim trailing dots/spaces (Win32 would silently drop
+    them anyway, making "foo." and "foo" collide).
+    """
+    stem = stem.replace("/", " ").replace("\\", " ")
+    stem = _WIN_INVALID_CHARS.sub(" ", stem)
+    stem = re.sub(r"\s+", " ", stem).strip().rstrip(".")
+    if stem.split(".")[0].upper() in _WIN_RESERVED:
+        stem += "_"
+    return stem
+
+
 def resolve_save_path(name: str) -> Path:
     """Resolve a user-supplied save name to a .ctx file path.
 
     Handles three cases:
     - Absolute path (starts with /): use as-is (strip .ctx if present, re-add it)
     - Tilde path (starts with ~): expand user, use as-is
-    - Bare name: join with the saves directory
+    - Bare name: sanitized to a single flat filename, joined with the saves directory
 
     This prevents the bugs where /save and /load split on spaces
-    (dropping the rest of the name) and where ~ is not expanded.
+    (dropping the rest of the name), where ~ is not expanded, and where a
+    slash in a bare name creates a subdirectory that Windows cannot delete.
 
     Args:
         name: The raw user argument (may contain spaces, ~, or be absolute).
@@ -62,8 +94,13 @@ def resolve_save_path(name: str) -> Path:
         # Preserve any other existing extension (e.g. foo.backup -> foo.backup.ctx)
         return path.with_name(f"{path.name}.ctx")
 
-    # Bare name — join with saves directory
-    return get_saves_dir() / f"{_ensure_ctx_stem(name)}.ctx"
+    # Bare name — sanitize so it can never create a subdirectory
+    stem = _sanitize_save_stem(_ensure_ctx_stem(name))
+    if not stem:
+        raise ValueError(
+            f"Save name is empty after removing invalid characters: {name!r}"
+        )
+    return get_saves_dir() / f"{stem}.ctx"
 
 
 # Context file format version
@@ -249,6 +286,7 @@ def _is_incomplete_turn(messages: list) -> bool:
     A turn is incomplete if:
     - Last message is assistant with tool_calls (tools not yet executed)
     - Last message is tool (results not yet processed by LLM)
+    - Last message is user (no assistant reply — e.g. quit while streaming)
 
     Args:
         messages: List of message dicts.
@@ -267,6 +305,13 @@ def _is_incomplete_turn(messages: list) -> bool:
 
     # Case 2: Tool result waiting for LLM to process
     if last_msg.get("role") == "tool":
+        return True
+
+    # Case 3: User message with no assistant reply. A completed session
+    # always ends on an assistant message, so a trailing user message
+    # means the turn never finished and --continue + /resume should
+    # answer it.
+    if last_msg.get("role") == "user":
         return True
 
     return False
@@ -367,10 +412,11 @@ def load_context(agent: "Agent", path: Path | str) -> tuple[bool, str, bool]:
         agent.prompt_tokens = context["token_usage"].get("prompt", 0)
         agent.completion_tokens = context["token_usage"].get("completion", 0)
 
-    # Check for incomplete turn and set agent flag
+    # Check for incomplete turn and set agent flag.
+    # Set unconditionally (True or False) so a later /load of a complete
+    # context clears a stale flag from a previously loaded incomplete one.
     incomplete_turn = context.get("incomplete_turn", False)
-    if incomplete_turn:
-        agent.mark_incomplete_turn(True)
+    agent.mark_incomplete_turn(incomplete_turn)
 
     if is_debug_enabled():
         log_session_restore(
@@ -409,7 +455,7 @@ def _is_auto_save_name_for_dir(stem: str, is_central: bool, project_name: str) -
         if not stem.startswith(f"{project_name}-"):
             return False
         # Check the date part
-        date_part = stem[len(project_name) + 1:]  # Skip "project-"
+        date_part = stem[len(project_name) + 1 :]  # Skip "project-"
         return bool(_AUTO_SAVE_RE.match(date_part))
     else:
         # Local mode: must be date-only
@@ -434,12 +480,16 @@ def list_all_saves() -> list[Path]:
     if auto_dir == saves_dir:
         # Local mode: auto-saves are in same dir, filter by date-only pattern
         for f in saves_dir.glob("*.ctx"):
-            if _is_auto_save_name_for_dir(f.stem, is_central=False, project_name=project_name):
+            if _is_auto_save_name_for_dir(
+                f.stem, is_central=False, project_name=project_name
+            ):
                 auto_saves.append(f)
     else:
         # Central mode: filter by project-date pattern
         for f in auto_dir.glob("*.ctx"):
-            if _is_auto_save_name_for_dir(f.stem, is_central=True, project_name=project_name):
+            if _is_auto_save_name_for_dir(
+                f.stem, is_central=True, project_name=project_name
+            ):
                 auto_saves.append(f)
 
     # Deduplicate (if local mode and same file somehow)

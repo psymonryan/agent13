@@ -250,6 +250,50 @@ class TestRunRemoteCommand:
         clear_remote_shell_cache()
 
     @pytest.mark.asyncio
+    async def test_ssh_child_runs_in_own_process_group(self):
+        """Regression: ssh must be spawned with start_new_session=True so a
+        timeout _kill_process_tree() cannot SIGKILL the agent's own group."""
+        from unittest.mock import patch, AsyncMock, MagicMock
+
+        captured = {}
+
+        mock_proc = MagicMock()
+        mock_proc.returncode = 0
+        mock_proc.pid = 12345
+        mock_proc.wait = AsyncMock(return_value=0)
+        mock_proc.stdin = MagicMock()
+        mock_proc.stdin.write = MagicMock()
+        mock_proc.stdin.close = MagicMock()
+
+        async def fake_read(n):
+            return b""
+
+        mock_proc.stdout = MagicMock()
+        mock_proc.stdout.read = fake_read
+        mock_proc.stderr = MagicMock()
+        mock_proc.stderr.read = fake_read
+
+        async def mock_create_subprocess_exec(*args, **kwargs):
+            captured["kwargs"] = kwargs
+            return mock_proc
+
+        with patch(
+            "agent13.remote_exec.asyncio.create_subprocess_exec",
+            mock_create_subprocess_exec,
+        ):
+            await run_remote_command(
+                host="myhost",
+                command="echo hi",
+                remote_shell="posix",
+                timeout=10,
+            )
+
+        assert captured["kwargs"].get("start_new_session") is True, (
+            "ssh must run in its own process group (start_new_session=True), "
+            "otherwise a timeout killpg() SIGKILLs the agent"
+        )
+
+    @pytest.mark.asyncio
     async def test_posix_command_sends_b64_on_stdin(self):
         """The base64 payload is written to ssh's stdin, not the argv."""
         captured = {}

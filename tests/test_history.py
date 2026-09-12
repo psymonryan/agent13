@@ -749,3 +749,59 @@ class TestPrefixNavigation:
             assert "cmd one" in results
             assert "cmd two" in results
             assert "cmd three" in results
+
+
+class TestUnicodeEncoding:
+    """History files must be UTF-8 regardless of the platform locale.
+
+    On Windows the locale code page (cp1252) cannot encode most unicode
+    characters, so every open() in History must specify encoding explicitly.
+    """
+
+    def test_add_unicode_command_written_as_utf8(self, temp_dir):
+        """Unicode commands (e.g. U+2192 arrow) are persisted as UTF-8 bytes.
+
+        Regression: on Windows the locale default (cp1252) raised
+        UnicodeEncodeError inside add() and crashed the session.
+        """
+        path = os.path.join(temp_dir, f"history-uni-{TODAY}")
+        with patch.object(History, "_get_path", return_value=path):
+            h = History("uni")
+            cmd = "use dir \u2192 ls to list files"
+            h.add(cmd)
+
+            with open(path, "rb") as f:
+                raw = f.read()
+            # U+2192 as UTF-8 bytes (E2 86 92) - not encodable in cp1252 at all
+            assert b"\xe2\x86\x92" in raw
+
+    def test_unicode_command_roundtrip(self, temp_dir):
+        """Unicode commands survive persistence across instances."""
+        path = os.path.join(temp_dir, f"history-uni2-{TODAY}")
+        with patch.object(History, "_get_path", return_value=path):
+            h = History("uni")
+            cmd = "use dir \u2192 ls \u2013 ok"
+            h.add(cmd)
+
+            h2 = History("uni")
+            assert h2.get_all() == [cmd]
+
+    def test_legacy_cp1252_file_loads_without_crash(self, temp_dir):
+        """Pre-existing locale-encoded (cp1252) files degrade, not crash.
+
+        Legacy non-ASCII bytes become U+FFFD replacement chars; the rest
+        of the entry survives.
+        """
+        path = os.path.join(temp_dir, f"history-legacy-{TODAY}")
+        with open(path, "w", encoding="cp1252") as f:
+            f.write("# 2026-09-01 10:00:00\ncaf\u00e9 \u2013 old entry\n")
+
+        with patch.object(History, "_get_path", return_value=path):
+            h = History("legacy")
+            items = h.get_all()
+
+        assert len(items) == 1
+        assert "caf" in items[0]
+        assert "old entry" in items[0]
+        # e-acute and en-dash each degrade to one replacement char
+        assert items[0].count("\ufffd") == 2

@@ -41,6 +41,59 @@ class TestAutoCompactConfig:
         assert agent.auto_compact_threshold == 0
 
 
+def _parse_auto_compact(toml_text: str):
+    """Write TOML to a temp file and return Config.from_file() (auto-unlink)."""
+    import tempfile
+
+    from pathlib import Path
+
+    from agent13.config import Config
+
+    with tempfile.NamedTemporaryFile(
+        mode="w", suffix=".toml", delete=False
+    ) as f:
+        f.write(toml_text)
+        path = Path(f.name)
+    try:
+        return Config.from_file(path)
+    finally:
+        path.unlink()
+
+
+class TestAutoCompactThresholdParsing:
+    """Threshold default (ON by default) + fail fast on invalid TOML values.
+
+    The threshold is enabled by default (220000) to suit large-context models
+    (e.g. Qwen 3.8, ~260k). A bad value must raise ConfigFileError at startup
+    - never be silently dropped.
+    """
+
+    def test_config_default_is_220000(self):
+        from agent13.config import Config
+
+        assert Config().auto_compact_threshold == 220000
+
+    def test_parse_valid_threshold(self):
+        config = _parse_auto_compact("[auto_compact]\nthreshold = 220000\n")
+        assert config.auto_compact_threshold == 220000
+
+    def test_parse_zero_disables(self):
+        config = _parse_auto_compact("[auto_compact]\nthreshold = 0\n")
+        assert config.auto_compact_threshold == 0
+
+    def test_invalid_string_threshold_fails_fast(self):
+        from agent13.fileio import ConfigFileError
+
+        with pytest.raises(ConfigFileError, match="threshold"):
+            _parse_auto_compact('[auto_compact]\nthreshold = "220k"\n')
+
+    def test_negative_threshold_fails_fast(self):
+        from agent13.fileio import ConfigFileError
+
+        with pytest.raises(ConfigFileError, match="threshold"):
+            _parse_auto_compact("[auto_compact]\nthreshold = -5\n")
+
+
 class TestAutoCompactCircuitBreaker:
     def test_failures_increment(self):
         agent = make_agent(auto_compact_threshold=1000)
@@ -281,30 +334,12 @@ threshold = 150000
         finally:
             path.unlink()
 
-    def test_parse_invalid_ignored(self):
-        import tempfile
-        from pathlib import Path
+    def test_parse_invalid_max_iterations_fails_fast(self):
+        """An invalid max_iterations (0) must fail fast, not be ignored."""
+        from agent13.fileio import ConfigFileError
 
-        from agent13.config import Config
-
-        toml_content = """
-[[providers]]
-name = "test"
-api_base = "http://localhost:8000/v1"
-
-[auto_compact]
-max_iterations = 0
-"""
-        with tempfile.NamedTemporaryFile(
-            mode="w", suffix=".toml", delete=False
-        ) as f:
-            f.write(toml_content)
-            path = Path(f.name)
-        try:
-            config = Config.from_file(path)
-            assert config.auto_compact_max_iterations == 3  # 0 rejected, default kept
-        finally:
-            path.unlink()
+        with pytest.raises(ConfigFileError, match="max_iterations"):
+            _parse_auto_compact("[auto_compact]\nmax_iterations = 0\n")
 
 
 class TestAutoCompactContinueLoop:
@@ -541,7 +576,7 @@ class TestConfigParsing:
         from agent13.config import Config
 
         config = Config()
-        assert config.auto_compact_threshold == 0
+        assert config.auto_compact_threshold == 220000
 
     def test_auto_compact_threshold_parse(self):
         """Test that the TOML parsing works."""
@@ -569,7 +604,7 @@ threshold = 150000
             path.unlink()
 
     def test_auto_compact_threshold_absent(self):
-        """Test that missing [auto_compact] section defaults to 0."""
+        """Test that missing [auto_compact] section defaults to 220000 (enabled)."""
         import tempfile
         from pathlib import Path
 
@@ -586,6 +621,6 @@ api_base = "http://localhost:8000/v1"
 
         try:
             config = Config.from_file(path)
-            assert config.auto_compact_threshold == 0
+            assert config.auto_compact_threshold == 220000
         finally:
             path.unlink()

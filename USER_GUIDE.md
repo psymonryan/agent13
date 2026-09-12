@@ -10,6 +10,7 @@ Complete reference for using Agent13 - configuration, tools, skills, TUI command
   - [Batch Mode](#batch-mode)
   - [Headless Mode](#headless-mode)
   - [Library Mode](#library-mode)
+  - [Pipe Mode](#pipe-mode)
 - [Command-Line Options](#command-line-options)
 - [TUI Reference](#tui-reference)
   - [Key bindings](#key-bindings)
@@ -99,7 +100,7 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 Install the latest release:
 
 ```bash
-uv tool install https://github.com/psymonryan/agent13/releases/download/v0.4.1/agent13-0.4.1-py3-none-any.whl
+uv tool install https://github.com/psymonryan/agent13/releases/download/v0.4.2/agent13-0.4.2-py3-none-any.whl
 ```
 
 ### Uninstall Agent13
@@ -239,6 +240,40 @@ The `Agent` constructor accepts:
 - `remove_reasoning: bool` - Strip reasoning between turns
 - `devel_mode: bool` - Show devel-group tools
 
+### Pipe Mode
+
+JSON stream protocol for orchestrator integration (e.g. OpenASE). Long-running process: reads NDJSON turn prompts from stdin, writes NDJSON stream events to stdout. Multiple turns per process; exits on stdin EOF.
+
+```bash
+agent13 <provider> --model <name> --io-format json
+```
+
+**Input** (stdin): one JSON object per line - a user turn:
+
+```json
+{"type":"user","message":{"role":"user","content":[{"type":"text","text":"Fix the bug in ticket-42"}]}}
+```
+
+**Output** (stdout): NDJSON events, one per line:
+
+| Event | When | Key fields |
+|-------|------|------------|
+| `system` | Once at startup | `session_id`, `data.model`, `data.provider` |
+| `assistant` | Per step (text, tool call, tool result) | `message.content[]` with `text`, `tool_use`, or `tool_result` blocks |
+| `result` | Once per turn (success or failure) | `is_error`, `result`, `usage`, `num_turns`, `duration_ms` |
+
+All events share `session_id` (stable UUID) and `type`. Diagnostics go to stderr.
+
+Malformed JSON on stdin produces a `result` with `subtype: "invalid_input"` - the process continues.
+
+```bash
+# Quick test
+echo '{"type":"user","message":{"role":"user","content":[{"type":"text","text":"Say hello"}]}}' \
+  | agent13 local --model devstral2 --io-format json
+```
+
+Full protocol spec: `agent13-pipe-mode-spec.md`. Orchestrator usage guide: `docs/PIPE_MODE_USAGE.md`.
+
 ## Input Features
 
 - **@filename expansion** (REPL mode) - Type `@path/to/file.txt` in your prompt to inline the file contents into your message. Supports `~/` home expansion and Windows drive-letter paths. Binary files are detected and skipped; text files are capped at 256 KB.
@@ -259,7 +294,7 @@ The `Agent` constructor accepts:
 | `--debug`                   | Enable debug logging                                                                                     | off                   |
 | `--tool-response raw\|json` | Tool response format                                                                                     | raw                   |
 | `--mcp`                     | Connect to MCP servers on startup (TUI and batch modes)                                                  | off                   |
-| `--skills`                  | Include discovered skills in the system prompt                                                           | off                   |
+| `--skills`                  | Show discovered skills in the system prompt and enable the `skill` tool                                  | off                   |
 | `--journal`                 | Enable journal mode (context compaction)                                                                 | off                   |
 | `--remove-reasoning`        | Strip reasoning tokens between turns                                                                     | off                   |
 | `-c`, `--continue`          | Continue from last auto-saved session                                                                    | -                     |
@@ -272,6 +307,7 @@ The `Agent` constructor accepts:
 | `--read FILE`               | Read file(s) into the user message before processing                                                     | -                     |
 | `--repl`                    | Run in REPL mode (readline-based, no TUI)                                                                | off                   |
 | `--output FILE`             | Write REPL chat transcript to file (implies `--repl`) (the REPL still gets output for command responses) | -                     |
+| `--io-format text\|json`    | I/O format: `text` (default) or `json` (NDJSON pipe mode)                                                 | text                  |
 
 ## TUI Reference
 
@@ -345,7 +381,7 @@ Note: both /model and /provider can use numbered or named models and providers. 
 | Command                  | Description                                  |
 | ------------------------ | -------------------------------------------- |
 | `/tools`                 | List active tools                            |
-| `/skills`                | List discovered skills                       |
+| `/skills [on|off|status]` | List skills, toggle the skills list, or show status |
 | `/sandbox [mode]`        | Change sandbox mode (tab-complete for modes) |
 | `/devel on\|off\|status` | Toggle devel tool visibility                 |
 
@@ -385,7 +421,7 @@ Each installed skill appears as a slash command. For example, a skill named `cod
 /code-review
 ```
 
-This sends the skill's content as a message to the agent.
+This sends the skill's content as a message to the agent. Invoking a skill also switches the `skill` tool on for the rest of the session, so the agent can then load other skills by name. The tool is otherwise off by default (or on from the start when you pass `--skills`); once on, it has no off-switch.
 
 ### Input Features
 
@@ -560,7 +596,7 @@ OPENAI_API_KEY=sk-project-key
 | `read_file`     | Read file contents - skim (symbols), raw (lines), or offset/limit                                               |
 | `write_file`    | Write content to files (fails if exists unless `overwrite=True`)                                                |
 | `edit_file`     | Line-based editing (replace, append, prepend, delete, rollback) and AST-based edits                             |
-| `skill`         | Load a specialized skill by name                                                                                |
+| `skill`         | Load a specialized skill by name (available with `--skills`, or after you invoke a skill)                        |
 | `square_number` | Demo/example tool (used for testing)                                                                            |
 | `tui_viewer`    | TUI testing tools: launch, screenshot, type, press, wait, quit (devel group - wont load unless you use --devel) |
 | `self_update`   | Check for updates, apply upgrade, or copy install command to clipboard                                          |
@@ -644,7 +680,7 @@ Agent13 ships with these skills (copied to `~/.agent13/skills/` on first run):
 
 - **List skills**: `/skills` in TUI
 
-- **Invoke skill**: `/skill-name` or ask the AI to use the `skill` tool
+- **Invoke skill**: `/skill-name` (also enables the `skill` tool for the session) or, with `--skills`, ask the AI to use the `skill` tool
 
 - **Skill paths**: Skills are discovered from:
   
@@ -698,6 +734,22 @@ agent13 local --sandbox restrictive-closed
 # TUI
 /sandbox restrictive-closed
 ```
+
+### Sandbox pinning
+
+A sandbox mode can be pinned per project, so it auto-applies every time you
+start agent13 in that directory:
+
+```
+/sandbox pin     pin the current mode for this project
+/sandbox unpin   remove the pin
+```
+
+Pins are stored in `~/.agent13/sandbox-pins.toml`. `/sandbox` (no arguments)
+shows whether a pin exists: `Pinned: yes` means the *current mode* shown in
+the same status output is pinned and will be restored on startup in this
+directory. With no pin, the config default (`permissive-open` unless
+configured otherwise) applies.
 
 ## Session Management
 

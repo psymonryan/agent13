@@ -36,10 +36,11 @@ threshold = 0
 # When the context window (prompt_tokens) reaches this value mid-turn,
 # the agent stops at the next safe point and journals (if journal is on)
 # or compacts the full history (if journal is off).
-# 0 = disabled (default). Set to e.g. 150000 to enable.
-# Change at runtime with: /auto_compact_threshold 150k
+# Default 220000 (220k) suits ~260k-context models (e.g. Qwen 3.8) with a
+# safety buffer. Must be an integer - no "k" suffix (220000, not "220k").
+# Set to 0 to disable. Change at runtime with: /auto_compact_threshold 150k
 [auto_compact]
-threshold = 0
+threshold = 220000
 # Max times the agent will compact-and-continue within a single turn before
 # pausing (so you can /compact, /journal all, or /model to a bigger-context
 # model, then /resume). Change at runtime with: /auto_compact_max N

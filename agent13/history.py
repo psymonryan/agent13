@@ -224,7 +224,10 @@ class History:
             return
 
         try:
-            with open(path, "r") as f:
+            # Explicit UTF-8: on Windows the default is the locale code page
+            # (cp1252). errors='replace' degrades legacy locale-encoded files
+            # to replacement chars instead of crashing.
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
                 content = f.read()
             # Split on timestamp lines: # YYYY-MM-DD HH:MM:SS[.microseconds]
             # Pattern captures timestamp in group 1, handles both our format
@@ -254,7 +257,7 @@ class History:
                                 timestamp = datetime.now()
                         self.file_items.append((timestamp, command))
 
-        except (IOError, OSError):
+        except (IOError, OSError, UnicodeError):
             pass
 
     def _append_to_file(self, command: str, timestamp: datetime) -> None:
@@ -273,13 +276,15 @@ class History:
         # On all platforms, appends under 1024 bytes are atomic,
         # so no file locking is needed for our ~40 byte writes.
         if not os.path.exists(path):
-            open(path, "w").close()
+            open(path, "w", encoding="utf-8").close()
 
         try:
-            with open(path, "a") as f:
+            # Explicit UTF-8: on Windows the default is the locale code page
+            # (cp1252), which crashed on unicode chars like U+2192 '->'.
+            with open(path, "a", encoding="utf-8") as f:
                 f.write(f"# {timestamp.strftime('%Y-%m-%d %H:%M:%S')}\n")
                 f.write(f"{command}\n")
-        except (IOError, OSError):
+        except (IOError, OSError, UnicodeError):
             pass
 
     def add(self, command: str) -> None:
@@ -463,9 +468,9 @@ class History:
         # Clear the file
         path = self._get_path()
         try:
-            with open(path, "w"):
+            with open(path, "w", encoding="utf-8"):
                 pass
-        except (IOError, OSError):
+        except (IOError, OSError, UnicodeError):
             pass
 
     def __len__(self) -> int:

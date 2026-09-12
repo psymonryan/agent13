@@ -26,6 +26,7 @@ from agent13 import (
     AgentEvent,
     History,
     PromptManager,
+    StopReason,
     get_filtered_tools,
     execute_tool,
     skill_manager_ctx,
@@ -240,7 +241,7 @@ async def run_repl(
     bell_enabled: bool = True,
     bell_command: str = "",
     priming_enabled: bool = False,
-    auto_compact_threshold: int = 0,
+    auto_compact_threshold: int = 220000,
     auto_compact_max_iterations: int = 3,
 ):
     """Run the agent in interactive REPL mode.
@@ -628,6 +629,21 @@ async def run_repl(
             # Freeze output before returning — close race window
             output_ctrl.freeze()
 
+    async def wait_stream_exit() -> str:
+        """Streaming-mode exit — unfreeze, wait for Enter, return next input.
+
+        Typed-ahead text is the user's next message (dispatched at loop top);
+        empty Enter returns to input mode (read with prompt).
+        """
+        output_ctrl.unfreeze()
+        user_input = await loop.run_in_executor(None, read_no_prompt)
+        # Enter pressed — freeze set in read_no_prompt finally
+        if user_input.strip():
+            # User typed during streaming — it's their next message
+            return user_input
+        # Empty Enter — show prompt for input
+        return await loop.run_in_executor(None, read_with_prompt)
+
     def read_multi_prompt():
         """Blocking input with multi-line prompt — MULTI-LINE mode."""
         try:
@@ -819,6 +835,16 @@ async def run_repl(
                             enter_streaming = True
                         else:
                             output_ctrl.freeze()
+                    elif agent.has_incomplete_turn:
+                        # Resume an incomplete turn loaded via --continue or
+                        # /load. Mirrors the TUI: signal run() to call
+                        # continue_incomplete_turn() inside its own loop —
+                        # pending tools execute, then the LLM continues with
+                        # the identical message prefix (kv-cache friendly).
+                        agent.request_continue_incomplete()
+                        output_ctrl.unfreeze()
+                        print("  Continuing incomplete turn...")
+                        enter_streaming = True
                     else:
                         print("  Not paused")
 
@@ -1035,7 +1061,9 @@ async def run_repl(
                     from agent13.prompts import resolve_compact_prompt
 
                     arg = cmd_arg.strip()
-                    compact_prompt_text, error = resolve_compact_prompt(prompt_manager, arg)
+                    compact_prompt_text, error = resolve_compact_prompt(
+                        prompt_manager, arg
+                    )
                     if error:
                         for error_line in error.splitlines():
                             print(f"  {error_line}")
@@ -1154,9 +1182,9 @@ async def run_repl(
                             print("    Session override: none (using config default)")
                         print(f"    Config default: {config_default.value}")
                         if pinned:
-                            print(f"    Pinned for this project: {pinned.value}")
+                            print("    Pinned: yes")
                         else:
-                            print("    Pinned for this project: none")
+                            print("    Pinned: no")
                         print()
                         from agent13.sandbox import SandboxMode
 
@@ -1169,8 +1197,12 @@ async def run_repl(
                     elif args == "pin":
                         current = get_current_sandbox_mode()
                         pin_sandbox_mode(current)
-                        print(f"  Pinned sandbox mode '{current.value}' for this project")
-                        print("  This mode will auto-apply on startup in this directory.")
+                        print(
+                            f"  Pinned sandbox mode '{current.value}' for this project"
+                        )
+                        print(
+                            "  This mode will auto-apply on startup in this directory."
+                        )
                     elif args == "unpin":
                         if unpin_sandbox_mode():
                             print("  Removed sandbox pin for this project")
@@ -1391,7 +1423,9 @@ async def run_repl(
                     args = cmd_arg.strip()
                     if not args:
                         if agent.auto_compact_threshold > 0:
-                            print(f"  Auto-compact: on ({agent.auto_compact_threshold:,} tokens)")
+                            print(
+                                f"  Auto-compact: on ({agent.auto_compact_threshold:,} tokens)"
+                            )
                         else:
                             print("  Auto-compact: off")
                     else:
@@ -1410,9 +1444,13 @@ async def run_repl(
                                 print(f"  Auto-compact: on ({threshold:,} tokens)")
                         except ValueError:
                             print("  Usage: /auto_compact_threshold [N|0]")
-                            print("    /auto_compact_threshold 150k - Compact at 150,000 tokens")
+                            print(
+                                "    /auto_compact_threshold 150k - Compact at 150,000 tokens"
+                            )
                             print("    /auto_compact_threshold 0    - Disable")
-                            print("    /auto_compact_threshold      - Show current status")
+                            print(
+                                "    /auto_compact_threshold      - Show current status"
+                            )
 
                 elif cmd == "/auto_compact_max":
                     args = cmd_arg.strip()
@@ -1429,7 +1467,9 @@ async def run_repl(
                             print(f"  Auto-compact max cycles: {max_iter}")
                         except ValueError:
                             print("  Usage: /auto_compact_max [N]")
-                            print("    /auto_compact_max 3 - Pause after 3 compact-and-continue cycles")
+                            print(
+                                "    /auto_compact_max 3 - Pause after 3 compact-and-continue cycles"
+                            )
                             print("    /auto_compact_max   - Show current value")
 
                 else:
@@ -1440,7 +1480,12 @@ async def run_repl(
                 if not enter_streaming:
                     user_input = await loop.run_in_executor(None, read_with_prompt)
                     continue
-                # else: fall through to STREAMING MODE below
+                # Switch to streaming mode directly — the command text itself
+                # must NOT leak into the send path below as a user message
+                # (previously "/resume" was queued as a phantom message).
+                enter_streaming = False
+                user_input = await wait_stream_exit()
+                continue
 
             # ── Parse priority/interrupt prefixes ─────────────────
             if user_input.startswith("!!"):
@@ -1491,18 +1536,10 @@ async def run_repl(
             # ── STREAMING MODE ────────────────────────────────────
             # Unfreeze output — agent events flow to stdout
             enter_streaming = False
-            output_ctrl.unfreeze()
 
-            # Wait for Enter (no prompt — user watches streaming output)
-            user_input = await loop.run_in_executor(None, read_no_prompt)
-            # Enter pressed — freeze set in read_no_prompt finally
-
-            if user_input.strip():
-                # User typed during streaming — it's their next message
-                continue
-            else:
-                # Empty Enter — show prompt for input
-                user_input = await loop.run_in_executor(None, read_with_prompt)
+            # Wait for Enter (no prompt — user watches streaming output);
+            # typed-ahead text is their next message, empty Enter re-prompts.
+            user_input = await wait_stream_exit()
 
     except (KeyboardInterrupt, EOFError) as exc:
         is_eof = isinstance(exc, EOFError)
@@ -1548,7 +1585,7 @@ async def run_repl(
             except Exception:
                 pass
 
-        agent.stop()
+        agent.stop(StopReason.QUIT)
         agent_task.cancel()
         try:
             await asyncio.wait_for(agent_task, timeout=2.0)

@@ -94,7 +94,7 @@ class TestMCPServerConfig:
 
     def test_default_timeouts(self, http_config):
         """Default timeouts should be set."""
-        assert http_config.connect_timeout == 240.0
+        assert http_config.connect_timeout == 300.0
         assert http_config.tool_timeout == 60.0
         assert http_config.retry_attempts == 3
         assert http_config.retry_delay == 1.0

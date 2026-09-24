@@ -15,10 +15,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Optional
 
-try:
-    import tomllib
-except ImportError:
-    import tomli as tomllib  # type: ignore
+import tomllib
 
 from agent13.config_paths import get_config_file
 
@@ -504,63 +501,10 @@ def get_effective_sandbox_mode(
 # ---------------------------------------------------------------------------
 # Sandbox pinning (per-project persistent sandbox mode)
 # ---------------------------------------------------------------------------
-# Pins are stored in ~/.agent13/sandbox-pins.toml as a flat table:
-#   "/abs/path/to/project" = "off"
-#   "/abs/path/to/another" = "permissive-closed"
-#
-# This avoids modifying the user's hand-edited config.toml and keeps the
-# pin data simple enough to write without a TOML writer library.
-
-
-def _get_sandbox_pins_file() -> Path:
-    """Return the path to the sandbox pins file."""
-    from agent13.config_paths import get_config_dir
-
-    return get_config_dir() / "sandbox-pins.toml"
-
-
-def load_sandbox_pins() -> dict[str, str]:
-    """Load all sandbox pins from the pins file.
-
-    Returns:
-        Dict mapping absolute project path -> sandbox mode string.
-        Empty dict if file doesn't exist or is invalid.
-    """
-    pins_file = _get_sandbox_pins_file()
-    if not pins_file.exists():
-        return {}
-
-    try:
-        with open(pins_file, "rb") as f:
-            data = tomllib.load(f)
-        return {k: v for k, v in data.items() if isinstance(v, str)}
-    except Exception:
-        return {}
-
-
-def save_sandbox_pins(pins: dict[str, str]) -> None:
-    """Write sandbox pins to the pins file.
-
-    Args:
-        pins: Dict mapping absolute project path -> sandbox mode string.
-    """
-    from agent13.config_paths import ensure_config_dir
-
-    pins_file = _get_sandbox_pins_file()
-    ensure_config_dir()
-
-    lines = []
-    for path in sorted(pins.keys()):
-        mode = pins[path]
-        escaped = path.replace("\\", "\\\\")
-        lines.append(f'"{escaped}" = "{mode}"')
-
-    content = "# Sandbox pins - per-project persistent sandbox mode\n"
-    content += "# Managed by /sandbox pin and /sandbox unpin\n"
-    if lines:
-        content += "\n".join(lines) + "\n"
-
-    pins_file.write_text(content)
+# Pins live in the shared per-project pins file (~/.agent13/pins.toml,
+# [sandbox] section) managed by agent13.pins - see that module for the file
+# format. The typed helpers below keep the SandboxMode enum out of the
+# generic pin store.
 
 
 def get_pinned_sandbox_mode(
@@ -574,14 +518,13 @@ def get_pinned_sandbox_mode(
     Returns:
         The pinned SandboxMode, or None if no pin exists.
     """
-    if project_dir is None:
-        project_dir = Path.cwd()
-    key = str(project_dir.resolve())
-    pins = load_sandbox_pins()
-    if key not in pins:
+    from agent13.pins import SECTION_SANDBOX, get_pinned
+
+    raw = get_pinned(SECTION_SANDBOX, project_dir)
+    if raw is None:
         return None
     try:
-        return parse_sandbox_mode(pins[key])
+        return parse_sandbox_mode(raw)
     except ValueError:
         return None
 
@@ -593,12 +536,9 @@ def pin_sandbox_mode(mode: SandboxMode, project_dir: Optional[Path] = None) -> N
         mode: The sandbox mode to pin.
         project_dir: The project directory. Defaults to cwd.
     """
-    if project_dir is None:
-        project_dir = Path.cwd()
-    key = str(project_dir.resolve())
-    pins = load_sandbox_pins()
-    pins[key] = mode.value
-    save_sandbox_pins(pins)
+    from agent13.pins import SECTION_SANDBOX, set_pinned
+
+    set_pinned(SECTION_SANDBOX, mode.value, project_dir)
 
 
 def unpin_sandbox_mode(project_dir: Optional[Path] = None) -> bool:
@@ -610,15 +550,9 @@ def unpin_sandbox_mode(project_dir: Optional[Path] = None) -> bool:
     Returns:
         True if a pin was removed, False if no pin existed.
     """
-    if project_dir is None:
-        project_dir = Path.cwd()
-    key = str(project_dir.resolve())
-    pins = load_sandbox_pins()
-    if key not in pins:
-        return False
-    del pins[key]
-    save_sandbox_pins(pins)
-    return True
+    from agent13.pins import SECTION_SANDBOX, remove_pin
+
+    return remove_pin(SECTION_SANDBOX, project_dir)
 
 
 def build_sandbox_command(
@@ -734,6 +668,8 @@ def run_sandboxed(
             "stderr": stderr,
             "truncated": truncated,
             "timed_out": False,
+            "status": "completed",
+            "output_encoding": "utf-8",
             "sandbox_mode": mode.value,
         }
 
@@ -758,6 +694,8 @@ def run_sandboxed(
             "stderr": f"Command not found: {e}",
             "truncated": False,
             "timed_out": False,
+            "status": "error",
+            "output_encoding": "utf-8",
             "sandbox_mode": mode.value,
         }
     except Exception as e:
@@ -768,6 +706,8 @@ def run_sandboxed(
             "stderr": f"Error running command: {e}",
             "truncated": False,
             "timed_out": False,
+            "status": "error",
+            "output_encoding": "utf-8",
             "sandbox_mode": mode.value,
         }
 
@@ -948,6 +888,8 @@ async def run_sandboxed_async(
             "stderr": stderr,
             "truncated": truncated,
             "timed_out": False,
+            "status": "completed",
+            "output_encoding": "utf-8",
             "sandbox_mode": mode.value,
         }
 
@@ -961,6 +903,8 @@ async def run_sandboxed_async(
             "stderr": f"Command not found: {e}",
             "truncated": False,
             "timed_out": False,
+            "status": "error",
+            "output_encoding": "utf-8",
             "sandbox_mode": mode.value,
         }
     except Exception as e:
@@ -973,6 +917,8 @@ async def run_sandboxed_async(
             "stderr": f"Error running command: {e}",
             "truncated": False,
             "timed_out": False,
+            "status": "error",
+            "output_encoding": "utf-8",
             "sandbox_mode": mode.value,
         }
 
@@ -1012,6 +958,8 @@ def _timeout_result(
         "stderr": stderr,
         "truncated": truncated,
         "timed_out": True,
+        "status": "timeout",
+        "output_encoding": "utf-8",
         "sandbox_mode": mode.value,
     }
 

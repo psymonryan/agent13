@@ -35,6 +35,7 @@ Complete reference for using Agent13 - configuration, tools, skills, TUI command
 - [Sandbox Modes](#sandbox-modes)
 - [Session Management](#session-management)
 - [Journal Mode](#journal-mode)
+- [Auto-Context](#auto-context)
 - [MCP Integration](#mcp-integration)
 - [Troubleshooting](#troubleshooting)
 - [Updates](#updates)
@@ -100,7 +101,7 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 Install the latest release:
 
 ```bash
-uv tool install https://github.com/psymonryan/agent13/releases/download/v0.4.2/agent13-0.4.2-py3-none-any.whl
+uv tool install https://github.com/psymonryan/agent13/releases/download/v0.5.0/agent13-0.5.0-py3-none-any.whl
 ```
 
 ### Uninstall Agent13
@@ -296,9 +297,12 @@ Full protocol spec: `agent13-pipe-mode-spec.md`. Orchestrator usage guide: `docs
 | `--mcp`                     | Connect to MCP servers on startup (TUI and batch modes)                                                  | off                   |
 | `--skills`                  | Show discovered skills in the system prompt and enable the `skill` tool                                  | off                   |
 | `--journal`                 | Enable journal mode (context compaction)                                                                 | off                   |
+| `--auto-context-threshold N` | Auto-context token threshold for this run (0 = disabled)                                                 | 220000                |
+| `--report-and-compact`      | Auto-context action = `report_and_compact` for this run                                                  | from config           |
+| `--auto-context-chain N`    | Auto-context chain (restarts per turn) for this run                                                      | 3                     |
 | `--remove-reasoning`        | Strip reasoning tokens between turns                                                                     | off                   |
 | `-c`, `--continue`          | Continue from last auto-saved session                                                                    | -                     |
-| `--devel`                   | Enable devel mode (show devel-group tools)                                                               | off                   |
+| `--devel`                   | Enable devel mode (show devel-group tools); also pinnable per project via `/devel pin`                    | off                   |
 | `--spinner fast\|slow\|off` | Spinner style                                                                                            | fast                  |
 | `--upgrade`                 | Check for updates and apply, then exit                                                                   | -                     |
 | `--clipboard osc52\|system` | Clipboard method for this session                                                                        | osc52                 |
@@ -383,7 +387,7 @@ Note: both /model and /provider can use numbered or named models and providers. 
 | `/tools`                 | List active tools                            |
 | `/skills [on|off|status]` | List skills, toggle the skills list, or show status |
 | `/sandbox [mode]`        | Change sandbox mode (tab-complete for modes) |
-| `/devel on\|off\|status` | Toggle devel tool visibility                 |
+| `/devel [on\|off\|status\|pin\|unpin]` | Toggle devel tool visibility, pin per project |
 
 #### MCP
 
@@ -401,6 +405,14 @@ Note: both /model and /provider can use numbered or named models and providers. 
 | `/journal last`    | Journal the last turn             |
 | `/journal all`     | Journal all turns that used tools |
 | `/journal status`  | Show journal mode status          |
+
+#### Auto-Context
+
+| Command                                                        | Description                                                                                   |
+| -------------------------------------------------------------- | --------------------------------------------------------------------------------------------- |
+| `/auto_context_threshold [N\|0]`                               | Act when context exceeds N tokens (supports k suffix, e.g. `150k`; 0 disables); no arg = status |
+| `/auto_context_action [compact\|report_and_compact\|none]`     | What to do at the threshold; no arg shows current value                                       |
+| `/auto_context_chain [N]`                                      | Restart the turn up to N times per turn after a compact (0 = none); no arg shows current value |
 
 #### Other
 
@@ -622,7 +634,7 @@ agent13 local --devel
 /devel on
 ```
 
-When devel mode is off, the AI cannot see or use tools in the `devel` group. This keeps the tool list lean for normal usage.
+When devel mode is off, the AI cannot see or use tools in the `devel` group. This keeps the tool list lean for normal usage. Devel mode can also be pinned per project - see [Pinning](#pinning).
 
 ### Adding Custom Tools
 
@@ -735,21 +747,27 @@ agent13 local --sandbox restrictive-closed
 /sandbox restrictive-closed
 ```
 
-### Sandbox pinning
+### Pinning
 
-A sandbox mode can be pinned per project, so it auto-applies every time you
-start agent13 in that directory:
+Session settings can be pinned per project, so they auto-apply every time you
+start agent13 in that directory. Pinning the *current* state means both on and
+off can be pinned (e.g. `/devel off` + `/devel pin` keeps devel off in a
+project by default). An explicit CLI flag always overrides a pin.
 
 ```
-/sandbox pin     pin the current mode for this project
+/sandbox pin     pin the current sandbox mode for this project
 /sandbox unpin   remove the pin
+/devel pin       pin the current devel mode for this project
+/devel unpin     remove the pin
 ```
 
-Pins are stored in `~/.agent13/sandbox-pins.toml`. `/sandbox` (no arguments)
-shows whether a pin exists: `Pinned: yes` means the *current mode* shown in
-the same status output is pinned and will be restored on startup in this
-directory. With no pin, the config default (`permissive-open` unless
-configured otherwise) applies.
+Pins are stored in `~/.agent13/pins.toml`, one section per pin type
+(`[sandbox]`, `[devel]`), keyed by the absolute project path. `/sandbox` and
+`/devel` (no arguments) show whether a pin exists: `Pinned: yes` means the
+*current* value shown in the same status output is pinned and will be
+restored on startup in this directory. With no sandbox pin, the config default
+(`permissive-open` unless configured otherwise) applies; with no devel pin,
+devel mode is off.
 
 ## Session Management
 
@@ -788,6 +806,45 @@ Journal commands:
 - `/journal last` - Convert the last turn into a journal summary
 - `/journal all` - Iterate over all turns, journalling each
 - `/journal status` - Show current status
+
+## Auto-Context
+
+Auto-context acts automatically when the context nears the model's limit - you don't have to decide when to compact. When the estimated context crosses `threshold`, the configured `action` runs, and `chain` lets the agent continue the same turn afterwards.
+
+```toml
+[auto_context]
+threshold = 220000              # tokens to act at (0 = disabled)
+action = "report_and_compact"   # what happens at the threshold
+chain = 3                       # turn restarts after a compact (0 = none)
+```
+
+**Actions:**
+
+| Action               | At the threshold                                                        | Afterwards                                          |
+| -------------------- | ----------------------------------------------------------------------- | --------------------------------------------------- |
+| `compact`            | Full compact                                                            | Idle                                                |
+| `report_and_compact` | The agent pauses once to update the project documentation and write a progress report, then compacts | Idle, or the turn continues (with `chain > 0`)      |
+| `none`               | Nothing - context untouched                                             | **Paused**: `/model` to a larger-context model, `/compact`, or `/journal all`, then `/resume` |
+
+**Chain semantics:** `chain` counts restarts *after* a compact, per user turn (it resets every turn). `chain = N` allows at most N restarts, so the action can fire up to N+1 times in one turn (e.g. `chain = 3`: report → compact → continue, up to four cycles). A failed compact never restarts - the agent idles with an error notice. `chain` is ignored when `action = "none"`.
+
+With the defaults (`report_and_compact`, `chain = 3`) a long heavy turn will report and compact several times before handing back to you. To get "compact and hand back immediately", set `action = "compact"` and `chain = 0`.
+
+**CLI overrides** (this run only, beat the config - see [Command-Line Options](#command-line-options)):
+
+```bash
+agent13 local --auto-context-threshold 150000   # lower the threshold
+agent13 local --report-and-compact              # force the report action
+agent13 local --auto-context-chain 2            # restart budget per turn
+```
+
+**Runtime overrides** (TUI and REPL; mutate the live session only, never written to config):
+
+- `/auto_context_threshold [N|0]` - no arg prints the current threshold, action, and chain
+- `/auto_context_action [compact|report_and_compact|none]` - no arg prints the current action
+- `/auto_context_chain [N]` - no arg prints the current chain
+
+The current live values also appear in `/status` under Settings (`auto-context`, `auto-action`, `auto-chain`).
 
 ## MCP Integration
 

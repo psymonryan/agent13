@@ -17,10 +17,7 @@ import urllib.parse
 
 import httpx
 
-try:
-    import tomllib
-except ImportError:
-    import tomli as tomllib  # type: ignore
+import tomllib
 
 from dotenv import load_dotenv
 
@@ -155,7 +152,7 @@ class MCPServerConfig:
     env: dict[str, str] = field(default_factory=dict)
     enabled_tools: list[str] = field(default_factory=list)
     disabled_tools: list[str] = field(default_factory=list)
-    connect_timeout: float = 240.0
+    connect_timeout: float = 300.0
     tool_timeout: float = 60.0
     retry_attempts: int = 3
     retry_delay: float = 1.0
@@ -261,8 +258,13 @@ class Config:
     bell_enabled: bool = True  # Whether bell is active
     bell_command: str = ""  # External command to run instead of terminal bell
     cursor_blink: bool = False  # Whether input cursor blinks (false = tmux-friendly)
-    auto_compact_threshold: int = 220000  # Token threshold for auto-compact (0 = disabled)
-    auto_compact_max_iterations: int = 3  # Max compact-and-continue cycles per turn
+    auto_context_threshold: int = (
+        220000  # Token threshold for auto-context (0 = disabled)
+    )
+    auto_context_action: str = (
+        "report_and_compact"  # At threshold: compact | report_and_compact | none
+    )
+    auto_context_chain: int = 3  # Turn restarts after a compact per turn (0 = none)
     vision: Optional[VisionConfig] = None  # Vision/image routing config
 
     @classmethod
@@ -328,7 +330,9 @@ class Config:
 
             read_timeout = provider_data.get("read_timeout", 2400.0)
             if not isinstance(read_timeout, (int, float)):
-                raise ConfigFileError(f"Provider '{name}' 'read_timeout' must be a number")
+                raise ConfigFileError(
+                    f"Provider '{name}' 'read_timeout' must be a number"
+                )
 
             connect_timeout = provider_data.get("connect_timeout", 30.0)
             if not isinstance(connect_timeout, (int, float)):
@@ -400,9 +404,7 @@ class Config:
         # Parse [updates] section
         updates_data = data.get("updates", {})
         if isinstance(updates_data, dict):
-            config.update_check_enabled = updates_data.get(
-                "check_enabled", True
-            )
+            config.update_check_enabled = updates_data.get("check_enabled", True)
             config.update_check_interval_hours = float(
                 updates_data.get("check_interval_hours", 24)
             )
@@ -434,42 +436,53 @@ class Config:
             if isinstance(bc, str):
                 config.bell_command = bc
 
-        # Parse [auto_compact] section. Fail fast on a bad value - a user
-        # typo like threshold = "220k" must surface at startup, never be
-        # silently dropped. Absent keys fall back to the dataclass defaults.
-        if "auto_compact" in data:
-            auto_compact_data = data["auto_compact"]
-            if not isinstance(auto_compact_data, dict):
-                raise ConfigFileError("[auto_compact] must be a table")
-            if "threshold" in auto_compact_data:
-                threshold = auto_compact_data["threshold"]
+        # Parse [auto_context] section. Fail fast on a bad value - a user
+        # typo like threshold = "220k" or an unknown action must surface at
+        # startup, never be silently dropped. Absent keys fall back to the
+        # dataclass defaults.
+        if "auto_context" in data:
+            auto_context_data = data["auto_context"]
+            if not isinstance(auto_context_data, dict):
+                raise ConfigFileError("[auto_context] must be a table")
+            if "threshold" in auto_context_data:
+                threshold = auto_context_data["threshold"]
                 if isinstance(threshold, bool) or not isinstance(
                     threshold, (int, float)
                 ):
                     raise ConfigFileError(
-                        f"[auto_compact] 'threshold' must be an integer number "
+                        f"[auto_context] 'threshold' must be an integer number "
                         f"of tokens, got {threshold!r}. "
                         f"Use e.g. threshold = 220000 (or 0 to disable)."
                     )
                 if threshold < 0:
                     raise ConfigFileError(
-                        f"[auto_compact] 'threshold' must be >= 0, got {threshold}"
+                        f"[auto_context] 'threshold' must be >= 0, got {threshold}"
                     )
-                config.auto_compact_threshold = int(threshold)
-            if "max_iterations" in auto_compact_data:
-                max_iter = auto_compact_data["max_iterations"]
-                if isinstance(max_iter, bool) or not isinstance(
-                    max_iter, (int, float)
+                config.auto_context_threshold = int(threshold)
+            if "action" in auto_context_data:
+                action = auto_context_data["action"]
+                if not isinstance(action, str) or action not in (
+                    "compact",
+                    "report_and_compact",
+                    "none",
                 ):
                     raise ConfigFileError(
-                        f"[auto_compact] 'max_iterations' must be an integer, "
-                        f"got {max_iter!r}. Use e.g. max_iterations = 3."
+                        f"[auto_context] 'action' must be one of 'compact', "
+                        f"'report_and_compact', 'none', got {action!r}."
                     )
-                if max_iter < 1:
+                config.auto_context_action = action
+            if "chain" in auto_context_data:
+                chain = auto_context_data["chain"]
+                if isinstance(chain, bool) or not isinstance(chain, (int, float)):
                     raise ConfigFileError(
-                        f"[auto_compact] 'max_iterations' must be >= 1, got {max_iter}"
+                        f"[auto_context] 'chain' must be an integer, got "
+                        f"{chain!r}. Use e.g. chain = 2 (0 = no restarts)."
                     )
-                config.auto_compact_max_iterations = int(max_iter)
+                if chain < 0:
+                    raise ConfigFileError(
+                        f"[auto_context] 'chain' must be >= 0, got {chain}"
+                    )
+                config.auto_context_chain = int(chain)
 
         # Parse [ui] section
         ui_data = data.get("ui", {})
@@ -483,7 +496,9 @@ class Config:
         if isinstance(vision_data, dict):
             mode = vision_data.get("mode", "sidecar")
             if not isinstance(mode, str) or mode not in ("sidecar", "native", "auto"):
-                raise ConfigFileError(f"[vision] 'mode' must be 'sidecar', 'native', or 'auto', got '{mode}'")
+                raise ConfigFileError(
+                    f"[vision] 'mode' must be 'sidecar', 'native', or 'auto', got '{mode}'"
+                )
             sidecar_provider = vision_data.get("sidecar_provider", "")
             if not isinstance(sidecar_provider, str):
                 raise ConfigFileError("[vision] 'sidecar_provider' must be a string")
@@ -492,7 +507,9 @@ class Config:
                 raise ConfigFileError("[vision] 'sidecar_model' must be a string")
             patterns = vision_data.get("native_vision_patterns", [])
             if not isinstance(patterns, list):
-                raise ConfigFileError("[vision] 'native_vision_patterns' must be a list")
+                raise ConfigFileError(
+                    "[vision] 'native_vision_patterns' must be a list"
+                )
             config.vision = VisionConfig(
                 mode=mode,
                 sidecar_provider=sidecar_provider,
@@ -736,9 +753,7 @@ def create_client(
     )
 
 
-def resolve_provider_selection(
-    choice: str, use_stderr: bool = False
-) -> str | None:
+def resolve_provider_selection(choice: str, use_stderr: bool = False) -> str | None:
     """Resolve a provider selection by number, name, or URL.
 
     Args:

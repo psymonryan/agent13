@@ -1,15 +1,21 @@
 [project]
 name = "agent13"
-version = "0.4.2"
+version = "0.5.0"
 description = "Context-lean AI agent - minimal VRAM fits in a small cupboard, a postbox or even a clock"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 license = "MIT"
 authors = [
     { name = "Simon Ryan, various local models" }
 ]
 dependencies = [
-    "openai",
+    # Pinned exact: openai 3.x is in flux (httpx2 migration, retry-semantics
+    # changes between minors - see the "Event loop is closed" TUI bug where
+    # 3.14.1 stopped retrying raw RuntimeErrors). Bump deliberately with a
+    # test run. httpx is pinned because create_client passes a legacy
+    # httpx.Timeout into a client that internally uses httpx2.
+    "openai==3.13.0",
+    "httpx==0.28.1",
     "textual",
     "rich",
     "python-dotenv",
@@ -18,11 +24,7 @@ dependencies = [
     "pyte",
     "mcp",
     "filelock",
-    "httpx",
     "Pillow",
-    # tomllib is stdlib only on 3.11+; config.py/sandbox.py fall back to tomli
-    # on 3.10 (see `import tomllib` / `except ImportError: import tomli`).
-    "tomli; python_version < '3.11'",
 ]
 
 [dependency-groups]

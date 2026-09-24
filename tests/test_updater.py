@@ -2,7 +2,7 @@
 
 import json
 from datetime import datetime, timezone, timedelta
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch, MagicMock, mock_open
 
 from agent13.updater import (
     _parse_version,
@@ -16,6 +16,10 @@ from agent13.updater import (
     _rename_locked_scripts_dir,
     _restore_renamed_scripts_dir,
     cleanup_old_scripts_dir,
+    _is_process_alive,
+    _find_helper_python,
+    _spawn_detached_updater,
+    check_last_update_result,
     check_for_update,
     check_and_apply_update,
     perform_update,
@@ -577,6 +581,228 @@ class TestPerformUpdateWindowsDirRename:
         assert success is True
         assert "0.1.9" in msg
         assert "successfully" in msg
+
+    def test_helper_fallback_when_rename_fails_windows(self):
+        """When the Scripts dir rename fails on Windows, spawn the detached
+        helper and report the update as scheduled (not a hard failure)."""
+        with (
+            patch("agent13.updater.fetch_latest_release") as mock_fetch,
+            patch("agent13.updater.__version__", "0.1.8"),
+            patch("agent13.updater.httpx.stream", _mock_stream_factory()),
+            patch("agent13.updater.subprocess.run") as mock_run,
+            patch("agent13.updater._rename_locked_scripts_dir", return_value=None),
+            patch("agent13.updater._find_scripts_dir", return_value=r"C:\Scripts"),
+            patch("agent13.updater.os.name", "nt"),
+            patch("agent13.updater.shutil.which", return_value=r"C:\uv.exe"),
+            patch("agent13.updater._spawn_detached_updater", return_value=True) as mock_spawn,
+        ):
+            mock_fetch.return_value = {
+                "tag_name": "0.1.9", "html_url": "",
+                "wheel_url": "https://example.com/agent13-0.1.9-py3-none-any.whl",
+            }
+            success, msg = perform_update()
+        assert success is True
+        assert "scheduled" in msg.lower()
+        # The helper is spawned with the wheel path and the resolved uv path.
+        mock_spawn.assert_called_once()
+        args = mock_spawn.call_args[0]
+        assert args[1] == r"C:\uv.exe"
+        # The in-process install must NOT have run (helper handles it).
+        mock_run.assert_not_called()
+
+    def test_no_helper_fallback_on_posix(self):
+        """On POSIX, a None rename is normal (no Scripts dir) -- no helper."""
+        with (
+            patch("agent13.updater.fetch_latest_release") as mock_fetch,
+            patch("agent13.updater.__version__", "0.1.8"),
+            patch("agent13.updater.httpx.stream", _mock_stream_factory()),
+            patch("agent13.updater.subprocess.run") as mock_run,
+            patch("agent13.updater._rename_locked_scripts_dir", return_value=None),
+            patch("agent13.updater._find_scripts_dir", return_value="/usr/local/bin"),
+            patch("agent13.updater.os.name", "posix"),
+            patch("agent13.updater._spawn_detached_updater") as mock_spawn,
+        ):
+            mock_fetch.return_value = {
+                "tag_name": "0.1.9", "html_url": "",
+                "wheel_url": "https://example.com/agent13-0.1.9-py3-none-any.whl",
+            }
+            mock_run.return_value = MagicMock(returncode=0)
+            success, msg = perform_update()
+        assert success is True
+        mock_spawn.assert_not_called()
+        # In-process install ran normally.
+        mock_run.assert_called_once()
+
+    def test_falls_through_to_install_when_spawn_fails(self):
+        """If the helper can't be spawned, fall through to the in-process
+        install so the user sees the real error."""
+        with (
+            patch("agent13.updater.fetch_latest_release") as mock_fetch,
+            patch("agent13.updater.__version__", "0.1.8"),
+            patch("agent13.updater.httpx.stream", _mock_stream_factory()),
+            patch("agent13.updater.subprocess.run") as mock_run,
+            patch("agent13.updater._rename_locked_scripts_dir", return_value=None),
+            patch("agent13.updater._find_scripts_dir", return_value=r"C:\Scripts"),
+            patch("agent13.updater.os.name", "nt"),
+            patch("agent13.updater.shutil.which", return_value=r"C:\uv.exe"),
+            patch("agent13.updater._spawn_detached_updater", return_value=False),
+        ):
+            mock_fetch.return_value = {
+                "tag_name": "0.1.9", "html_url": "",
+                "wheel_url": "https://example.com/agent13-0.1.9-py3-none-any.whl",
+            }
+            mock_run.return_value = MagicMock(returncode=1, stderr="locked")
+            success, msg = perform_update()
+        assert success is False
+        # In-process install ran (and failed) because the helper wasn't spawned.
+        mock_run.assert_called_once()
+
+
+class TestIsProcessAlive:
+    """Tests for _is_process_alive."""
+
+    def test_self_is_alive(self):
+        """The current process should be reported as alive."""
+        import os
+
+        assert _is_process_alive(os.getpid()) is True
+
+    def test_dead_pid_not_alive(self):
+        """A very high (unused) PID should be reported as not alive."""
+        # PID 2**20 - 1 is almost certainly unused.
+        assert _is_process_alive(1048575) is False
+
+
+class TestSpawnDetachedUpdater:
+    """Tests for _spawn_detached_updater."""
+
+    def test_spawns_process(self):
+        """Should write the helper to a temp file and Popen it with args."""
+        with (
+            patch("agent13.updater.subprocess.Popen") as mock_popen,
+            patch("agent13.updater._find_helper_python", return_value="/usr/bin/python3"),
+            patch("builtins.open", mock_open()),
+        ):
+            result = _spawn_detached_updater("/tmp/wheel.whl", "/usr/bin/uv")
+        assert result is True
+        mock_popen.assert_called_once()
+        cmd = mock_popen.call_args[0][0]
+        # Command is: [python, script_file, pid, wheel, uv]
+        assert cmd[0] == "/usr/bin/python3"
+        assert cmd[1].endswith(".py")
+        assert cmd[3] == "/tmp/wheel.whl"
+        assert cmd[4] == "/usr/bin/uv"
+
+    def test_returns_false_if_script_write_fails(self):
+        """Should return False if the helper script can't be written."""
+        with (
+            patch("agent13.updater.subprocess.Popen") as mock_popen,
+            patch("agent13.updater._find_helper_python", return_value="/usr/bin/python3"),
+            patch("builtins.open", side_effect=OSError("disk full")),
+        ):
+            result = _spawn_detached_updater("/tmp/wheel.whl", "/usr/bin/uv")
+        assert result is False
+        mock_popen.assert_not_called()
+
+    def test_returns_false_on_oserror(self):
+        """Should return False if Popen raises OSError."""
+        with (
+            patch(
+                "agent13.updater.subprocess.Popen", side_effect=OSError("no python")
+            ),
+            patch("agent13.updater._find_helper_python", return_value="/usr/bin/python3"),
+            patch("builtins.open", mock_open()),
+        ):
+            result = _spawn_detached_updater("/tmp/wheel.whl", "/usr/bin/uv")
+        assert result is False
+
+
+class TestFindHelperPython:
+    """Tests for _find_helper_python."""
+
+    def test_prefers_uv_managed_python_outside_scripts(self):
+        """Should prefer a uv-managed python that is outside the Scripts dir."""
+        with (
+            patch("agent13.updater._find_scripts_dir", return_value=r"C:\Scripts"),
+            patch("agent13.updater.subprocess.run") as mock_run,
+            patch("agent13.updater.shutil.which", return_value=None),
+            patch("agent13.updater.os.path.isfile", return_value=True),
+        ):
+            mock_run.return_value = MagicMock(
+                returncode=0,
+                stdout="C:\\uv\\python\\cpython-3.14\\python.exe\n",
+            )
+            result = _find_helper_python()
+        assert result == r"C:\uv\python\cpython-3.14\python.exe"
+
+    def test_skips_python_inside_scripts_dir(self):
+        """Should skip a uv-managed python that is inside the Scripts dir
+        and fall back to a system python outside it."""
+        with (
+            patch("agent13.updater._find_scripts_dir", return_value=r"C:\Scripts"),
+            patch("agent13.updater.subprocess.run") as mock_run,
+            patch("agent13.updater.shutil.which", return_value=r"C:\Python314\python.exe"),
+            patch("agent13.updater.os.path.isfile", return_value=True),
+        ):
+            # uv-managed python is INSIDE the Scripts dir -> skip it.
+            mock_run.return_value = MagicMock(
+                returncode=0,
+                stdout="C:\\Scripts\\python.exe\n",
+            )
+            result = _find_helper_python()
+        assert result == r"C:\Python314\python.exe"
+
+    def test_falls_back_to_sys_executable(self):
+        """Should fall back to sys.executable when no candidate is found."""
+        with (
+            patch("agent13.updater._find_scripts_dir", return_value=r"C:\Scripts"),
+            patch("agent13.updater.subprocess.run", side_effect=OSError("no uv")),
+            patch("agent13.updater.shutil.which", return_value=None),
+            patch("agent13.updater.os.path.isfile", return_value=False),
+            patch("agent13.updater.sys.executable", r"C:\Scripts\python.exe"),
+        ):
+            result = _find_helper_python()
+        assert result == r"C:\Scripts\python.exe"
+
+
+class TestCheckLastUpdateResult:
+    """Tests for check_last_update_result."""
+
+    def test_no_file_returns_none(self, tmp_path):
+        """Should return None when there is no result file."""
+        with patch("agent13.updater._UPDATE_RESULT_FILE", tmp_path / "missing.json"):
+            assert check_last_update_result() is None
+
+    def test_success_result(self, tmp_path):
+        """Should return a success message and clear the file."""
+        result_file = tmp_path / "last_update.json"
+        result_file.write_text(json.dumps({"ok": True, "detail": "", "ts": 0}))
+        with patch("agent13.updater._UPDATE_RESULT_FILE", result_file):
+            msg = check_last_update_result()
+        assert msg is not None
+        assert "successfully" in msg
+        # File should be cleared after reading.
+        assert not result_file.exists()
+
+    def test_failure_result_includes_hint(self, tmp_path):
+        """Should return a failure message with an actionable hint."""
+        result_file = tmp_path / "last_update.json"
+        result_file.write_text(
+            json.dumps({"ok": False, "detail": "Access is denied", "ts": 0})
+        )
+        with patch("agent13.updater._UPDATE_RESULT_FILE", result_file):
+            msg = check_last_update_result()
+        assert msg is not None
+        assert "did not complete" in msg
+        assert "Access is denied" in msg
+        assert "antivirus" in msg.lower()
+
+    def test_corrupt_file_returns_none(self, tmp_path):
+        """Should return None (not raise) on a corrupt result file."""
+        result_file = tmp_path / "last_update.json"
+        result_file.write_text("not-json{")
+        with patch("agent13.updater._UPDATE_RESULT_FILE", result_file):
+            assert check_last_update_result() is None
 
 
 class TestCheckAndApplyUpdate:

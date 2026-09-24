@@ -280,7 +280,7 @@ Do not include:
 
 ```markdown
 ## Dev environment
-- Python 3.10+, Node.js 18+
+- Python 3.11+, Node.js 18+
 - `pip install -r requirements.txt`, `npm install`
 - Run: `python main.py`
 - Debug: `DEBUG=True python main.py`

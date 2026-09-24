@@ -30,10 +30,10 @@ from agent13.message_history import (
 from agent13.persistence import load_context, save_context
 from tools import ToolResult
 
-# 1x1 red PNG
+# 1x1 red PNG (fully decodable — the previous fixture was itself truncated)
 PNG_URI = (
     "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJ"
-    "AAAADUlEQVR42mP8z8DwHwAFAAH/q842iQAAAABJRU5ErkJggg=="
+    "AAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg=="
 )
 
 

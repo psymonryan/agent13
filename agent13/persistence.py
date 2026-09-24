@@ -70,7 +70,11 @@ def resolve_save_path(name: str) -> Path:
     Handles three cases:
     - Absolute path (starts with /): use as-is (strip .ctx if present, re-add it)
     - Tilde path (starts with ~): expand user, use as-is
-    - Bare name: sanitized to a single flat filename, joined with the saves directory
+    - Bare name: sanitized to a single flat filename. Resolved by searching
+      the project-local saves dir first, then the central dir, so /load and
+      /delete find saves created under either saves_location setting. If the
+      file exists in neither, returns a path in the configured write
+      location (so /save creates it where the setting says it belongs).
 
     This prevents the bugs where /save and /load split on spaces
     (dropping the rest of the name), where ~ is not expanded, and where a
@@ -100,7 +104,21 @@ def resolve_save_path(name: str) -> Path:
         raise ValueError(
             f"Save name is empty after removing invalid characters: {name!r}"
         )
-    return get_saves_dir() / f"{stem}.ctx"
+    filename = f"{stem}.ctx"
+
+    # Search both locations: project-local first, then central. Users flip
+    # saves_location over time, and home-dir runs make the two dirs the same
+    # physical dir — /load and /delete must find saves from either era.
+    local_candidate = get_saves_dir() / filename
+    if local_candidate.exists():
+        return local_candidate
+    central_candidate = get_global_saves_dir() / filename
+    if central_candidate.exists():
+        return central_candidate
+
+    # Not found anywhere — return the configured write location so /save
+    # creates the file where the setting says it belongs.
+    return get_auto_save_dir() / filename
 
 
 # Context file format version
@@ -396,6 +414,11 @@ def load_context(agent: "Agent", path: Path | str) -> tuple[bool, str, bool]:
 
     # Load into agent
     agent.messages = context["messages"]
+    # The saved prompt_tokens (restored below) describes the last LLM call of
+    # the saved session, which already covers these messages. Reset the
+    # safe-point bookkeeping so _estimate_current_context_tokens() does not
+    # add them on top (the live agent's index is stale after a load).
+    agent._msg_count_before_stream = len(agent.messages)
 
     # Sessions saved before injections were marked carry no flag; infer it
     # so grouping/compaction treat image messages as mid-turn.
@@ -468,36 +491,90 @@ def list_all_saves() -> list[Path]:
     Manual saves appear first, auto-saves (date-based names) last.
     Used for /load tab completion.
 
+    Files are gathered from both the project-local dir and the central dir
+    — manual saves written under a central saves_location live in the
+    central dir. Auto-saves are recognised by name pattern; everything
+    else is manual.
+
     Returns:
         List of paths sorted: manual (mtime desc), then auto-saves (mtime desc).
     """
-    manual = list_saves()
     auto_dir = get_auto_save_dir()
     saves_dir = get_saves_dir()
     project_name = Path.cwd().name
 
-    auto_saves: list[Path] = []
-    if auto_dir == saves_dir:
-        # Local mode: auto-saves are in same dir, filter by date-only pattern
-        for f in saves_dir.glob("*.ctx"):
-            if _is_auto_save_name_for_dir(
-                f.stem, is_central=False, project_name=project_name
-            ):
-                auto_saves.append(f)
-    else:
-        # Central mode: filter by project-date pattern
-        for f in auto_dir.glob("*.ctx"):
-            if _is_auto_save_name_for_dir(
-                f.stem, is_central=True, project_name=project_name
-            ):
-                auto_saves.append(f)
+    # Gather every .ctx from both locations, deduped (home-dir runs make
+    # the two dirs the same physical dir).
+    seen: set[Path] = set()
+    files: list[Path] = []
+    for d in (saves_dir, auto_dir):
+        for f in d.glob("*.ctx"):
+            if f in seen:
+                continue
+            seen.add(f)
+            files.append(f)
 
-    # Deduplicate (if local mode and same file somehow)
-    manual_set = set(manual)
-    auto_saves = [f for f in auto_saves if f not in manual_set]
+    same_dir = auto_dir == saves_dir
+    manual: list[Path] = []
+    auto_saves: list[Path] = []
+    for f in files:
+        if same_dir:
+            is_auto = _is_auto_save_name_for_dir(
+                f.stem, is_central=False, project_name=project_name
+            )
+        else:
+            # Central mode: only the central dir holds auto-saves, and only
+            # with the project-date prefix. Anything else (including manual
+            # saves written to the central dir) is manual.
+            is_auto = (
+                f.parent == auto_dir
+                and _is_auto_save_name_for_dir(
+                    f.stem, is_central=True, project_name=project_name
+                )
+            )
+        (auto_saves if is_auto else manual).append(f)
 
     # Sort each group by mtime descending
     manual.sort(key=lambda p: p.stat().st_mtime, reverse=True)
     auto_saves.sort(key=lambda p: p.stat().st_mtime, reverse=True)
 
     return manual + auto_saves
+
+
+def count_saves() -> tuple[int, int]:
+    """Count auto-saves and manual saves.
+
+    Uses the same classification as list_all_saves():
+    - local mode (or when the auto-save dir equals the manual dir, e.g.
+      running from the home directory): one dir, split by name pattern —
+      date-only stems are auto-saves, everything else is manual
+    - central mode: manual = everything in the project-local dir,
+      auto = project-prefixed date files in the central dir
+
+    Returns:
+        (auto_count, manual_count)
+    """
+    auto_dir = get_auto_save_dir()
+    saves_dir = get_saves_dir()
+    project_name = Path.cwd().name
+
+    if auto_dir == saves_dir:
+        files = list(saves_dir.glob("*.ctx"))
+        auto = [
+            f
+            for f in files
+            if _is_auto_save_name_for_dir(
+                f.stem, is_central=False, project_name=project_name
+            )
+        ]
+        return len(auto), len(files) - len(auto)
+
+    manual = list(saves_dir.glob("*.ctx"))
+    auto = [
+        f
+        for f in auto_dir.glob("*.ctx")
+        if _is_auto_save_name_for_dir(
+            f.stem, is_central=True, project_name=project_name
+        )
+    ]
+    return len(auto), len(manual)

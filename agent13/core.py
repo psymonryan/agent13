@@ -15,7 +15,13 @@ from agent13.events import AgentEvent, AgentEventData, EventHandler
 from agent13.journal import JournalManager
 from agent13.polite import PoliteLock, _sanitize_provider
 from agent13.message_history import MessageHistory, is_turn_start
-from agent13.prompts import DEFAULT_PROMPT, AUTO_COMPACT_CONTINUE_HINT
+from agent13.prompts import (
+    DEFAULT_PROMPT,
+    AUTO_CONTEXT_CONTINUE_HINT,
+    AUTO_CONTEXT_TRUTH_CUE,
+    AUTO_CONTEXT_JOURNAL_CUE,
+    DEFAULT_REPORT_AND_COMPACT_PROMPT,
+)
 from agent13.queue import AgentQueue, QueueItem
 from agent13.llm import (
     append_assistant_message,
@@ -38,8 +44,13 @@ from agent13.debug_log import (
     is_debug_enabled,
     log_tps_event,
 )
-from agent13.vision import describe_image, resize_image_uri
-from agent13.vision import SIDECAR_MAX_DIMENSION, NATIVE_MAX_DIMENSION
+from agent13.vision import (
+    NATIVE_MAX_DIMENSION,
+    SIDECAR_MAX_DIMENSION,
+    describe_image,
+    image_uri_decodable,
+    resize_image_uri,
+)
 from tools import ToolResult
 
 # Seconds of stream silence (no visible tokens, only keep-alive chunks) before
@@ -48,6 +59,17 @@ from tools import ToolResult
 # appears on the first keep-alive past the threshold. Normal responses start
 # streaming content within ~1s of the role chunk, so they never trip this.
 TOOL_CALL_PENDING_SILENCE = 5.0
+
+# Max number of times to re-issue an LLM stream that came back empty
+# (zero bytes). The first retry is the real fix: after a long pause the
+# pooled HTTP connection has gone stale, and re-issuing on a fresh
+# connection recovers. The extra attempt is insurance against a
+# transient backend hiccup; more just delays surfacing the failure.
+_MAX_EMPTY_STREAM_RETRIES = 2
+# Delay before the second retry (the first is immediate - a fresh
+# connection is the fix, there is nothing to wait for). Don't hammer a
+# struggling backend.
+_EMPTY_STREAM_RETRY_BACKOFF = 0.5
 
 if TYPE_CHECKING:
     from agent13.mcp import MCPManager
@@ -285,8 +307,10 @@ class Agent:
         devel_mode: bool = False,
         skills_mode: bool = False,
         priming_enabled: bool = False,
-        auto_compact_threshold: int = 220000,
-        auto_compact_max_iterations: int = 3,
+        auto_context_threshold: int = 220000,
+        auto_context_action: str = "report_and_compact",
+        auto_context_chain: int = 3,
+        report_and_compact_prompt: str = "",
     ):
         """Initialize the agent.
 
@@ -305,6 +329,15 @@ class Agent:
                              Defaults to False (preserve reasoning between turns).
             devel_mode: If True, include tools in the "devel" group (e.g. TUI viewer).
             skills_mode: If True, include tools in the "skills" group (e.g. skill tool).
+            auto_context_threshold: Token threshold for the auto-context check.
+            auto_context_action: What to do at the threshold - "compact",
+                "report_and_compact", or "none".
+            auto_context_chain: How many times the turn may restart after a
+                compact within one user turn (0 = none; ignored when action is
+                "none").
+            report_and_compact_prompt: Prompt text injected for the wrap-up
+                turn. Resolved from prompts.yaml ("report_and_compact") by the
+                caller; empty = use DEFAULT_REPORT_AND_COMPACT_PROMPT.
         """
         self.client = client
         self.model = model
@@ -319,14 +352,31 @@ class Agent:
         self._devel_mode = devel_mode
         self._skills_mode = skills_mode
         self.priming_enabled = priming_enabled
-        self.auto_compact_threshold = auto_compact_threshold
-        self.auto_compact_max_iterations = auto_compact_max_iterations
-        self._auto_compact_failures = 0  # Circuit breaker counter
-        self._auto_compact_triggered = False  # Set when threshold hit mid-turn
-        self._auto_compact_iterations = 0  # Compact cycles this turn (resets per turn)
-        self._auto_compact_snapshot_count = (
+        self.auto_context_threshold = auto_context_threshold
+        self._auto_context_failures = 0  # Circuit breaker counter
+        self._auto_context_triggered = False  # Set when threshold hit mid-turn
+        self._auto_context_chain_used = 0  # Chain restarts used this turn
+        self._auto_context_snapshot_count = (
             0  # Per-session monotonic (snapshot filenames)
         )
+        # Auto-context action (--report-and-compact / [auto_context] action)
+        self.auto_context_action = auto_context_action
+        self.auto_context_chain = auto_context_chain
+        self.report_and_compact_prompt = (
+            report_and_compact_prompt or DEFAULT_REPORT_AND_COMPACT_PROMPT
+        )
+        self._report_and_compact_triggered = False  # Set when threshold hit mid-turn
+        # Suppresses the auto-context threshold check while the wrap-up turn
+        # runs, so the threshold can't re-fire mid-wrap-up and loop.
+        self._suppress_auto_context = False
+        # Session journal path (docs_archive/*_journal.md) captured from the
+        # wrap-up's own append tool call; carried across chain restarts in
+        # the continuation nudge. Persists for the whole session.
+        self._session_journal_path = ""
+        # Current-truth path (docs_archive/*_current_truth.md), captured the
+        # same way; the nudge carries a read-first cue for it so the next
+        # chain orients from the durable facts before starting new work.
+        self._session_truth_path = ""
         # Message count at the start of the most recent LLM stream. Used to
         # estimate the true context size at the safe point (prompt_tokens is
         # stale there - it predates the tool results just added).
@@ -907,37 +957,68 @@ class Agent:
                     # Without this, /pause during the pending-tools branch
                     # shows "Paused" in the TUI but the loop keeps running
                     # until _llm_turn's own safe point.
-                    await self._wait_if_paused()
+                    # Mid-turn resume: the turn continues into _llm_turn
+                    # below, so report WAITING rather than IDLE.
+                    await self._wait_if_paused(resume_status=AgentStatus.WAITING)
+
+                # Turn-start threshold check: a loaded/restored session may be
+                # over-threshold (a previous turn can end over-threshold
+                # without a mid-turn hit). Compact before the resumed turn's
+                # first LLM call so it starts on a compacted context.
+                await self._check_threshold_pre_turn(_polite_acquired=_polite_acquired)
 
                 # Now call LLM to continue
                 await self._llm_turn(_polite_acquired=_polite_acquired)
                 return True
 
             elif self.history.has_incomplete_turn():
-                # Case 2: Last message is tool result, call LLM to process
+                # Case 2: Last message is tool result, call LLM to process.
+                # Turn-start threshold check first (see case 1 above).
+                await self._check_threshold_pre_turn(_polite_acquired=_polite_acquired)
                 await self._llm_turn(_polite_acquired=_polite_acquired)
                 return True
 
             return False
         finally:
             # Polite mode safety net: release the lock if still held.
-            # _llm_turn normally releases after each LLM stream (before
-            # tool execution), so on normal exit the lock is already free.
-            # This covers error/cancel paths where _llm_turn may not have
+            # _llm_turn normally releases after each LLM stream (before tool
+            # execution), so on normal exit the lock is already free. This
+            # covers error/cancel paths where _llm_turn may not have
             # had a chance to release.
             if self.polite_lock is not None and self.polite_lock.is_held():
                 self.polite_lock.release()
+            # Auto-context safety net: the resume path calls _llm_turn but has
+            # no post-turn handler of its own, so a threshold hit during the
+            # resumed turn would orphan the flags and idle over-threshold.
+            # Run the handler here (guarded by the flags; a no-op if not armed).
+            if self._report_and_compact_triggered or self._auto_context_triggered:
+                try:
+                    await self._run_auto_context_post_turn(
+                        _polite_acquired=_polite_acquired
+                    )
+                except BaseException:
+                    # Must not mask the original exception.
+                    pass
 
     @property
     def status(self) -> AgentStatus:
         """Get the current agent status."""
         return self._status
 
-    async def _wait_if_paused(self) -> None:
+    async def _wait_if_paused(self, resume_status: AgentStatus | None = None) -> None:
         """Wait while the agent is paused.
 
         This is called at safe pause points. When pause is requested,
         this will block until resume() is called.
+
+        Args:
+            resume_status: Status to report when the wait ends, for callers
+                that resume *mid-turn* (the turn continues immediately after
+                this returns). Omit it for the run loop's between-items pause,
+                where the next state is decided by the queue. Without this a
+                mid-turn resume would report IDLE while the agent is still
+                working — the status bar would read "idle", and the TUI's idle
+                handling would end the turn (elapsed timer reset, bell).
         """
         if self._pause_state == PauseState.PAUSING:
             # Transition to fully paused
@@ -950,10 +1031,14 @@ class Agent:
             # Only transition if we woke from a resume,
             # not from a stop() — check _running to distinguish.
             if self._running:
-                # Skip IDLE if there are queued items — go straight to
-                # WAITING so the user never sees "ready" between resume
-                # and processing the next item.
-                if self.queue.pending_count > 0:
+                if resume_status is not None:
+                    # Mid-turn resume: the caller continues the turn, so the
+                    # queue is irrelevant — report what it is about to do.
+                    await self._set_status(resume_status)
+                elif self.queue.pending_count > 0:
+                    # Skip IDLE if there are queued items — go straight to
+                    # WAITING so the user never sees "ready" between resume
+                    # and processing the next item.
                     await self._set_status(AgentStatus.WAITING)
                 else:
                     await self._set_status(AgentStatus.IDLE)
@@ -964,7 +1049,7 @@ class Agent:
         """Roughly estimate the token count of a list of messages.
 
         Uses a chars/4 heuristic (no tokenizer dependency). Adequate for a
-        threshold check given the headroom between the auto-compact threshold
+        threshold check given the headroom between the auto-context threshold
         and the model's real context limit.
 
         Image content blocks are counted as a fixed 170 tokens (the actual
@@ -1000,11 +1085,29 @@ class Agent:
         added = self.messages[self._msg_count_before_stream :]
         return self.prompt_tokens + self._estimate_message_tokens(added)
 
-    def _save_auto_compact_snapshot(self, n: int) -> None:
+    async def _estimate_post_compact_context(self) -> int:
+        """Estimate the context size the next LLM call will see post-compact.
+
+        System prompt + tools schema + current (compacted) messages, using
+        the same chars/4 heuristic as _estimate_message_tokens. The tools
+        schema is the largest unknown, so serialize the live tool list; on
+        failure fall back to system prompt + messages only.
+        """
+        base = len(self.system_prompt) // 4 + self._estimate_message_tokens(
+            self.messages
+        )
+        try:
+            tools = await self.get_all_tools()
+            base += len(json.dumps(tools)) // 4
+        except Exception:
+            pass
+        return base
+
+    def _save_auto_context_snapshot(self, n: int) -> None:
         """Save pre-compact history to a dated snapshot file.
 
         Uses the same location and date pattern as the auto-save, with a
-        ``_N`` suffix (N = per-session auto-compact count) so snapshots never
+        ``_N`` suffix (N = per-session auto-context count) so snapshots never
         collide. A safety net: if the journal/compact summary loses state, the
         user can reload this file. Never blocks the turn on failure.
         """
@@ -1017,6 +1120,350 @@ class Agent:
         except Exception:
             # Snapshot is best-effort; a failure here must not kill the turn.
             pass
+
+    async def _check_threshold_pre_turn(self, _polite_acquired: bool = False) -> None:
+        """Turn-start threshold check.
+
+        A turn can end over-threshold without the mid-turn safe point ever
+        firing (a final response has no tool boundary), so when the user
+        asks for the next thing — a new message, or /resume — check before
+        that turn's first LLM call. If over-threshold, run the configured
+        action (wrap-up and/or compact) so the new work starts on a compacted
+        context. A finished turn is left alone: the compact happens when the
+        user continues, not the moment the agent goes idle.
+
+        No chain restart: the incoming user message (or the resumed turn) is
+        the continuation — the caller runs the turn itself after this
+        returns. action=none pauses and waits for the user to intervene
+        (/compact, /model, /journal all) before the turn proceeds.
+        """
+        estimated_context = self._estimate_current_context_tokens()
+        # Publish the live context estimate so the UI can show it (with a
+        # "~") until the next LLM call reports the grounded count via
+        # TOKEN_USAGE.
+        await self.emit(
+            AgentEvent.CONTEXT_ESTIMATE,
+            {"estimated_tokens": estimated_context},
+        )
+        if not self._should_check_threshold(estimated_context):
+            return
+        action = await self._handle_threshold_check(estimated_context)
+        if action == "pause_wait":
+            # action=none: paused; wait for the user to intervene and
+            # /resume before the turn proceeds.
+            await self._wait_if_paused(resume_status=AgentStatus.WAITING)
+            return
+        if self._report_and_compact_triggered or self._auto_context_triggered:
+            await self._run_auto_context_post_turn(
+                _polite_acquired=_polite_acquired, restart=False
+            )
+
+    async def _run_auto_context_post_turn(
+        self, _polite_acquired: bool = False, restart: bool = True
+    ) -> None:
+        """Run the pending auto-context action.
+
+        Called from process_item and the resume path after each _llm_turn
+        (the threshold was hit mid-turn; _handle_threshold_check armed the
+        flags and broke out of the tool loop), and from
+        _check_threshold_pre_turn before a turn's first LLM call (a previous
+        turn ended over-threshold without a mid-turn hit). Runs the pending
+        wrap-up (report_and_compact), compacts, then either restarts the
+        turn (chain budget remaining) or finishes.
+
+        restart=False (pre-turn): no nudge + _llm_turn restart — the incoming
+        user message (or the resumed turn) is the continuation, and the
+        caller runs the turn itself after this returns.
+
+        The loop shape matters: a restarted _llm_turn can re-trip the
+        threshold and set the flags again — the while picks that up; do not
+        restructure into recursion.
+        """
+        while self._report_and_compact_triggered or self._auto_context_triggered:
+            if self._report_and_compact_triggered:
+                # Leave the flag set: _run_report_and_compact_turn checks it as
+                # its no-op guard (a direct call without the flag does nothing)
+                # and clears it itself. Clearing it here first would make that
+                # guard see False and skip the wrap-up turn entirely.
+                await self._run_report_and_compact_turn(
+                    _polite_acquired=_polite_acquired
+                )
+                continue  # proceed to the pending compact
+            if self._auto_context_triggered:
+                self._auto_context_triggered = False
+                # Snapshot the pre-compact history (safety net). Named with a
+                # per-session monotonic counter so snapshots never collide.
+                self._auto_context_snapshot_count += 1
+                self._save_auto_context_snapshot(self._auto_context_snapshot_count)
+                # Always a full compact (journal_mode no longer affects the auto
+                # path; per-turn reflection keeps running below the threshold).
+                success, msg = await self.compact_history("")
+                if not success:
+                    self._auto_context_failures += 1
+                    await self.emit(
+                        AgentEvent.NOTIFICATION,
+                        {
+                            "message": (f"Auto-context: compact failed — idle. {msg}"),
+                            "level": "error",
+                        },
+                    )
+                    break
+                self._auto_context_failures = 0
+                if restart and self._auto_context_chain_used < self.auto_context_chain:
+                    self._auto_context_chain_used += 1
+                    await self.emit(AgentEvent.CHAT_CLEAR, {})
+                    # Nudge the model to finish the original task. The paths
+                    # captured from the wrap-up's own writes are re-announced
+                    # so they survive into every chain restart: the truth file
+                    # with a read-first cue (orientation for the new chain -
+                    # the summary alone was shown not to reliably trigger the
+                    # read), the journal with its append-at-wrap-up cue.
+                    nudge = AUTO_CONTEXT_CONTINUE_HINT
+                    if self._session_truth_path:
+                        nudge += AUTO_CONTEXT_TRUTH_CUE.format(
+                            truth_path=self._session_truth_path
+                        )
+                    if self._session_journal_path:
+                        nudge += AUTO_CONTEXT_JOURNAL_CUE.format(
+                            journal_path=self._session_journal_path
+                        )
+                    # "injected" keeps the nudge inside the turn it lands in
+                    # (is_turn_start) and off the API wire (LOCAL_MSG_KEYS) -
+                    # it carries no user intent. The TUI's chain-restart
+                    # rebuild relies on this: the kept "last turn" must be
+                    # the compacted summary pair, not the nudge.
+                    self.messages.append(
+                        {"role": "user", "content": nudge, "injected": True}
+                    )
+                    await self._llm_turn(_polite_acquired=_polite_acquired)
+                else:
+                    await self.emit(
+                        AgentEvent.NOTIFICATION,
+                        {
+                            "message": (
+                                "Auto-context: compacted — continuing"
+                                if not restart
+                                else "Auto-context: compacted — idle, over to you"
+                            ),
+                            "level": "info",
+                        },
+                    )
+                    break
+
+    async def _run_report_and_compact_turn(
+        self, _polite_acquired: bool = False
+    ) -> None:
+        """Run the report-and-compact wrap-up turn.
+
+        Called from the post-turn handler when the threshold was hit mid-turn
+        and action = "report_and_compact". Snapshots the full history (safety
+        net), injects the wrap-up prompt (with the current date and time
+        appended so the model can write a dated journal heading), and runs
+        ONE turn with the full tool set so the model can append its session
+        journal entry while it still has full context. Auto-context is
+        suppressed for the duration so the threshold can't re-fire mid-wrap-up;
+        afterwards the pending compact proceeds. Fires once per chain cycle —
+        the per-turn chain counter (plus suppression) replaces the old
+        once-per-session latch.
+        """
+        if not self._report_and_compact_triggered:
+            # No pending wrap-up: a direct call without the flag is a no-op.
+            return
+        self._report_and_compact_triggered = False
+        self._auto_context_snapshot_count += 1
+        self._save_auto_context_snapshot(self._auto_context_snapshot_count)
+        # Inject a fake assistant message first. The threshold is hit straight
+        # after a tool result, and strict chat templates (Jinja) reject a bare
+        # user message following a tool message: "conversation roles must
+        # alternate user and assistant roles except for tool calls and
+        # results". Same trick the mid-turn interrupt path uses.
+        self.messages.append(
+            {
+                "role": "assistant",
+                "content": "[Wrapping up]",
+                "report_and_compact": True,
+            }
+        )
+        now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+        self.messages.append(
+            {
+                "role": "user",
+                "content": (
+                    f"{self.report_and_compact_prompt}\n\nCurrent date and time: {now}"
+                ),
+                "report_and_compact": True,
+            }
+        )
+        start_len = len(self.messages)
+        self._suppress_auto_context = True
+        try:
+            await self._llm_turn(_polite_acquired=_polite_acquired)
+            # Capture the journal path the model chose (its own append tool
+            # call) so the continuation nudge can carry it into every chain
+            # restart.
+            self._capture_session_journal_path(self.messages[start_len:])
+        finally:
+            self._suppress_auto_context = False
+
+    def _capture_session_journal_path(self, new_messages: list[dict]) -> None:
+        """Capture the journal and current-truth paths from the wrap-up's
+        own tool calls.
+
+        The wrap-up prompt tells the model to append to
+        docs_archive/{intent_or_feature}_journal.md and rewrite
+        docs_archive/{project}_current_truth.md. The paths the model chose
+        are carried across chain boundaries in the continuation nudge (the
+        journal: append at the next wrap-up; the truth file: read-first cue
+        for the next chain), so each later wrap-up touches the same files.
+        Last matching write wins.
+        """
+        for msg in new_messages:
+            for call in msg.get("tool_calls") or []:
+                try:
+                    fn = call["function"]
+                    if fn["name"] not in ("write_file", "edit_file"):
+                        continue
+                    # The file tools' parameter is "filepath" (write_file/
+                    # edit_file signatures). Reading "path" here always
+                    # returned "" - the nudge never carried the journal path.
+                    path = json.loads(fn["arguments"]).get("filepath", "")
+                except (KeyError, TypeError, ValueError):
+                    continue
+                if "docs_archive" not in path:
+                    continue
+                if path.endswith("_journal.md"):
+                    self._session_journal_path = path
+                elif path.endswith("_current_truth.md"):
+                    self._session_truth_path = path
+
+    @property
+    def auto_context_chain_used(self) -> int:
+        """Chain restarts consumed by the current turn (0..auto_context_chain).
+
+        Public view of _auto_context_chain_used for UIs (TUI status bar and
+        /status). Resets to 0 at the start of each user turn.
+        """
+        return self._auto_context_chain_used
+
+    def _should_check_threshold(self, estimated_context: int) -> bool:
+        """Gate for the auto-context threshold check at a safe point.
+
+        Extracted as a predicate (rather than inlined in _llm_turn) so the four
+        conditions are testable without copying them into the test.
+        """
+        return (
+            self.auto_context_threshold > 0
+            and estimated_context >= self.auto_context_threshold
+            and self._auto_context_failures < 3
+            and not self._suppress_auto_context
+        )
+
+    def _reset_auto_context_turn_state(self) -> None:
+        """Reset per-turn auto-context state at the start of each user turn.
+
+        The chain budget is per-turn (chain=N means N restarts every turn, not
+        N for the session). The flag clears are hygiene: a flag left set by a
+        failed wrap-up or compact cannot leak into the next turn.
+        """
+        self._auto_context_chain_used = 0
+        self._auto_context_triggered = False
+        self._report_and_compact_triggered = False
+
+    async def _handle_threshold_check(self, estimated_context: int) -> str:
+        """Handle the auto-context threshold being hit at a safe point.
+
+        Called from _llm_turn when _should_check_threshold passes. Decides the
+        action, emits the user notice, and arms the flags the post-turn handler
+        consumes — the actual work (wrap-up turn, compact, nudge) happens there.
+
+        Args:
+            estimated_context: Estimated current context tokens.
+
+        Returns:
+            Control action for the caller:
+              "break"      - leave _llm_turn's loop; the post-turn handler
+                              (wrap-up and/or compact) takes over
+              "pause_wait" - pause() was called (action=none); wait, then
+                              continue the loop
+              "continue"   - nothing applied (caller shouldn't get this for
+                              an over-threshold estimate, but be safe)
+        """
+        # action=none: no automatic action. Pause with context untouched so the
+        # user can /model, /compact, /journal all, then /resume. Chain is
+        # meaningless without a compact, so it is ignored.
+        if self.auto_context_action == "none":
+            if is_debug_enabled():
+                log_tps_event(
+                    "auto_context_check",
+                    {
+                        "prompt_tokens": self.prompt_tokens,
+                        "estimated_context": estimated_context,
+                        "threshold": self.auto_context_threshold,
+                        "action": self.auto_context_action,
+                        "chain": self.auto_context_chain,
+                        "chain_used": self._auto_context_chain_used,
+                    },
+                )
+            await self.emit(
+                AgentEvent.NOTIFICATION,
+                {
+                    "message": (
+                        f"Auto-context: threshold reached "
+                        f"(~{estimated_context:,} tokens) — paused "
+                        f"(action=none). /model to a larger-context model, "
+                        f"/compact, or /journal all, then /resume."
+                    ),
+                    "level": "warning",
+                },
+            )
+            self.pause()
+            return "pause_wait"
+
+        if is_debug_enabled():
+            log_tps_event(
+                "auto_context_check",
+                {
+                    "prompt_tokens": self.prompt_tokens,
+                    "estimated_context": estimated_context,
+                    "threshold": self.auto_context_threshold,
+                    "action": self.auto_context_action,
+                    "chain": self.auto_context_chain,
+                    "chain_used": self._auto_context_chain_used,
+                },
+            )
+
+        # NOTIFICATION, never ASSISTANT_TOKEN: a notice streamed into the
+        # response buffer is orphaned when the next turn's STREAM_START resets
+        # the display tracker (start_response() runs twice).
+        if self.auto_context_action == "report_and_compact":
+            await self.emit(
+                AgentEvent.NOTIFICATION,
+                {
+                    "message": (
+                        f"Report-and-compact: context at "
+                        f"~{estimated_context:,} tokens — wrapping up"
+                    ),
+                    "level": "warning",
+                },
+            )
+            # Wrap-up first, then the pending compact (post-turn handler).
+            self._report_and_compact_triggered = True
+            self._auto_context_triggered = True
+            return "break"
+
+        # action=compact (default)
+        await self.emit(
+            AgentEvent.NOTIFICATION,
+            {
+                "message": (
+                    f"Auto-context: context at ~{estimated_context:,} tokens "
+                    f"— compacting"
+                ),
+                "level": "info",
+            },
+        )
+        self._auto_context_triggered = True
+        return "break"
 
     async def _execute_tool_async(self, name: str, arguments: dict) -> str:
         """Execute a tool (handles both sync and async callables).
@@ -1091,12 +1538,27 @@ class Agent:
         if vision is None or vision.should_use_native(self.model):
             # Native: inject images inline as a user message with image_url blocks.
             # OpenAI API requires images in user role, not tool role.
-            images = [resize_image_uri(uri, NATIVE_MAX_DIMENSION) for uri in images]
+            # Unreadable images (corrupt/truncated) become text notes — sending
+            # them would make the provider reject the whole request with a 500.
             content_parts = [
                 {"type": "text", "text": f"[Image from tool: {tool_name}]"}
             ]
             for uri in images:
-                content_parts.append({"type": "image_url", "image_url": {"url": uri}})
+                resized = resize_image_uri(uri, NATIVE_MAX_DIMENSION)
+                if image_uri_decodable(resized):
+                    content_parts.append(
+                        {"type": "image_url", "image_url": {"url": resized}}
+                    )
+                else:
+                    content_parts.append(
+                        {
+                            "type": "text",
+                            "text": (
+                                "[Image unreadable — file may be corrupt or "
+                                "truncated; try re-fetching it]"
+                            ),
+                        }
+                    )
             return (
                 {"role": "tool", "tool_call_id": tool_call_id, "content": text},
                 [
@@ -1137,9 +1599,20 @@ class Agent:
                         "Describe this image in detail: all visible text, "
                         "UI elements, colors, layout, and anything notable."
                     )
-                desc = await describe_image(
-                    sidecar_config, vision.sidecar_model or None, uri, prompt
-                )
+                try:
+                    desc = await describe_image(
+                        sidecar_config, vision.sidecar_model or None, uri, prompt
+                    )
+                except Exception as e:
+                    # Sidecar failure (e.g. 500 on a corrupt image) must not
+                    # kill the turn — note it so the model can re-fetch.
+                    log_error(
+                        e, {"context": "sidecar_describe_image", "tool": tool_name}
+                    )
+                    desc = (
+                        f"[sidecar failed to describe image: {e} — "
+                        "the image may be corrupt or truncated; try re-fetching it]"
+                    )
                 descriptions.append(desc)
 
             combined = text + "\n\n" + "\n\n".join(descriptions)
@@ -1439,42 +1912,30 @@ class Agent:
                 if not self.journal_mode and self.remove_reasoning:
                     self.history.strip_reasoning()
 
+                # Reset the per-turn auto-context state before this turn
+                # starts (chain budget + triggered flags).
+                self._reset_auto_context_turn_state()
+
+                # Turn-start threshold check: a previous turn may have ended
+                # over-threshold without a mid-turn hit (a final response has
+                # no tool boundary). Compact before this turn's first LLM
+                # call so the new work starts on a compacted context. Runs
+                # BEFORE the user message is appended — the compact replaces
+                # the whole history and would swallow it.
+                await self._check_threshold_pre_turn(_polite_acquired=_polite_acquired)
+
                 # Add user message to history
                 self.messages.append({"role": "user", "content": item.text})
-
-                # Reset the per-turn compact counter before this turn starts.
-                self._auto_compact_iterations = 0
 
                 # Process with LLM (may include multiple tool call rounds)
                 await self._llm_turn(_polite_acquired=_polite_acquired)
 
-                # Auto-compact: the threshold was hit mid-turn. Compact (or
-                # journal) the history, nudge the model to resume the in-progress
-                # task, and re-enter the turn. Bounded by
-                # auto_compact_max_iterations; once the bound is reached the
-                # agent pauses (handled inside _llm_turn) instead of failing,
-                # so the user can /compact, /journal all, or /model to a
-                # bigger-context model, then /resume.
-                while self._auto_compact_triggered:
-                    self._auto_compact_triggered = False
-                    self._auto_compact_iterations += 1
-                    # Snapshot the pre-compact history (safety net). Named with
-                    # a per-session monotonic counter so snapshots never collide.
-                    self._auto_compact_snapshot_count += 1
-                    self._save_auto_compact_snapshot(self._auto_compact_snapshot_count)
-                    if self.journal_mode:
-                        success, msg = await self.journal.journal_all()
-                    else:
-                        success, msg = await self.compact_history("")
-                    if not success:
-                        self._auto_compact_failures += 1
-                        break
-                    self._auto_compact_failures = 0
-                    # Nudge the model to finish the original task.
-                    self.messages.append(
-                        {"role": "user", "content": AUTO_COMPACT_CONTINUE_HINT}
-                    )
-                    await self._llm_turn(_polite_acquired=_polite_acquired)
+                # Auto-context: the threshold was hit mid-turn. Run the pending
+                # wrap-up (report_and_compact), compact, then either restart the
+                # turn (chain budget remaining) or go idle.
+                await self._run_auto_context_post_turn(
+                    _polite_acquired=_polite_acquired
+                )
 
                 # Stage 12: Run reflection after turn completes
                 await self.journal.maybe_reflect_after_turn()
@@ -1535,6 +1996,23 @@ class Agent:
             # not have had a chance to release.
             if self.polite_lock is not None and self.polite_lock.is_held():
                 self.polite_lock.release()
+            # Auto-context safety net: if _llm_turn was interrupted before the
+            # post-turn handler ran (above), the flags armed by
+            # _handle_threshold_check are orphaned and the agent would idle
+            # over-threshold with no wrap-up/compact. Running the handler here
+            # (guarded by the flags; a no-op on the normal path) guarantees it
+            # happens. Skipped on cancel — the ESC handler restarts the loop.
+            if not self._cancel_requested and (
+                self._report_and_compact_triggered or self._auto_context_triggered
+            ):
+                try:
+                    await self._run_auto_context_post_turn(
+                        _polite_acquired=_polite_acquired
+                    )
+                except BaseException:
+                    # Must not mask the original exception that triggered this
+                    # finally block.
+                    pass
 
         # Skip IDLE if there are queued items — go straight to WAITING
         # so the TUI (and bell) never sees "ready" between queue items.
@@ -1575,6 +2053,29 @@ class Agent:
                 self.history.repair_interrupted()
             self._incomplete_turn_loaded = False
 
+    async def _close_llm_connections(self) -> None:
+        """Close the LLM client's pooled HTTP connections (best effort).
+
+        After a long pause the server's keep-alive timeout may have closed
+        the pooled connection while we were idle; the next stream is then
+        issued on a stale connection and ends with zero bytes. Closing the
+        pool forces the next request onto a fresh connection.
+
+        The pool (httpcore2.AsyncConnectionPool) stays usable after
+        aclose() - it opens fresh connections on demand. Degrades to a
+        no-op if the client's internal structure changes (or is a mock),
+        so a failed close can never break the turn.
+        """
+        try:
+            httpx_client = getattr(self.client, "_client", None)
+            transport = getattr(httpx_client, "_transport", None)
+            pool = getattr(transport, "_pool", None)
+            if pool is not None:
+                await pool.aclose()
+        except Exception:
+            # Best effort - the pool (if any) is simply left as-is.
+            pass
+
     async def _llm_turn(self, _polite_acquired: bool = False) -> None:
         """Execute one LLM turn (may include multiple tool call rounds).
 
@@ -1600,142 +2101,217 @@ class Agent:
                     if not self.polite_lock.is_held():
                         await self.polite_lock.acquire()
 
-                # Stream response, capturing reasoning and tool calls
-                content = ""
-                reasoning = ""
-                tool_calls = None
-                # Tool-call ids we've already emitted TOOL_CALL_STARTED for, so
-                # the early "name known" signal fires exactly once per tool call.
-                _started_tool_ids: set = set()
-                # Silent-stream detection: providers that buffer whole tool
-                # calls (e.g. mlx-lm) stream nothing visible while generating
-                # them - only payload-less keep-alive chunks. Track the last
-                # time a visible token arrived so a long silence can be
-                # reported to the UI as "a tool call is likely being prepared".
-                # None until the first chunk arrives: prompt-processing time
-                # (request sent -> first chunk) is normal waiting, not silence.
-                _last_visible_t: float | None = None
-                _pending_emitted = False
+                # Stream response, capturing reasoning and tool calls.
+                #
+                # Empty-stream retry: after a long pause the pooled HTTP
+                # connection has gone stale (the server's keep-alive timeout
+                # elapsed while we were idle), so the stream can end with
+                # zero bytes. For a streaming request that is
+                # indistinguishable from an empty completion - no exception
+                # is raised - so we detect "nothing came back" and re-issue
+                # on a fresh connection.
+                _empty_retries = 0
+                while True:
+                    content = ""
+                    reasoning = ""
+                    tool_calls = None
+                    # Tool-call ids we've already emitted TOOL_CALL_STARTED for, so
+                    # the early "name known" signal fires exactly once per tool call.
+                    _started_tool_ids: set = set()
+                    # Silent-stream detection: providers that buffer whole tool
+                    # calls (e.g. mlx-lm) stream nothing visible while generating
+                    # them - only payload-less keep-alive chunks. Track the last
+                    # time a visible token arrived so a long silence can be
+                    # reported to the UI as "a tool call is likely being prepared".
+                    # None until the first chunk arrives: prompt-processing time
+                    # (request sent -> first chunk) is normal waiting, not silence.
+                    _last_visible_t: float | None = None
+                    _pending_emitted = False
 
-                if is_debug_enabled():
-                    log_tps_event(
-                        "agent_stream_start",
-                        {"note": "Starting _stream_and_emit"},
-                    )
-
-                # Track first tokens for status transitions
-                _first_reasoning = True
-                _first_content = True
-
-                # Record context size at stream start so the safe point can
-                # estimate the true current context (prompt_tokens alone is
-                # stale - it predates the tool results added after this call).
-                self._msg_count_before_stream = len(self.messages)
-
-                # Stream via _stream_and_emit which handles STREAM_START
-                # and TOKEN_USAGE centrally (DRY).
-                async for event_type, data in self._stream_and_emit(
-                    self.messages,
-                    source="assistant",
-                ):
-                    if event_type == "content":
-                        content += data
-                        _last_visible_t = time.time()
-                        # Visible tokens are flowing: re-arm the silent-stream
-                        # signal. A placeholder shown during an earlier silence
-                        # was a false alarm (slow start / pre-thinking gap),
-                        # but a LATER silence in the same stream (e.g.
-                        # thinking -> buffered tool call) must signal again.
-                        _pending_emitted = False
-                        # Transition to PROCESSING on first content token
-                        if _first_content:
-                            _first_content = False
-                            await self._set_status(AgentStatus.PROCESSING)
-                        await self.emit(
-                            AgentEvent.ASSISTANT_TOKEN,
-                            {
-                                "text": data,
-                            },
+                    if is_debug_enabled():
+                        log_tps_event(
+                            "agent_stream_start",
+                            {"note": "Starting _stream_and_emit"},
                         )
-                    elif event_type == "reasoning":
-                        reasoning += data
-                        _last_visible_t = time.time()
-                        # Re-arm the silent-stream signal (same as content).
-                        _pending_emitted = False
-                        # Transition to THINKING on first reasoning token
-                        if _first_reasoning and data.strip():
-                            _first_reasoning = False
-                            await self._set_status(AgentStatus.THINKING)
-                        await self.emit(
-                            AgentEvent.ASSISTANT_REASONING,
-                            {
-                                "text": data,
-                            },
-                        )
-                    elif event_type == "keepalive":
-                        # Payload-less chunk: the stream is alive but the
-                        # server is suppressing output. The first chunk only
-                        # starts the clock (generation has begun); silence
-                        # AFTER it means the model is almost certainly
-                        # generating a (buffered) tool call - tell the UI so
-                        # the user isn't left staring at nothing.
-                        if _last_visible_t is None:
+
+                    # Track first tokens for status transitions
+                    _first_reasoning = True
+                    _first_content = True
+
+                    # Record context size at stream start so the safe point can
+                    # estimate the true current context (prompt_tokens alone is
+                    # stale - it predates the tool results added after this call).
+                    self._msg_count_before_stream = len(self.messages)
+
+                    # Stream via _stream_and_emit which handles STREAM_START
+                    # and TOKEN_USAGE centrally (DRY).
+                    async for event_type, data in self._stream_and_emit(
+                        self.messages,
+                        source="assistant",
+                    ):
+                        if event_type == "content":
+                            content += data
                             _last_visible_t = time.time()
-                            continue
-                        _silent_for = time.time() - _last_visible_t
-                        if (
-                            not _pending_emitted
-                            and _silent_for > TOOL_CALL_PENDING_SILENCE
-                        ):
-                            _pending_emitted = True
-                            if is_debug_enabled():
-                                log_tps_event(
-                                    "agent_tool_call_pending",
-                                    {
-                                        "silent_for": round(_silent_for, 1),
-                                        "note": "stream alive, no visible tokens - "
-                                        "provider likely buffering a tool call",
-                                    },
-                                )
-                            await self.emit(AgentEvent.TOOL_CALL_PENDING, {})
-                    elif event_type == "tool_call":
-                        # Early signal: the model has committed to a tool (name
-                        # known) but its arguments are still streaming. Emit once
-                        # per tool-call id so the UI can show the tool name
-                        # immediately instead of waiting for the full argument
-                        # stream to finish (which can be long — e.g. a big
-                        # write_file whose file content IS the arguments).
-                        tc_id = data.get("id")
-                        if tc_id is not None and tc_id not in _started_tool_ids:
-                            _started_tool_ids.add(tc_id)
-                            # The name is now known - any TOOL_CALL_PENDING
-                            # placeholder is superseded by the named widget.
-                            _pending_emitted = True
-                            if is_debug_enabled():
-                                log_tps_event(
-                                    "agent_tool_call_started",
-                                    {
-                                        "name": data.get("name", ""),
-                                        "id": tc_id,
-                                        "note": "name known, args still streaming",
-                                    },
-                                )
+                            # Visible tokens are flowing: re-arm the silent-stream
+                            # signal. A placeholder shown during an earlier silence
+                            # was a false alarm (slow start / pre-thinking gap),
+                            # but a LATER silence in the same stream (e.g.
+                            # thinking -> buffered tool call) must signal again.
+                            _pending_emitted = False
+                            # Transition to PROCESSING on first content token
+                            if _first_content:
+                                _first_content = False
+                                await self._set_status(AgentStatus.PROCESSING)
                             await self.emit(
-                                AgentEvent.TOOL_CALL_STARTED,
-                                {"name": data.get("name", ""), "id": tc_id},
-                            )
-                    elif event_type == "tool_calls_complete":
-                        tool_calls = data["tool_calls"]
-                        # Transition to TOOLING state when tools are about to execute
-                        await self._set_status(AgentStatus.TOOLING)
-                        if is_debug_enabled():
-                            log_tps_event(
-                                "agent_tool_calls_complete",
+                                AgentEvent.ASSISTANT_TOKEN,
                                 {
-                                    "tool_count": len(tool_calls),
-                                    "tool_names": [tc.get("name") for tc in tool_calls],
+                                    "text": data,
                                 },
                             )
+                        elif event_type == "reasoning":
+                            reasoning += data
+                            _last_visible_t = time.time()
+                            # Re-arm the silent-stream signal (same as content).
+                            _pending_emitted = False
+                            # Transition to THINKING on first reasoning token
+                            if _first_reasoning and data.strip():
+                                _first_reasoning = False
+                                await self._set_status(AgentStatus.THINKING)
+                            await self.emit(
+                                AgentEvent.ASSISTANT_REASONING,
+                                {
+                                    "text": data,
+                                },
+                            )
+                        elif event_type == "keepalive":
+                            # Payload-less chunk: the stream is alive but the
+                            # server is suppressing output. The first chunk only
+                            # starts the clock (generation has begun); silence
+                            # AFTER it means the model is almost certainly
+                            # generating a (buffered) tool call - tell the UI so
+                            # the user isn't left staring at nothing.
+                            if _last_visible_t is None:
+                                _last_visible_t = time.time()
+                                continue
+                            _silent_for = time.time() - _last_visible_t
+                            if (
+                                not _pending_emitted
+                                and _silent_for > TOOL_CALL_PENDING_SILENCE
+                            ):
+                                _pending_emitted = True
+                                if is_debug_enabled():
+                                    log_tps_event(
+                                        "agent_tool_call_pending",
+                                        {
+                                            "silent_for": round(_silent_for, 1),
+                                            "note": "stream alive, no visible tokens - "
+                                            "provider likely buffering a tool call",
+                                        },
+                                    )
+                                await self.emit(AgentEvent.TOOL_CALL_PENDING, {})
+                        elif event_type == "tool_call":
+                            # Early signal: the model has committed to a tool (name
+                            # known) but its arguments are still streaming. Emit once
+                            # per tool-call id so the UI can show the tool name
+                            # immediately instead of waiting for the full argument
+                            # stream to finish (which can be long — e.g. a big
+                            # write_file whose file content IS the arguments).
+                            tc_id = data.get("id")
+                            if tc_id is not None and tc_id not in _started_tool_ids:
+                                _started_tool_ids.add(tc_id)
+                                # The name is now known - any TOOL_CALL_PENDING
+                                # placeholder is superseded by the named widget.
+                                _pending_emitted = True
+                                if is_debug_enabled():
+                                    log_tps_event(
+                                        "agent_tool_call_started",
+                                        {
+                                            "name": data.get("name", ""),
+                                            "id": tc_id,
+                                            "note": "name known, args still streaming",
+                                        },
+                                    )
+                                await self.emit(
+                                    AgentEvent.TOOL_CALL_STARTED,
+                                    {"name": data.get("name", ""), "id": tc_id},
+                                )
+                        elif event_type == "tool_calls_complete":
+                            tool_calls = data["tool_calls"]
+                            # Transition to TOOLING state when tools are about to execute
+                            await self._set_status(AgentStatus.TOOLING)
+                            if is_debug_enabled():
+                                log_tps_event(
+                                    "agent_tool_calls_complete",
+                                    {
+                                        "tool_count": len(tool_calls),
+                                        "tool_names": [
+                                            tc.get("name") for tc in tool_calls
+                                        ],
+                                    },
+                                )
+                    # Non-empty stream: break out of the retry loop.
+                    if content or reasoning or tool_calls is not None:
+                        break
+
+                    # Empty stream: stale pooled connection (or a genuinely
+                    # empty completion). Re-issue on a fresh connection.
+                    if _empty_retries < _MAX_EMPTY_STREAM_RETRIES and self._running:
+                        _empty_retries += 1
+                        if is_debug_enabled():
+                            log_tps_event(
+                                "agent_empty_stream_retry",
+                                {
+                                    "attempt": _empty_retries,
+                                    "note": "stream ended with zero bytes - "
+                                    "retrying on a fresh connection",
+                                },
+                            )
+                        await self.emit(
+                            AgentEvent.NOTIFICATION,
+                            {
+                                "message": (
+                                    "Empty response from the model - retrying "
+                                    "on a fresh connection"
+                                ),
+                                "level": "info",
+                            },
+                        )
+                        await self._close_llm_connections()
+                        # First retry is immediate (a fresh connection is
+                        # the fix); delay the second so we don't hammer a
+                        # struggling backend.
+                        if _empty_retries > 1:
+                            await asyncio.sleep(_EMPTY_STREAM_RETRY_BACKOFF)
+                        continue
+
+                    # Retries exhausted: surface the empty response and
+                    # leave the turn recoverable via /resume (the history
+                    # may be dangling on a tool result).
+                    if is_debug_enabled():
+                        log_tps_event(
+                            "agent_empty_stream_exhausted",
+                            {
+                                "retries": _empty_retries,
+                                "note": "stream kept coming back empty - "
+                                "turn paused, use /resume to retry",
+                            },
+                        )
+                    retries_note = (
+                        f" after {_empty_retries} retries" if _empty_retries else ""
+                    )
+                    await self.emit(
+                        AgentEvent.NOTIFICATION,
+                        {
+                            "message": (
+                                "The model returned an empty response"
+                                f"{retries_note} - turn paused, "
+                                "use /resume to retry"
+                            ),
+                            "level": "warning",
+                        },
+                    )
+                    self.mark_incomplete_turn(True)
+                    break
 
                 # Polite mode: release the lock after streaming completes.
                 # The GPU is no longer needed — tool execution (if any) runs
@@ -1862,8 +2438,10 @@ class Agent:
                         for msg in extra_msgs:
                             self.messages.append(msg)
 
-                    # Safe pause point - check if pause requested
-                    await self._wait_if_paused()
+                    # Safe pause point - check if pause requested.
+                    # Mid-turn resume: the loop continues to the next LLM
+                    # call below, so report WAITING rather than IDLE.
+                    await self._wait_if_paused(resume_status=AgentStatus.WAITING)
 
                     # Check for interrupt messages at natural boundary
                     # (after all tool results are in, before next LLM call)
@@ -1909,11 +2487,12 @@ class Agent:
                         # cache because reasoning tokens are not stripped.
                         continue
 
-                    # Auto-compact threshold check at safe point.
+                    # Auto-context threshold check at safe point.
                     # Use the estimated CURRENT context (prompt_tokens is stale
                     # here - it predates the tool results just added). If over
-                    # the threshold, either compact-and-continue (bounded) or
-                    # pause so the user can intervene.
+                    # the threshold, run the configured action (compact, or
+                    # report-and-compact) and either chain-restart or go idle;
+                    # action=none pauses so the user can intervene.
                     estimated_context = self._estimate_current_context_tokens()
                     # Publish the live context estimate so the UI can show it
                     # (with a "~") until the next LLM call reports the grounded
@@ -1922,60 +2501,16 @@ class Agent:
                         AgentEvent.CONTEXT_ESTIMATE,
                         {"estimated_tokens": estimated_context},
                     )
-                    if (
-                        self.auto_compact_threshold > 0
-                        and estimated_context >= self.auto_compact_threshold
-                        and self._auto_compact_failures < 3
-                    ):
-                        if is_debug_enabled():
-                            log_tps_event(
-                                "auto_compact_check",
-                                {
-                                    "prompt_tokens": self.prompt_tokens,
-                                    "estimated_context": estimated_context,
-                                    "threshold": self.auto_compact_threshold,
-                                    "iterations": self._auto_compact_iterations,
-                                    "max_iterations": self.auto_compact_max_iterations,
-                                    "action": (
-                                        "compact"
-                                        if self._auto_compact_iterations
-                                        < self.auto_compact_max_iterations
-                                        else "pause"
-                                    ),
-                                },
-                            )
-                        if (
-                            self._auto_compact_iterations
-                            < self.auto_compact_max_iterations
-                        ):
-                            # Compact in the post-turn handler, then re-enter
-                            # the turn so the model finishes its task.
-                            action = "journaling" if self.journal_mode else "compacting"
-                            await self.emit(
-                                AgentEvent.ASSISTANT_TOKEN,
-                                {
-                                    "text": f"\n[Auto-compact: context at ~{estimated_context:,} tokens, {action}]\n"
-                                },
-                            )
-                            self._auto_compact_triggered = True
+                    if self._should_check_threshold(estimated_context):
+                        action = await self._handle_threshold_check(estimated_context)
+                        if action == "break":
                             break
-                        else:
-                            # Bound reached: pause at this safe point so the
-                            # user can /compact, /journal all, or /model to a
-                            # bigger-context model, then /resume.
-                            await self.emit(
-                                AgentEvent.ASSISTANT_TOKEN,
-                                {
-                                    "text": (
-                                        f"\n[Auto-compact limit ({self.auto_compact_max_iterations}) "
-                                        f"reached — context at ~{estimated_context:,} tokens. "
-                                        "Pausing. You can /compact, /journal all, or /model to a "
-                                        "larger-context model, then /resume.]\n"
-                                    )
-                                },
+                        if action == "pause_wait":
+                            # Mid-turn resume: the loop continues to the next
+                            # LLM call, so report WAITING rather than IDLE.
+                            await self._wait_if_paused(
+                                resume_status=AgentStatus.WAITING
                             )
-                            self.pause()
-                            await self._wait_if_paused()
                             continue
 
                     # Continue loop for next LLM call
@@ -2568,15 +3103,14 @@ class Agent:
                 },
             )
 
-            # Emit TOKEN_USAGE so the TUI refreshes its Ctx counter
+            # Publish a fresh context estimate so the TUI's Ctx counter drops
+            # to the post-compact size immediately. The grounded prompt_tokens
+            # is stale here - it reflects the pre-compact call that just
+            # produced the summary. The next LLM call's TOKEN_USAGE replaces
+            # this with the grounded count.
             await self.emit(
-                AgentEvent.TOKEN_USAGE,
-                {
-                    "prompt_tokens": self.prompt_tokens,
-                    "completion_tokens": 0,
-                    "total_tokens": self.prompt_tokens,
-                    "source": "compact",
-                },
+                AgentEvent.CONTEXT_ESTIMATE,
+                {"estimated_tokens": await self._estimate_post_compact_context()},
             )
 
             return True, f"Compacted {tokens_before}\u2192{tokens_after} words"

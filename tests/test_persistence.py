@@ -10,6 +10,7 @@ from agent13.config import Config
 from agent13.persistence import (
     _ensure_ctx_stem,
     _sanitize_save_stem,
+    count_saves,
     find_latest_auto_save,
     get_auto_save_dir,
     get_auto_save_path,
@@ -60,6 +61,26 @@ def _make_agent_stub(messages=None, model="test-model", system_prompt=""):
             self._incomplete = val
 
     return _Stub()
+
+
+def _patch_save_dirs(
+    monkeypatch, tmp_path, saves_location="local", global_dir=None
+):
+    """Make bare-name resolution hermetic.
+
+    resolve_save_path touches both the local saves dir and the central dir
+    (dual-location lookup), so tests must pin the config and the central
+    dir to temp locations instead of the real home.
+    """
+    monkeypatch.setattr(
+        "agent13.config.get_config", lambda: _make_config(saves_location)
+    )
+    if global_dir is None:
+        global_dir = tmp_path / "global_saves"
+    monkeypatch.setattr(
+        "agent13.persistence.get_global_saves_dir",
+        lambda: global_dir,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -398,6 +419,35 @@ class TestListAllSaves:
             "proj-2026-05-01.ctx",
         ]
 
+    def test_manual_save_in_central_dir_is_listed(self, monkeypatch, tmp_path):
+        """Central mode: /save writes to the central dir — it must be listed.
+
+        Regression: a manual save written under a central saves_location
+        fell through both groups of list_all_saves (not in the local dir,
+        not matching the project-date auto pattern), so /load completion
+        and the REPL no-name listing never showed it.
+        """
+        proj_dir = tmp_path / "proj"
+        proj_dir.mkdir()
+        monkeypatch.chdir(proj_dir)
+        monkeypatch.setattr(
+            "agent13.config.get_config", lambda: _make_config("central")
+        )
+        global_dir = tmp_path / "global_saves"
+        global_dir.mkdir()
+        monkeypatch.setattr(
+            "agent13.persistence.get_global_saves_dir", lambda: global_dir
+        )
+
+        get_saves_dir()  # ensure local dir exists (empty)
+        _touch(global_dir / "mylist.ctx", mtime=100)
+        _touch(global_dir / "proj-2026-05-20.ctx", mtime=200)
+
+        result = list_all_saves()
+        names = [p.name for p in result]
+        # mylist is manual (no project-date prefix) → manual group first
+        assert names == ["mylist.ctx", "proj-2026-05-20.ctx"]
+
     def test_manual_then_auto_local(self, monkeypatch, tmp_path):
         """Local mode: all .ctx in same dir, sorted by mtime desc.
 
@@ -689,18 +739,21 @@ class TestResolveSavePath:
     def test_bare_name(self, monkeypatch, tmp_path):
         """Bare name joins with saves dir and adds .ctx."""
         monkeypatch.setenv("AGENT13_SAVES_DIR", str(tmp_path / "saves"))
+        _patch_save_dirs(monkeypatch, tmp_path)
         path = resolve_save_path("mycontext")
         assert path == tmp_path / "saves" / "mycontext.ctx"
 
     def test_name_with_spaces(self, monkeypatch, tmp_path):
         """Names with spaces are preserved, not split."""
         monkeypatch.setenv("AGENT13_SAVES_DIR", str(tmp_path / "saves"))
+        _patch_save_dirs(monkeypatch, tmp_path)
         path = resolve_save_path("my context name")
         assert path == tmp_path / "saves" / "my context name.ctx"
 
     def test_strips_ctx_suffix(self, monkeypatch, tmp_path):
         """Existing .ctx suffix is not doubled."""
         monkeypatch.setenv("AGENT13_SAVES_DIR", str(tmp_path / "saves"))
+        _patch_save_dirs(monkeypatch, tmp_path)
         path = resolve_save_path("mycontext.ctx")
         assert path.name == "mycontext.ctx"
         assert path.name != "mycontext.ctx.ctx"
@@ -801,6 +854,7 @@ class TestResolveSavePathSanitization:
     def test_bare_name_with_slash_stays_flat(self, monkeypatch, tmp_path):
         """The c122 landmine: slash in name → single flat file, no subdir."""
         monkeypatch.setenv("AGENT13_SAVES_DIR", str(tmp_path / "saves"))
+        _patch_save_dirs(monkeypatch, tmp_path)
         path = resolve_save_path("glm5.3 flash fixes for pause / resume")
         assert path == tmp_path / "saves" / "glm5.3 flash fixes for pause resume.ctx"
         # File sits directly in saves — no subdirectory was created
@@ -809,6 +863,7 @@ class TestResolveSavePathSanitization:
     def test_bare_name_with_slash_and_ctx_suffix(self, monkeypatch, tmp_path):
         """The .ctx strip happens before sanitization, so no doubling."""
         monkeypatch.setenv("AGENT13_SAVES_DIR", str(tmp_path / "saves"))
+        _patch_save_dirs(monkeypatch, tmp_path)
         path = resolve_save_path("foo / bar.ctx")
         assert path == tmp_path / "saves" / "foo bar.ctx"
 
@@ -821,6 +876,7 @@ class TestResolveSavePathSanitization:
     def test_save_and_load_agree_on_sanitized_name(self, monkeypatch, tmp_path):
         """/save and /load must resolve the same raw string to the same file."""
         monkeypatch.setenv("AGENT13_SAVES_DIR", str(tmp_path / "saves"))
+        _patch_save_dirs(monkeypatch, tmp_path)
         raw = "glm5.3 flash fixes for pause / resume"
         save_path = resolve_save_path(raw)
         load_path = resolve_save_path(raw)
@@ -828,3 +884,104 @@ class TestResolveSavePathSanitization:
         assert save_path == load_path == resolve_save_path(
             "glm5.3 flash fixes for pause resume"
         )
+
+
+# ---------------------------------------------------------------------------
+# resolve_save_path dual-location lookup
+# ---------------------------------------------------------------------------
+
+
+class TestResolveSavePathDualLocation:
+    """Bare names search local then central; writes go to the configured dir.
+
+    Regression: /load could not find central auto-saves (resolve_save_path
+    only looked in the project-local dir), so a save that appeared in
+    completion failed to load by name.
+    """
+
+    def test_found_in_local_dir(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("AGENT13_SAVES_DIR", str(tmp_path / "saves"))
+        _patch_save_dirs(monkeypatch, tmp_path, "local")
+        _touch(tmp_path / "saves" / "foo.ctx")
+        assert resolve_save_path("foo") == tmp_path / "saves" / "foo.ctx"
+
+    def test_found_in_central_only(self, monkeypatch, tmp_path):
+        """A save that exists only in the central dir is found there."""
+        monkeypatch.setenv("AGENT13_SAVES_DIR", str(tmp_path / "saves"))
+        _patch_save_dirs(monkeypatch, tmp_path, "local", tmp_path / "global")
+        _touch(tmp_path / "global" / "foo.ctx")
+        assert resolve_save_path("foo") == tmp_path / "global" / "foo.ctx"
+
+    def test_local_wins_on_collision(self, monkeypatch, tmp_path):
+        """Same name in both dirs → project-local is preferred."""
+        monkeypatch.setenv("AGENT13_SAVES_DIR", str(tmp_path / "saves"))
+        _patch_save_dirs(monkeypatch, tmp_path, "local", tmp_path / "global")
+        _touch(tmp_path / "saves" / "foo.ctx")
+        _touch(tmp_path / "global" / "foo.ctx")
+        assert resolve_save_path("foo") == tmp_path / "saves" / "foo.ctx"
+
+    def test_not_found_local_mode_writes_local(self, monkeypatch, tmp_path):
+        """No file anywhere + local config → path in the local dir."""
+        monkeypatch.setenv("AGENT13_SAVES_DIR", str(tmp_path / "saves"))
+        _patch_save_dirs(monkeypatch, tmp_path, "local")
+        assert resolve_save_path("foo") == tmp_path / "saves" / "foo.ctx"
+
+    def test_not_found_central_mode_writes_central(self, monkeypatch, tmp_path):
+        """No file anywhere + central config → path in the central dir."""
+        monkeypatch.setenv("AGENT13_SAVES_DIR", str(tmp_path / "saves"))
+        _patch_save_dirs(monkeypatch, tmp_path, "central", tmp_path / "global")
+        assert resolve_save_path("foo") == tmp_path / "global" / "foo.ctx"
+
+
+# ---------------------------------------------------------------------------
+# count_saves
+# ---------------------------------------------------------------------------
+
+
+class TestCountSaves:
+    """count_saves classifies with the same rules as /load completion.
+
+    Regression: /status used the central name pattern in local mode, so the
+    auto count was always 0 and the manual count included auto-saves.
+    """
+
+    def test_local_mode_splits_by_pattern(self, monkeypatch, tmp_path):
+        monkeypatch.chdir(tmp_path)
+        _patch_save_dirs(monkeypatch, tmp_path, "local")
+        saves = tmp_path / ".agent13" / "saves"
+        _touch(saves / "2026-09-22.ctx")  # date-only → auto
+        _touch(saves / "manual-a.ctx")
+        _touch(saves / "manual-b.ctx")
+        assert count_saves() == (1, 2)
+
+    def test_local_mode_empty(self, monkeypatch, tmp_path):
+        monkeypatch.chdir(tmp_path)
+        _patch_save_dirs(monkeypatch, tmp_path, "local")
+        assert count_saves() == (0, 0)
+
+    def test_central_mode_counts_dirs_separately(self, monkeypatch, tmp_path):
+        proj = tmp_path / "proj"
+        proj.mkdir()
+        monkeypatch.chdir(proj)
+        _patch_save_dirs(monkeypatch, tmp_path, "central", tmp_path / "global")
+        _touch(proj / ".agent13" / "saves" / "manual.ctx")
+        # This project's auto-save in the central dir
+        _touch(tmp_path / "global" / "proj-2026-09-22.ctx")
+        # Another project's auto-save — must not be counted
+        _touch(tmp_path / "global" / "otherproj-2026-09-22.ctx")
+        assert count_saves() == (1, 1)
+
+    def test_same_dir_home_case(self, monkeypatch, tmp_path):
+        """Running from the home dir: auto and manual dirs are the same.
+
+        Classification falls back to the name pattern; a central-era
+        project-prefixed file is manual, a date-only file is auto.
+        """
+        home = tmp_path / "home"
+        home.mkdir()
+        monkeypatch.chdir(home)
+        _patch_save_dirs(monkeypatch, tmp_path, "local")
+        saves = home / ".agent13" / "saves"
+        _touch(saves / "2026-09-22.ctx")
+        _touch(saves / "simon-2026-06-15.ctx")
+        assert count_saves() == (1, 1)

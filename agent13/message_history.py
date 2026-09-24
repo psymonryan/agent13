@@ -11,7 +11,7 @@ from agent13.debug_log import log_journal_debug
 
 # Message keys that are local bookkeeping flags, never sent to the API.
 # Stripped in llm.build_messages() before the request goes out.
-LOCAL_MSG_KEYS = ("interrupt", "injected")
+LOCAL_MSG_KEYS = ("interrupt", "injected", "report_and_compact")
 
 
 def is_injected(msg: dict) -> bool:
@@ -27,13 +27,20 @@ def is_injected(msg: dict) -> bool:
 def is_turn_start(msg: dict) -> bool:
     """True if ``msg`` begins a new user turn.
 
-    A turn starts at a user message that is neither an interrupt (``!!``,
-    injected mid-turn) nor a native-vision image injection. Both of those
-    belong to the turn they landed in, so grouping, compaction and trims
-    keep them attached instead of splitting a turn in half.
+    A turn starts at a user message that is not agent-injected mid-turn.
+    Three kinds of user message are injected by agent13 rather than typed by
+    the user: an interrupt (``!!``), a native-vision image injection, and the
+    report-and-compact wrap-up prompt. All three carry no user intent and
+    belong to the turn they landed in, so grouping, compaction and trims keep
+    them attached instead of splitting a turn in half.
+
+    Note: membership in ``LOCAL_MSG_KEYS`` is what keeps these flags off the
+    API wire; this function must be kept in sync with that tuple, because the
+    two serve different purposes (wire-stripping vs. turn-boundary logic) and
+    neither reads the other.
     """
     return msg.get("role") == "user" and not (
-        msg.get("interrupt") or is_injected(msg)
+        msg.get("interrupt") or is_injected(msg) or msg.get("report_and_compact")
     )
 
 
@@ -99,19 +106,21 @@ class MessageHistory:
             has role 'tool'.
         """
         assistant_tc = sum(
-            1 for m in self.messages
+            1
+            for m in self.messages
             if m.get("role") == "assistant" and m.get("tool_calls")
         )
-        tool_msgs = sum(
-            1 for m in self.messages if m.get("role") == "tool"
-        )
+        tool_msgs = sum(1 for m in self.messages if m.get("role") == "tool")
         result = assistant_tc > 0 or tool_msgs > 0
-        log_journal_debug("has_tool_calls", {
-            "messages_count": len(self.messages),
-            "assistant_with_tool_calls": assistant_tc,
-            "tool_messages": tool_msgs,
-            "result": result,
-        })
+        log_journal_debug(
+            "has_tool_calls",
+            {
+                "messages_count": len(self.messages),
+                "assistant_with_tool_calls": assistant_tc,
+                "tool_messages": tool_msgs,
+                "result": result,
+            },
+        )
         return result
 
     def find_last_user_idx(self, start: int | None = None) -> int | None:
@@ -144,11 +153,14 @@ class MessageHistory:
             Returns None if no tool-using turn is found.
         """
         if not self.messages:
-            log_journal_debug("find_earliest_tool_turn", {
-                "messages_count": 0,
-                "result": None,
-                "reason": "no_messages",
-            })
+            log_journal_debug(
+                "find_earliest_tool_turn",
+                {
+                    "messages_count": 0,
+                    "result": None,
+                    "reason": "no_messages",
+                },
+            )
             return None
 
         # Step 1: Find the first assistant message with tool_calls
@@ -159,11 +171,14 @@ class MessageHistory:
                 break
 
         if first_tool_idx is None:
-            log_journal_debug("find_earliest_tool_turn", {
-                "messages_count": len(self.messages),
-                "result": None,
-                "reason": "no_tool_calls_found",
-            })
+            log_journal_debug(
+                "find_earliest_tool_turn",
+                {
+                    "messages_count": len(self.messages),
+                    "result": None,
+                    "reason": "no_tool_calls_found",
+                },
+            )
             return None
 
         # Step 2: Find the turn-start user message for this turn
@@ -204,11 +219,14 @@ class MessageHistory:
             # concluding assistant text (e.g. after --continue or interrupted runs)
             end_idx = len(self.messages) - 1
 
-        log_journal_debug("find_earliest_tool_turn", {
-            "messages_count": len(self.messages),
-            "result": (user_idx, end_idx),
-            "first_tool_idx": first_tool_idx,
-        })
+        log_journal_debug(
+            "find_earliest_tool_turn",
+            {
+                "messages_count": len(self.messages),
+                "result": (user_idx, end_idx),
+                "first_tool_idx": first_tool_idx,
+            },
+        )
         return (user_idx, end_idx)
 
     def count_tool_turns(self) -> int:
@@ -222,10 +240,13 @@ class MessageHistory:
             Number of tool-using turn groups.
         """
         if not self.messages:
-            log_journal_debug("count_tool_turns", {
-                "messages_count": 0,
-                "result": 0,
-            })
+            log_journal_debug(
+                "count_tool_turns",
+                {
+                    "messages_count": 0,
+                    "result": 0,
+                },
+            )
             return 0
 
         count = 0
@@ -239,10 +260,13 @@ class MessageHistory:
                     count += 1
                     in_tool_turn = True
 
-        log_journal_debug("count_tool_turns", {
-            "messages_count": len(self.messages),
-            "result": count,
-        })
+        log_journal_debug(
+            "count_tool_turns",
+            {
+                "messages_count": len(self.messages),
+                "result": count,
+            },
+        )
         return count
 
     def has_tool_calls_in_last_turn(self) -> bool:
@@ -683,9 +707,7 @@ class MessageHistory:
         # journal summary" and getting stuck in reflection mode.
         from agent13.prompts import JOURNAL_USER_MESSAGE
 
-        original_content = content_to_text(
-            self.messages[last_user_idx].get("content")
-        )
+        original_content = content_to_text(self.messages[last_user_idx].get("content"))
         self.messages[last_user_idx] = {
             "role": "user",
             "content": JOURNAL_USER_MESSAGE.format(original=original_content),
@@ -724,18 +746,24 @@ class MessageHistory:
 
                     # Emit as single text-only assistant message
                     label = f"[Skill: {skill_name}]" if skill_name else "[Skill]"
-                    self.messages.append({
-                        "role": "assistant",
-                        "content": f"{label}\n\n{skill_content}" if skill_content else label,
-                    })
+                    self.messages.append(
+                        {
+                            "role": "assistant",
+                            "content": f"{label}\n\n{skill_content}"
+                            if skill_content
+                            else label,
+                        }
+                    )
                 else:
                     # Non-skill message (shouldn't happen, but handle gracefully)
                     content = msg.get("content", "")
                     if content:
-                        self.messages.append({
-                            "role": "assistant",
-                            "content": content,
-                        })
+                        self.messages.append(
+                            {
+                                "role": "assistant",
+                                "content": content,
+                            }
+                        )
                 i += 1
 
         # Then append the combined summary

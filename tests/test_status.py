@@ -58,10 +58,17 @@ class MockAgent:
         self.devel_mode = kwargs.get("devel_mode", False)
         self.skills_mode = kwargs.get("skills_mode", False)
         self.remove_reasoning = kwargs.get("remove_reasoning", False)
+        self.auto_context_threshold = kwargs.get("auto_context_threshold", 220000)
+        self.auto_context_action = kwargs.get(
+            "auto_context_action", "report_and_compact"
+        )
+        self.auto_context_chain = kwargs.get("auto_context_chain", 3)
+        self.auto_context_chain_used = kwargs.get("auto_context_chain_used", 0)
 
     @property
     def status(self):
         from agent13.core import AgentStatus
+
         if self.is_paused:
             return AgentStatus.IDLE
         return AgentStatus.IDLE
@@ -253,14 +260,29 @@ class TestGatherStatus:
 
     def test_settings_enabled(self):
         agent = self._make_agent(
-            journal_mode=True, devel_mode=True,
-            skills_mode=True, remove_reasoning=True,
+            journal_mode=True,
+            devel_mode=True,
+            skills_mode=True,
+            remove_reasoning=True,
         )
         sd = gather_status(agent, "p", "m", time.time())
         assert sd.journal_mode is True
         assert sd.devel_mode is True
         assert sd.skills_mode is True
         assert sd.remove_reasoning is True
+
+    def test_auto_context_settings(self):
+        agent = self._make_agent(
+            auto_context_threshold=150000,
+            auto_context_action="compact",
+            auto_context_chain=2,
+            auto_context_chain_used=1,
+        )
+        sd = gather_status(agent, "p", "m", time.time())
+        assert sd.auto_context_threshold == 150000
+        assert sd.auto_context_action == "compact"
+        assert sd.auto_context_chain == 2
+        assert sd.auto_context_chain_used == 1
 
     def test_active_prompt(self):
         pm = MockPromptManager(active="coding")
@@ -276,6 +298,7 @@ class TestGatherStatus:
     @mock.patch("tools.security.get_current_sandbox_mode")
     def test_sandbox_mode(self, mock_sandbox):
         from agent13.sandbox import SandboxMode
+
         mock_sandbox.return_value = SandboxMode.OFF
         agent = self._make_agent()
         sd = gather_status(agent, "p", "m", time.time())
@@ -287,6 +310,38 @@ class TestGatherStatus:
         agent = self._make_agent()
         sd = gather_status(agent, "p", "m", time.time())
         assert sd.sandbox_mode == "unknown"
+
+    @mock.patch("agent13.pins.get_pinned_devel")
+    @mock.patch("agent13.sandbox.get_pinned_sandbox_mode")
+    @mock.patch("tools.security.get_current_sandbox_mode")
+    def test_pins_populated(
+        self, mock_sandbox, mock_sandbox_pin, mock_devel_pin
+    ):
+        from agent13.sandbox import SandboxMode
+
+        mock_sandbox.return_value = SandboxMode.OFF
+        mock_sandbox_pin.return_value = SandboxMode.PERMISSIVE_CLOSED
+        mock_devel_pin.return_value = True
+        agent = self._make_agent()
+        sd = gather_status(agent, "p", "m", time.time())
+        assert sd.sandbox_pinned == "permissive-closed"
+        assert sd.devel_pinned is True
+
+    @mock.patch("agent13.pins.get_pinned_devel")
+    @mock.patch("agent13.sandbox.get_pinned_sandbox_mode")
+    @mock.patch("tools.security.get_current_sandbox_mode")
+    def test_pins_none_when_unpinned(
+        self, mock_sandbox, mock_sandbox_pin, mock_devel_pin
+    ):
+        from agent13.sandbox import SandboxMode
+
+        mock_sandbox.return_value = SandboxMode.OFF
+        mock_sandbox_pin.return_value = None
+        mock_devel_pin.return_value = None
+        agent = self._make_agent()
+        sd = gather_status(agent, "p", "m", time.time())
+        assert sd.sandbox_pinned is None
+        assert sd.devel_pinned is None
 
     def test_tui_fields_default_none(self):
         """TUI-only optional fields default to None."""
@@ -342,12 +397,17 @@ class TestStatusData:
             tool_successes=45,
             tool_calls=52,
             sandbox_mode="off",
+            sandbox_pinned="off",
             journal_mode=True,
+            devel_pinned=False,
         )
         assert sd.provider == "openrouter"
         assert sd.mcp_status == "connected"
         assert sd.journal_mode is True
         assert sd.devel_mode is False  # default
+        assert sd.sandbox_pinned == "off"
+        assert sd.devel_pinned is False  # pinned off, not "no pin"
+
 
 # -- Tests for toggle_enum --
 

@@ -6,10 +6,19 @@ Can perform in-place upgrade via uv tool and prompt user to restart.
 On Windows, the Scripts directory (containing both agent13.exe and
 python.exe) is locked by the OS and cannot be deleted or replaced.
 However, Windows *does* allow renaming locked files and directories.
-We exploit this by renaming Scripts/ -> Scripts.old/ before running
+We exploit this by renaming Scripts/ to a temp location before running
 ``uv tool install --force``, which can then create a fresh Scripts/
-directory unimpeded.  Any leftover .old directory is cleaned up on
+directory unimpeded.  Any leftover temp directory is cleaned up on
 next launch.
+
+The rename is not guaranteed to succeed: the directory is locked for
+renaming if any process holds it as its current working directory
+(WinError 32) or has a file inside it open without FILE_SHARE_DELETE
+(WinError 5, e.g. antivirus or a file explorer window).  When the
+rename fails we fall back to a *detached helper* process that runs
+``uv tool install --force`` after the current process has exited, at
+which point the locks are released.  The helper records its outcome in
+a result file that the next launch reports on.
 
 Config keys (in ~/.agent13/config.toml):
     [updates]
@@ -19,11 +28,13 @@ Config keys (in ~/.agent13/config.toml):
 
 import json
 import logging
+import ntpath
 import os
 import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
@@ -202,13 +213,25 @@ def _rename_locked_scripts_dir() -> Optional[str]:
         except OSError:
             pass
 
-    try:
-        os.rename(scripts_dir, tmp_old)
-        logger.info("Renamed locked Scripts dir to %s", tmp_old)
-        return tmp_old
-    except OSError as e:
-        logger.warning("Could not rename Scripts dir: %s", e)
-        return None
+    # Retry a few times: transient locks (antivirus scanning a file in
+    # the dir, a file explorer window) clear within a second or two.
+    # A persistent lock (our own cwd, a held file handle) will not clear,
+    # so we give up after a bounded number of attempts and let the caller
+    # fall back to the detached helper.
+    attempts = 5
+    for attempt in range(1, attempts + 1):
+        try:
+            os.rename(scripts_dir, tmp_old)
+            logger.info("Renamed locked Scripts dir to %s", tmp_old)
+            return tmp_old
+        except OSError as e:
+            logger.warning(
+                "Could not rename Scripts dir (attempt %d/%d): %s",
+                attempt, attempts, e,
+            )
+            if attempt < attempts:
+                time.sleep(1.0)
+    return None
 
 
 def _restore_renamed_scripts_dir(old_dir: str, scripts_dir: str) -> None:
@@ -224,21 +247,26 @@ def _restore_renamed_scripts_dir(old_dir: str, scripts_dir: str) -> None:
 
 
 def cleanup_old_scripts_dir() -> None:
-    """Remove any leftover temp Scripts directory from a previous update.
+    """Remove any leftover temp directory from a previous update.
 
     Call this at startup to clean up stale temp dirs.  The old Scripts
     directory is moved to %TEMP%\agent13-scripts-<pid>.old before
-    install and cleaned up after success, but this is a safety net for
+    install (in-process path), and the whole tool dir to
+    %TEMP%\agent13-tool-helper-<pid>.old (detached helper path); both
+    are cleaned up after success, and this is a safety net for
     interrupted updates.
     """
     if os.name != "nt":
         return
 
-    # Look for agent13-scripts-*.old in the temp directory
+    # Look for agent13-scripts-*.old / agent13-tool-*.old in the temp dir
     tmp_dir = tempfile.gettempdir()
     try:
         for entry in os.listdir(tmp_dir):
-            if entry.startswith("agent13-scripts-") and entry.endswith(".old"):
+            if (
+                entry.startswith(("agent13-scripts-", "agent13-tool-"))
+                and entry.endswith(".old")
+            ):
                 old_path = os.path.join(tmp_dir, entry)
                 try:
                     shutil.rmtree(old_path)
@@ -247,6 +275,326 @@ def cleanup_old_scripts_dir() -> None:
                     logger.debug("Could not remove stale dir: %s", e)
     except OSError:
         pass
+
+
+# Result file written by the detached updater helper, read on next launch.
+_UPDATE_RESULT_FILE = get_config_dir() / "last_update.json"
+
+# Script run by the detached helper process.  It waits for the parent
+# (the running agent13) to exit so the tool dir locks are released,
+# moves the whole tool dir out of the way (polling until the transient
+# lock clears), runs `uv tool install --force` as a fresh install, and
+# records the outcome.  On install failure it rolls the tool dir back
+# so the old version keeps working.
+# Args: <parent_pid> <wheel_path> <uv_path> <tool_dir>
+_HELPER_SCRIPT = r"""
+import json, os, shutil, subprocess, sys, time
+
+_LOG = os.path.join(
+    os.environ.get("TEMP", os.environ.get("TMP", "/tmp")),
+    "agent13-updater-%s.log" % os.path.basename(sys.argv[0]),
+)
+
+def _log(msg):
+    try:
+        with open(_LOG, "a") as f:
+            f.write("%s %s\n" % (time.strftime("%H:%M:%S"), msg))
+    except Exception:
+        pass
+
+def _alive(pid):
+    # Use tasklist (not ctypes OpenProcess, which returns stale handles in
+    # detached processes) to check if the PID is alive.
+    if os.name == "nt":
+        try:
+            result = subprocess.run(
+                ["tasklist", "/FI", "PID eq %d" % pid],
+                capture_output=True, text=True, timeout=5,
+            )
+            return str(pid) in result.stdout
+        except Exception:
+            return True  # assume alive on error (keep waiting)
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+def main():
+    parent_pid = int(sys.argv[1])
+    wheel = sys.argv[2]
+    uv = sys.argv[3]
+    tool_dir = sys.argv[4] if len(sys.argv) > 4 else ""
+    # We inherit the parent's cwd, which may be the Scripts dir itself.
+    # A process whose cwd is inside a dir locks that dir for removal on
+    # Windows, so move away before uv tries to remove it.
+    try:
+        os.chdir(os.path.expanduser("~"))
+    except OSError:
+        pass
+    _log("started parent=%d uv=%s" % (parent_pid, uv))
+    # Wait (up to 60s) for the parent to exit and release the file locks.
+    # Check every 1s (tasklist is a bit slow; 0.1s would spawn too many).
+    deadline = time.time() + 60
+    while time.time() < deadline:
+        if not _alive(parent_pid):
+            _log("parent exited")
+            break
+        time.sleep(1.0)
+    else:
+        _log("timed out waiting for parent")
+    # Move the whole tool dir out of the way so uv installs fresh (no
+    # removal needed) and a failed install can be rolled back
+    # completely.  After the parent exits, the OS/AV keeps the dir tree
+    # locked for a few seconds (antivirus scanning); poll (1s apart)
+    # until the rename succeeds.  If a persistent lock never clears, run
+    # uv anyway (it may still succeed).
+    old_dir = ""
+    if tool_dir and os.path.isdir(tool_dir):
+        old_dir = os.path.join(
+            os.environ.get("TEMP", os.environ.get("TMP", "/tmp")),
+            "agent13-tool-helper-%d.old" % os.getpid(),
+        )
+        if os.path.exists(old_dir):
+            shutil.rmtree(old_dir, ignore_errors=True)
+        for attempt in range(60):
+            try:
+                os.rename(tool_dir, old_dir)
+                _log("moved tool dir to %s" % old_dir)
+                break
+            except OSError as e:
+                _log("tool rename attempt %d failed: %s" % (attempt + 1, e))
+                if attempt < 59:
+                    time.sleep(1.0)
+        else:
+            old_dir = ""
+    for attempt in (1, 2):
+        _log("running uv (attempt %d)" % attempt)
+        try:
+            result = subprocess.run(
+                [uv, "tool", "install", "--force", wheel],
+                capture_output=True, text=True, timeout=300,
+            )
+            ok = result.returncode == 0
+            detail = (result.stderr or result.stdout or "").strip()
+        except Exception as e:  # noqa: BLE001 - report any failure
+            ok = False
+            detail = str(e)
+        if ok:
+            break
+        # One retry: the lock may have been transient (e.g. antivirus).
+        if attempt == 1:
+            _log("uv failed, retrying in 3s")
+            time.sleep(3)
+    _log("uv done ok=%s" % ok)
+    if old_dir:
+        if ok:
+            # Old tool dir is no longer needed; if this fails the
+            # startup cleanup (agent13-tool-*.old) removes it later.
+            shutil.rmtree(old_dir, ignore_errors=True)
+        else:
+            # Roll back so the old version keeps working.
+            try:
+                if os.path.isdir(tool_dir):
+                    shutil.rmtree(tool_dir, ignore_errors=True)
+                os.rename(old_dir, tool_dir)
+                _log("restored tool dir")
+            except OSError as e:
+                _log("could not restore tool dir: %s" % e)
+    try:
+        os.unlink(wheel)
+    except OSError:
+        pass
+    try:
+        result_file = os.path.join(
+            os.path.expanduser("~"), ".agent13", "last_update.json"
+        )
+        os.makedirs(os.path.dirname(result_file), exist_ok=True)
+        with open(result_file, "w") as f:
+            json.dump({"ok": ok, "detail": detail[:2000], "ts": time.time()}, f)
+        _log("wrote result")
+    except Exception:  # noqa: BLE001 - result file is best-effort
+        pass
+    # Clean up this script file (we were run as `python <thisfile> ...`).
+    try:
+        os.unlink(sys.argv[0])
+    except OSError:
+        pass
+
+try:
+    main()
+except Exception as _e:  # noqa: BLE001 - log any crash for diagnosis
+    import traceback
+    _log("CRASH: %s %s" % (_e, traceback.format_exc()))
+"""
+
+
+def _is_process_alive(pid: int) -> bool:
+    """Return True if a process with the given PID is currently running."""
+    if os.name == "nt":
+        import ctypes
+
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        handle = ctypes.windll.kernel32.OpenProcess(
+            PROCESS_QUERY_LIMITED_INFORMATION, False, pid
+        )
+        if handle:
+            ctypes.windll.kernel32.CloseHandle(handle)
+            return True
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
+def _find_helper_python() -> str:
+    """Find a Python interpreter OUTSIDE the Scripts dir to run the helper.
+
+    The helper must not use the Scripts dir's own python.exe: that
+    interpreter lives inside the directory that ``uv tool install`` needs
+    to remove, and a running python locks the directory for removal
+    (WinError 5).  Prefer a uv-managed python, then a system python, and
+    fall back to ``sys.executable`` (which may be in the Scripts dir, but
+    is better than nothing).
+    """
+    scripts_dir = _find_scripts_dir()
+    # Use ntpath (Windows semantics) so the comparison is consistent on
+    # every platform -- this code path is Windows-only, but tests run on
+    # macOS where os.path.normcase/os.sep are no-ops.
+    scripts_prefix = (
+        ntpath.normcase(ntpath.normpath(scripts_dir)) + ntpath.sep
+        if scripts_dir
+        else None
+    )
+
+    candidates: list[str] = []
+    # 1. uv-managed python (most reliable, lives outside the Scripts dir)
+    try:
+        result = subprocess.run(
+            ["uv", "python", "find"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            candidates.append(result.stdout.strip())
+    except (OSError, subprocess.SubprocessError):
+        pass
+    # 2. System python on PATH
+    for name in ("python", "python3"):
+        path = shutil.which(name)
+        if path:
+            candidates.append(path)
+
+    for path in candidates:
+        if not os.path.isfile(path):
+            continue
+        norm = ntpath.normcase(ntpath.normpath(path))
+        if scripts_prefix is None or not norm.startswith(scripts_prefix):
+            return path
+    # Fallback: the current interpreter (may be in the Scripts dir).
+    return sys.executable
+
+
+def _spawn_detached_updater(wheel_path: str, uv_path: str) -> bool:
+    """Spawn a detached process that installs the wheel after we exit.
+
+    The helper waits for this process to exit (releasing the Scripts dir
+    locks), then runs ``uv tool install --force <wheel>`` and records the
+    outcome in ``_UPDATE_RESULT_FILE``.
+
+    Returns:
+        True if the helper was spawned, False otherwise.
+    """
+    # Write the helper to a temp file and run it as `python <file> ...`.
+    # Passing it via `-c` is unreliable on Windows: the script contains
+    # double quotes that subprocess.list2cmdline does not escape, so the
+    # command line is mis-parsed.  A file avoids all quoting issues.
+    script_path = os.path.join(
+        tempfile.gettempdir(), f"agent13-updater-{os.getpid()}.py"
+    )
+    try:
+        with open(script_path, "w") as f:
+            f.write(_HELPER_SCRIPT)
+    except OSError as e:
+        logger.warning("Could not write helper script: %s", e)
+        return False
+
+    scripts_dir = _find_scripts_dir()
+    cmd = [
+        _find_helper_python(),
+        script_path,
+        str(os.getpid()),
+        wheel_path,
+        uv_path,
+        os.path.dirname(scripts_dir) if scripts_dir else "",
+    ]
+    common = dict(
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        stdin=subprocess.DEVNULL,
+        close_fds=True,
+    )
+    try:
+        if os.name == "nt":
+            DETACHED_PROCESS = 0x00000008
+            CREATE_NEW_PROCESS_GROUP = 0x00000200
+            CREATE_NO_WINDOW = 0x08000000
+            subprocess.Popen(
+                cmd,
+                creationflags=(
+                    DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW
+                ),
+                **common,
+            )
+        else:
+            subprocess.Popen(cmd, start_new_session=True, **common)
+        logger.info("Spawned detached updater helper for %s", wheel_path)
+        return True
+    except OSError as e:
+        logger.warning("Could not spawn detached updater: %s", e)
+        return False
+
+
+def check_last_update_result() -> Optional[str]:
+    """Read and clear the detached updater's result file.
+
+    Called at startup to report on a scheduled update from a previous
+    launch.  Returns a human-readable message, or None if there is no
+    recorded result (or it could not be read).
+    """
+    try:
+        if not _UPDATE_RESULT_FILE.exists():
+            return None
+        with open(_UPDATE_RESULT_FILE) as f:
+            data = json.load(f)
+    except (OSError, ValueError) as e:
+        logger.debug("Could not read last update result: %s", e)
+        return None
+    finally:
+        try:
+            _UPDATE_RESULT_FILE.unlink()
+        except OSError:
+            pass
+
+    if data.get("ok"):
+        return "Your scheduled update completed successfully."
+    detail = (data.get("detail") or "").strip()
+    msg = "Your scheduled update did not complete."
+    if detail:
+        msg += f" ({detail[:300]})"
+    msg += (
+        " Close any file explorer windows showing the agent13 install "
+        "directory and temporarily disable antivirus, then run "
+        "`agent13 --upgrade` again."
+    )
+    return msg
 
 
 def check_for_update(
@@ -586,6 +934,26 @@ def perform_update(
     # Step 3: On Windows, rename the locked Scripts dir so uv can replace it
     scripts_dir = _find_scripts_dir()
     renamed_old = _rename_locked_scripts_dir()
+
+    # Step 3b: If the rename failed, the Scripts dir is still locked (a
+    # process holds it as its cwd, or has a file inside it open).  An
+    # in-process `uv tool install` would fail for the same reason.  Fall
+    # back to a detached helper that runs the install after we exit, when
+    # our own locks are released.  The wheel is kept (not unlinked in the
+    # finally block below) because the helper consumes it.
+    if os.name == "nt" and renamed_old is None and scripts_dir is not None:
+        uv_path = shutil.which("uv") or "uv"
+        if _spawn_detached_updater(tmp_path, uv_path):
+            _say(
+                "Scripts dir is locked; scheduling the update to finish "
+                "after agent13 exits."
+            )
+            return True, (
+                "Update scheduled. It will complete after agent13 exits. "
+                "Restart agent13 to use the new version."
+            )
+        # Could not spawn the helper; fall through to the in-process
+        # install so the user sees the real error.
 
     # Step 4: Install via uv
     if os.name == "nt":

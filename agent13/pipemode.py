@@ -114,8 +114,10 @@ async def run_pipe_mode(
     read_files: list[str] | None = None,
     polite_interval: float | None = None,
     priming_enabled: bool = False,
-    auto_compact_threshold: int = 220000,
-    auto_compact_max_iterations: int = 3,
+    auto_context_threshold: int = 220000,
+    auto_context_action: str = "report_and_compact",
+    auto_context_chain: int = 3,
+    report_and_compact_prompt: str = "",
 ) -> None:
     """Long-running pipe session: NDJSON in on stdin, NDJSON out on stdout.
 
@@ -152,8 +154,10 @@ async def run_pipe_mode(
         skills_mode=skills_mode,
         journal_mode=journal_mode,
         priming_enabled=priming_enabled,
-        auto_compact_threshold=auto_compact_threshold,
-        auto_compact_max_iterations=auto_compact_max_iterations,
+        auto_context_threshold=auto_context_threshold,
+        auto_context_action=auto_context_action,
+        auto_context_chain=auto_context_chain,
+        report_and_compact_prompt=report_and_compact_prompt,
     )
 
     agent.available_models = []
@@ -298,6 +302,14 @@ async def run_pipe_mode(
         if event.event != AgentEvent.ASSISTANT_REASONING or shutting_down:
             return
         reasoning_buf.append(event.text or "")
+
+    @agent.on_event
+    async def on_notification(event):
+        if event.event != AgentEvent.NOTIFICATION or shutting_down:
+            return
+        message = event.data.get("message", "")
+        if message:
+            _log(f"[notice] {message}")
 
     @agent.on_event
     async def on_tool_call(event):

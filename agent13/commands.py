@@ -567,7 +567,11 @@ def format_history_groups(agent) -> list[HistoryGroup]:
 
 
 def list_save_names() -> list[str]:
-    """List available save names (stems without .ctx extension)."""
-    from agent13.persistence import list_saves
+    """List available save names (stems without .ctx extension).
 
-    return [s.stem for s in list_saves()]
+    Searches both the project-local and central saves dirs — manual saves
+    written under a central saves_location live in the central dir.
+    """
+    from agent13.persistence import list_all_saves
+
+    return [s.stem for s in list_all_saves()]

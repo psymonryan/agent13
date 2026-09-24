@@ -89,10 +89,16 @@ class StatusData:
 
     # ── Settings ──
     sandbox_mode: str = "unknown"
+    sandbox_pinned: Optional[str] = None  # pinned mode value, None = no pin
     journal_mode: bool = False
     devel_mode: bool = False
+    devel_pinned: Optional[bool] = None  # pinned devel state, None = no pin
     skills_mode: bool = False
     remove_reasoning: bool = False
+    auto_context_threshold: int = 0
+    auto_context_action: str = ""
+    auto_context_chain: int = 0
+    auto_context_chain_used: int = 0
 
     # ── TUI-only (Optional) ──
     # These fields are populated by the TUI for its richer status display.
@@ -187,6 +193,24 @@ def gather_status(
     except Exception:
         sandbox_mode = "unknown"
 
+    # ── Pins (per-project; rendered as "(pinned: <value>)" in /status) ──
+    from agent13.pins import get_pinned_devel
+    from agent13.sandbox import get_pinned_sandbox_mode
+
+    sandbox_pinned: Optional[str] = None
+    try:
+        pinned = get_pinned_sandbox_mode()
+        if pinned is not None:
+            sandbox_pinned = pinned.value
+    except Exception:
+        pass
+
+    devel_pinned: Optional[bool] = None
+    try:
+        devel_pinned = get_pinned_devel()
+    except Exception:
+        pass
+
     return StatusData(
         # Session
         agent_status=agent_status,
@@ -213,10 +237,16 @@ def gather_status(
         tool_calls=stats.total_calls,
         # Settings
         sandbox_mode=sandbox_mode,
+        sandbox_pinned=sandbox_pinned,
         journal_mode=agent.journal_mode,
         devel_mode=agent.devel_mode,
+        devel_pinned=devel_pinned,
         skills_mode=agent.skills_mode,
         remove_reasoning=agent.remove_reasoning,
+        auto_context_threshold=agent.auto_context_threshold,
+        auto_context_action=agent.auto_context_action,
+        auto_context_chain=agent.auto_context_chain,
+        auto_context_chain_used=agent.auto_context_chain_used,
     )
 
 
@@ -259,9 +289,7 @@ def get_tool_stats_summary(agent) -> dict:
     rate = (successes / total * 100) if total > 0 else 0.0
 
     per_tool = []
-    for name, count in sorted(
-        stats.calls.items(), key=lambda x: x[1], reverse=True
-    ):
+    for name, count in sorted(stats.calls.items(), key=lambda x: x[1], reverse=True):
         per_tool.append(
             {
                 "name": name,

@@ -58,6 +58,9 @@ class AgentEvent(Enum):
     # Interrupt injection
     INTERRUPT_INJECTED = "interrupt_injected"  # Interrupt message injected mid-turn
 
+    # Display
+    CHAT_CLEAR = "chat_clear"  # Chat display cleared at a chain restart (display only, never history)
+
     # Streaming
     STREAM_START = "stream_start"  # Emitted at start of each LLM stream
 

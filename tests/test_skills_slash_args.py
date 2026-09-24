@@ -94,6 +94,7 @@ def _make_app(skill_manager):
     agent.queue.pending_count = 0
     agent.queue.current = None
     agent.devel_mode = False
+    agent.auto_context_chain_used = 0
     app.agent = agent
     return app, agent
 

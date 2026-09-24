@@ -13,14 +13,21 @@ Fix: continue_incomplete_turn() now calls _set_status(WAITING) right
 after clearing the flag and before any work, mirroring _process_item.
 This test pins that behaviour: STATUS_CHANGE to WAITING is observed
 synchronously, before _llm_turn() is awaited.
+
+Second case, same family: a mid-turn /resume. _wait_if_paused() used to
+report IDLE on resume whenever the queue was empty — correct for the run
+loop's between-items pause (the agent then blocks on the queue), but wrong
+for the callers that resume *mid-turn* and continue the turn immediately.
+Those now pass resume_status=WAITING, so no IDLE is emitted at all.
 """
 
+import asyncio
 import json
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from agent13.core import Agent, AgentEvent
+from agent13.core import Agent, AgentEvent, AgentStatus
 
 
 class MockClient:
@@ -204,4 +211,110 @@ class TestContinueIncompleteTurnStatus:
         assert emitted == [], (
             f"No STATUS_CHANGE should fire when there's no incomplete turn, "
             f"got: {emitted}"
+        )
+
+
+class TestMidTurnResumeStatus:
+    """A mid-turn /resume must not report IDLE.
+
+    _wait_if_paused() used to set IDLE on resume whenever the queue was empty.
+    Right for the run loop's between-items pause, wrong for the callers that
+    resume mid-turn (the /pause safe point in _llm_turn, the pending-tools
+    loop in continue_incomplete_turn, the auto-context pause_wait): they
+    continue the turn immediately, so the status bar read "idle" while the
+    agent was working — and the TUI's idle handling ended the turn (elapsed
+    timer reset, bell).
+
+    Fix: those callers pass resume_status=WAITING. The parameter is optional,
+    so the run loop keeps its queue-based behaviour.
+    """
+
+    @staticmethod
+    async def _pause_then_resume(agent, resume_status=None):
+        """Drive one pause/resume cycle through _wait_if_paused()."""
+        agent._running = True
+        assert agent.pause() is True
+        task = asyncio.create_task(agent._wait_if_paused(resume_status=resume_status))
+        # Let the coroutine promote PAUSING -> PAUSED and block on the event.
+        for _ in range(5):
+            await asyncio.sleep(0)
+        assert agent.is_paused, "should have reached the PAUSED transition"
+        agent.resume()
+        await task
+
+    @pytest.mark.asyncio
+    async def test_mid_turn_resume_reports_waiting_not_idle(self):
+        """resume_status=WAITING: IDLE is never emitted."""
+        agent = Agent(client=MockClient(), model="test-model")
+        seen = []
+
+        async def capture(event):
+            if event.event == AgentEvent.STATUS_CHANGE:
+                seen.append(event.data.get("status"))
+
+        agent._handlers.append(capture)
+
+        await self._pause_then_resume(agent, resume_status=AgentStatus.WAITING)
+
+        assert agent.status is AgentStatus.WAITING
+        assert seen == ["paused", "waiting"], (
+            f"Expected paused -> waiting with no idle, got: {seen}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_explicit_resume_status_wins_over_queue(self):
+        """A queued item must not override the caller's explicit status."""
+        agent = Agent(client=MockClient(), model="test-model")
+        agent.queue = MagicMock()
+        agent.queue.pending_count = 3
+
+        await self._pause_then_resume(agent, resume_status=AgentStatus.WAITING)
+
+        assert agent.status is AgentStatus.WAITING
+
+    @pytest.mark.asyncio
+    async def test_default_resume_keeps_queue_based_behaviour(self):
+        """Without resume_status the run loop's rule is unchanged."""
+        idle_agent = Agent(client=MockClient(), model="test-model")
+        idle_agent.queue = MagicMock()
+        idle_agent.queue.pending_count = 0
+        await self._pause_then_resume(idle_agent)
+        assert idle_agent.status is AgentStatus.IDLE
+
+        busy_agent = Agent(client=MockClient(), model="test-model")
+        busy_agent.queue = MagicMock()
+        busy_agent.queue.pending_count = 2
+        await self._pause_then_resume(busy_agent)
+        assert busy_agent.status is AgentStatus.WAITING
+
+    @pytest.mark.asyncio
+    async def test_pending_tools_safe_point_passes_resume_status(self):
+        """continue_incomplete_turn's pending-tools safe point passes WAITING.
+
+        That loop resumes mid-turn into _llm_turn, so a bare
+        _wait_if_paused() would report IDLE on resume.
+        """
+        agent = _make_agent_with_incomplete_turn()
+        agent._running = True
+        seen = []
+
+        async def fake_wait_if_paused(resume_status=None):
+            seen.append(resume_status)
+
+        async def fake_execute_tool(name, args):
+            return "ok"
+
+        async def fake_llm_turn(_polite_acquired=False):
+            return None
+
+        agent._wait_if_paused = fake_wait_if_paused
+
+        with (
+            patch.object(agent, "_execute_tool_async", side_effect=fake_execute_tool),
+            patch.object(agent, "_llm_turn", side_effect=fake_llm_turn),
+        ):
+            await agent.continue_incomplete_turn()
+
+        assert seen == [AgentStatus.WAITING], (
+            f"the pending-tools safe point must resume as WAITING, got: {seen}"
         )

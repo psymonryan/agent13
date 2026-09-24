@@ -20,10 +20,17 @@ def spawn_process(command, args=None, env=None, encoding="utf-8", timeout=30,
         cmd_str = f"{command} {' '.join(args or [])}"
         proc = PopenSpawn(cmd_str, encoding=encoding, codec_errors="replace",
                           timeout=timeout, env=env)
+
         # PopenSpawn lacks .close() and .sendcontrol() that pexpect.spawn has.
-        # .close() -> send EOF then terminate the underlying subprocess.
+        # .close(force) mirrors pexpect.spawn.close(force=False):
+        #   force=False -> send EOF then terminate the underlying subprocess.
+        #   force=True  -> terminate immediately (no EOF).
         # .sendcontrol(c) -> send the control character (Ctrl+C = \x03, Ctrl+D = \x04, etc).
-        proc.close = lambda: (proc.sendeof(), proc.proc.terminate())
+        def _close(force=False):
+            if not force:
+                proc.sendeof()
+            proc.proc.terminate()
+        proc.close = _close
         _orig_sendcontrol = getattr(proc, 'sendcontrol', None)
         if _orig_sendcontrol is None:
             def _sendcontrol(char):

@@ -262,6 +262,11 @@ async def run_remote_command(
     else:
         shell = await detect_remote_shell(host)
 
+    # Normalize line endings for Windows: PowerShell is CRLF-oriented, so
+    # make the payload deterministic before encoding (spec item 3).
+    if shell == "powershell":
+        command = command.replace("\r\n", "\n").replace("\n", "\r\n")
+
     # Encode the payload: base64 of UTF-8, no newlines.
     b64 = base64.b64encode(command.encode("utf-8")).decode("ascii")
     _validate_b64_payload(b64)
@@ -289,6 +294,8 @@ async def run_remote_command(
             ),
             "truncated": False,
             "timed_out": False,
+            "status": "error",
+            "output_encoding": "utf-8",
             "remote": host,
             "remote_shell": shell,
         }
@@ -361,6 +368,8 @@ async def run_remote_command(
             "stderr": stderr,
             "truncated": truncated,
             "timed_out": False,
+            "status": "completed",
+            "output_encoding": "utf-8",
             "remote": host,
             "remote_shell": shell,
         }
@@ -375,6 +384,8 @@ async def run_remote_command(
             "stderr": f"Error running remote command: {e}",
             "truncated": False,
             "timed_out": False,
+            "status": "error",
+            "output_encoding": "utf-8",
             "remote": host,
             "remote_shell": shell,
         }
@@ -411,6 +422,8 @@ def _remote_timeout_result(
         "stderr": stderr,
         "truncated": truncated,
         "timed_out": True,
+        "status": "timeout",
+        "output_encoding": "utf-8",
         "remote": host,
         "remote_shell": shell,
     }

@@ -52,15 +52,135 @@ mentor: |
   - Encourage experimentation — suggest variations they can try
   - Never just give the answer; teach the thinking process
 
+# Auto-context wrap-up and compaction prompts (mirror of the Python
+# constants in agent13/prompts.py; the constants win when this file is
+# absent or the key is missing).
+
+report_and_compact: |
+  CONTEXT IS NEARLY FULL. Stop investigating. Write the handoff, in this order.
+
+  SETTLE FIRST (no new work): leave in-progress work in a clean state; note
+  anything left running or half-done; verify anything you claim is unchanged
+  rather than assuming it.
+
+  1. RECONCILE (bounded, <= 5 tool calls). Before recording anything as new:
+     - Read the current-truth file in full. You are about to rewrite it;
+       every line you keep must pass through your eyes.
+     - Skim the journal (read_file, no offset/limit): the heading map is
+       your global view of every past session's attempt and outcome. Then
+       read the LAST entry in full, starting at the line number the skim
+       gives. Not the whole journal: the last entry.
+     - If a long project doc exists, grep it for the 3-5 key terms of this
+       session's findings.
+     Anything already documented is a CONFIRMATION with a section reference,
+     not a discovery.
+
+  2. CURRENT TRUTH - rewrite docs_archive/{project}_current_truth.md (<= 150
+     lines; create if absent). The ONLY file you may rewrite. Durable facts
+     only: what is true about this system regardless of which session you
+     are. Not where we are in the work - that is the journal's job. Delete
+     bullets no longer true. The next session reads this first.
+     No session-relative markers: no "NEW", no "this session", no "added
+     today". Every line must read correctly to someone arriving next week
+     who never saw this session. Dates as evidence provenance
+     ("[observed 2026-09-23]") are fine; dates as novelty labels are not.
+     Exact format - a single title, no opening paragraph, then sections. Omit
+     any section that would be empty; add sub-headings for detail:
+       # {project} - current truth (updated YYYY-MM-DD HH:MM)
+       ## 1. Environment & access   (where it runs, how to reach it, credentials,
+            standing constraints: never modify X)
+       - <statement>   [source ref, provenance]
+       ## 2. Conventions & notation (units, identifiers, encodings, how to read
+            the values you will see)
+       - <statement>   [source ref, provenance]
+       ## 3. Findings               (verified facts about the system; sub-heading
+            by topic)
+       - <statement>   [source ref, provenance]
+       ## 4. Tooling & traps        (how to drive the tooling; what wastes calls
+            or bites)
+       - <statement>   [source ref, provenance]
+       ## 5. Artifacts              (files you depend on)
+       - <statement>   [source ref, provenance]
+       ## 6. Open tickets          (the ONLY positional section here - it
+            changes every entry; everything above is durable fact)
+       - <ticket> - FIRST SEEN YYYY-MM-DD HH:MM [- BLOCKED: <what it waits
+         on>] [- NEEDS USER]
+       ### Parked                  (not ranked; one line each)
+       - <ticket> - parked YYYY-MM-DD: <reason>
+     Rewrite every ticket, every time: ranked most-blocking first, capped
+     at 10 - an 11th forces one out: CLOSE it (resolved), KILL it (ruled
+     out), or PARK it (set aside), with the reason recorded in the journal.
+     Keep each FIRST SEEN exactly as first written, to the minute - never
+     coarsen it to date-only.
+     The TOP UNBLOCKED ticket becomes this entry's "b. NEXT SESSION, FIRST
+     ACTION"; if you cannot work it, mark it BLOCKED and name what unblocks
+     it - a block is a state, not a failure. NEEDS USER tickets wait for
+     the user; never answer them yourself.
+
+  3. APPEND the journal entry to docs_archive/{project}_journal.md (append
+     only; create if absent.
+     Format: one dated heading (## YYYY-MM-DD HH:MM - {sub-task} - {terse
+     outcome}; one line, <= 15 words after the date - the skim view of
+     this journal is the project's map), then a bold "**<letter>. <NAME>**"
+     line per section below, in this order so truncation loses the least
+     (bold lines, NOT ### headings - ### would flood the skim view with
+     the same 8 subheadings in every entry). Every list item starts with
+     "- " - never a numbered list, never an unbulleted paragraph. Exactly
+     one blank line between sections and between entries - never two.
+     a. GOAL STATUS - one line per project end-goal: DONE / BLOCKED / NOT
+        TRIED. Then: the cheapest next step that could move a NOT-TRIED goal,
+        and whether you ran it. If not, one sentence saying why.
+     b. NEXT SESSION, FIRST ACTION - one imperative sentence that works the
+        TOP UNBLOCKED open ticket (truths file section 6), plus the check
+        that proves it worked.
+     c. STATE AT HANDOFF - anything left running/in progress; exact versions
+        or hashes of artifacts you depend on; any environment state that must
+        persist.
+     d. DERIVED VALUES - any computed/derived value you state must show the
+        arithmetic or command that produced it. No unstated mental math.
+     e. DECISIONS + RATIONALE - including what you chose NOT to do, and why.
+     f. NEW KNOWLEDGE - each item tagged with its provenance (observed /
+        inferred / assumed) and its evidence (log line, file, command output).
+        A negative result must name the method that produced it, and a
+        negative from one method does not override a positive finding from a
+        more authoritative method.
+     g. SUPERSEDES / CONTRADICTS - name the prior claim you are overriding
+        (date + section). If two existing claims disagree, resolve it or park
+        it explicitly; never leave both standing.
+     h. TICKET CHANGES - the open-ticket list lives in the truths file
+        (section 6), which you have just rewritten; do NOT restate it here.
+        Record only this entry's delta, one line each: tickets ADDED (with
+        FIRST SEEN), tickets CLOSED / KILLED / PARKED (with the reason).
+        The entry that CREATES section 6 records its seed tickets as ADDED;
+        every later PARKED move lands here too, with the reason.
+        No delta: write "- none" and nothing else.
+
+  Name the journal after the PROJECT, not this session's sub-task; put the
+  sub-task in the entry header. No cumulative version history. No prose
+  restatement of prior entries. Keep it tight - a cold reader must be able to
+  act on it.
+
+  Never leave anything important only in the conversation.
+
 compaction: |
   Summarize our conversation so far into a concise but complete context summary.
   Preserve:
   - All key decisions, their rationale, and current status
   - Important code, file paths, and technical details
+  - The project's durable record — the journal and current-truth files
+    under docs_archive/ (e.g. <project>_current_truth.md). Always name them,
+    even if untouched this session, with a cue on when to read them.
+    Mid-session journal appends (user-requested, or to make a hard-won
+    finding survive a crash) are fine: same dated heading with terse
+    outcome, plain "- " bullets, NO a-h sections - those belong to the
+    wrap-up entry only
   - New knowledge gained by doing: how to connect to hosts/services,
     exact commands that work, environment quirks and gotchas
-  - Open questions and unresolved issues
+  - Open questions and unresolved issues - the full ticket ledger lives in
+    the current-truth file (section 6); do NOT copy the list into this
+    summary. Carry only the TOP unblocked ticket - it is the next chain's
+    first work item.
   - The current direction/next steps
   Skip pleasantries and hedging. Write as a direct reference document
   that lets you continue the work seamlessly.
-  If you'd have to re-discover it from scratch, it belongs in the summary.
+  If you'd have to re-discover it from scratch, it belongs in this summary.

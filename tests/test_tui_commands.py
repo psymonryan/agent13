@@ -1736,3 +1736,80 @@ class TestBellCommandValidation:
         # ./echo doesn't exist but the validator should handle it gracefully
         result = BellManager.validate_command("./nonexistent_script")
         assert result is False
+
+
+# ============== /load completion Tests ==============
+
+
+def _make_tui_app():
+    """Build an AgentTUI with stubs, matching test_tui_client_loop's pattern."""
+    from unittest.mock import MagicMock, patch
+
+    from ui.tui import AgentTUI as ChatApp
+
+    with patch("ui.tui.get_config", return_value=MagicMock()):
+        return ChatApp(
+            client=MagicMock(),
+            model="test-model",
+            model_names=["test-model"],
+            provider="test",
+        )
+
+
+class TestLoadCompletions:
+    """/load tab completion lists saves; failures surface, not silence.
+
+    Regression: a user on Windows (running from his home dir) saw auto-saves
+    written but /load <tab> showed nothing — list_all_saves() raising was
+    swallowed by `except Exception: return []`, indistinguishable from "no
+    saves".
+    """
+
+    def test_lists_save_stems(self):
+        from unittest.mock import patch
+
+        app = _make_tui_app()
+        with patch(
+            "ui.tui.list_all_saves",
+            return_value=[Path("/saves/manual.ctx"), Path("/saves/2026-09-22.ctx")],
+        ):
+            result = app._get_load_completions("")
+        assert result == ["manual", "2026-09-22"]
+
+    def test_filters_by_partial(self):
+        from unittest.mock import patch
+
+        app = _make_tui_app()
+        with patch(
+            "ui.tui.list_all_saves",
+            return_value=[Path("/saves/manual.ctx"), Path("/saves/2026-09-22.ctx")],
+        ):
+            result = app._get_load_completions("2026")
+        assert result == ["2026-09-22"]
+
+    def test_failure_shows_hint_with_error(self):
+        """A raising list_all_saves yields a visible hint, not an empty list."""
+        from unittest.mock import patch
+
+        app = _make_tui_app()
+        with patch(
+            "ui.tui.list_all_saves",
+            side_effect=PermissionError("[WinError 5] Access is denied"),
+        ):
+            result = app._get_load_completions("")
+        assert len(result) == 1
+        assert result[0].startswith("saves list unavailable:")
+        assert "Access is denied" in result[0]
+
+    def test_failure_hint_is_truncated(self):
+        """Long exception strings can't blow out the completion dropdown."""
+        from unittest.mock import patch
+
+        app = _make_tui_app()
+        with patch(
+            "ui.tui.list_all_saves",
+            side_effect=RuntimeError("x" * 500),
+        ):
+            result = app._get_load_completions("")
+        assert len(result) == 1
+        assert len(result[0]) <= 100

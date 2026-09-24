@@ -40,8 +40,9 @@ from agent13.llm import close_tracked_asyncgens
 from agent13.persistence import save_context, get_auto_save_path
 from agent13.models import fetch_models, select_model, print_model_list
 from agent13.sandbox import parse_sandbox_mode, get_pinned_sandbox_mode
+from agent13.pins import get_pinned_devel
 from agent13.skills import SkillManager, ensure_default_skills
-from agent13.prompts import get_skills_section
+from agent13.prompts import get_skills_section, resolve_report_and_compact_prompt
 from tools.security import set_session_sandbox_mode
 from agent13.config_paths import get_global_env_file
 from agent13.fileio import ConfigFileError, read_text_robust
@@ -327,18 +328,30 @@ Provider names are read from ~/.agent13/config.toml
         help="Strip reasoning tokens between turns",
     )
     parser.add_argument(
-        "--auto-compact-threshold",
+        "--auto-context-threshold",
         type=int,
         default=None,
         metavar="TOKENS",
-        help="Auto-compact when context exceeds TOKENS (e.g. 150000). 0 or omitted = use config value",
+        help="Auto-context threshold: take the configured action when context "
+        "exceeds TOKENS (e.g. 150000). 0 or omitted = use config value",
     )
     parser.add_argument(
-        "--auto-compact-max",
+        "--auto-context-chain",
         type=int,
         default=None,
         metavar="N",
-        help="Max auto-compact-and-continue cycles per turn before pausing. Omitted = use config value",
+        help="After a compact, restart the turn up to N times within one user "
+        "turn (0 = no restarts). Omitted = use config value",
+    )
+    parser.add_argument(
+        "--report-and-compact",
+        action="store_true",
+        default=None,
+        help=(
+            "At the auto-context threshold, snapshot, run a wrap-up report turn, "
+            "then compact (and restart the turn when --auto-context-chain > 0). "
+            "Omitted = use config value"
+        ),
     )
     parser.add_argument(
         "-c",
@@ -501,9 +514,14 @@ Provider names are read from ~/.agent13/config.toml
         sys.exit(0 if success else 1)
 
     # Clean up any stale .old Scripts dir from a previous Windows update
-    from agent13.updater import cleanup_old_scripts_dir
+    from agent13.updater import cleanup_old_scripts_dir, check_last_update_result
 
     cleanup_old_scripts_dir()
+
+    # Report on a scheduled update from a previous launch (Windows helper)
+    last_result = check_last_update_result()
+    if last_result:
+        print(f"\n{last_result}\n", file=sys.stderr)
 
     # Check for updates (throttled, respects config)
     from agent13.updater import check_for_update, format_update_notice, perform_update
@@ -577,7 +595,10 @@ Provider names are read from ~/.agent13/config.toml
         client = FakeOpenAIClient()
     else:
         client = create_client(
-            base_url, api_key, read_timeout=read_timeout, connect_timeout=connect_timeout
+            base_url,
+            api_key,
+            read_timeout=read_timeout,
+            connect_timeout=connect_timeout,
         )
 
     # Fetch models
@@ -660,6 +681,9 @@ Provider names are read from ~/.agent13/config.toml
         if pinned is not None:
             set_session_sandbox_mode(pinned)
 
+    # Devel mode: explicit --devel flag > per-project pin > off
+    devel_mode = bool(args.devel) or get_pinned_devel() is True
+
     # Create skill manager (needed for both batch and TUI if skills enabled)
     skill_manager = SkillManager(lambda: get_config())
 
@@ -687,19 +711,25 @@ Provider names are read from ~/.agent13/config.toml
                 system_prompt=system_prompt,
                 journal_mode=args.journal,
                 remove_reasoning=args.remove_reasoning,
-                devel_mode=args.devel,
+                devel_mode=devel_mode,
                 skills_mode=include_skills and bool(skill_manager.skills),
                 skill_manager=skill_manager,
                 continue_session=args.continue_session,
                 read_files=args.read,
                 polite_interval=args.polite,
                 priming_enabled=args.priming_prompt,
-                auto_compact_threshold=args.auto_compact_threshold
-                if args.auto_compact_threshold is not None
-                else cfg.auto_compact_threshold,
-                auto_compact_max_iterations=args.auto_compact_max
-                if args.auto_compact_max is not None
-                else cfg.auto_compact_max_iterations,
+                auto_context_threshold=args.auto_context_threshold
+                if args.auto_context_threshold is not None
+                else cfg.auto_context_threshold,
+                auto_context_action="report_and_compact"
+                if args.report_and_compact
+                else cfg.auto_context_action,
+                auto_context_chain=args.auto_context_chain
+                if args.auto_context_chain is not None
+                else cfg.auto_context_chain,
+                report_and_compact_prompt=resolve_report_and_compact_prompt(
+                    prompt_manager
+                ),
             )
         finally:
             await client.close()
@@ -724,7 +754,7 @@ Provider names are read from ~/.agent13/config.toml
                 prompt_manager=prompt_manager,
                 system_prompt=system_prompt,
                 remove_reasoning=args.remove_reasoning,
-                devel_mode=args.devel,
+                devel_mode=devel_mode,
                 skills_mode=include_skills and bool(skill_manager.skills),
                 connect_mcp=args.mcp,
                 polite_interval=args.polite,
@@ -753,7 +783,7 @@ Provider names are read from ~/.agent13/config.toml
                 system_prompt=system_prompt,
                 journal_mode=args.journal,
                 remove_reasoning=args.remove_reasoning,
-                devel_mode=args.devel,
+                devel_mode=devel_mode,
                 skills_mode=include_skills and bool(skill_manager.skills),
                 skill_manager=skill_manager,
                 continue_session=args.continue_session,
@@ -763,14 +793,22 @@ Provider names are read from ~/.agent13/config.toml
                 polite_interval=args.polite,
                 bell_threshold=args.bell,
                 bell_enabled=cfg.bell_enabled,
-                bell_command=args.bell_command if args.bell_command is not None else cfg.bell_command,
+                bell_command=args.bell_command
+                if args.bell_command is not None
+                else cfg.bell_command,
                 priming_enabled=args.priming_prompt,
-                auto_compact_threshold=args.auto_compact_threshold
-                if args.auto_compact_threshold is not None
-                else cfg.auto_compact_threshold,
-                auto_compact_max_iterations=args.auto_compact_max
-                if args.auto_compact_max is not None
-                else cfg.auto_compact_max_iterations,
+                auto_context_threshold=args.auto_context_threshold
+                if args.auto_context_threshold is not None
+                else cfg.auto_context_threshold,
+                auto_context_action="report_and_compact"
+                if args.report_and_compact
+                else cfg.auto_context_action,
+                auto_context_chain=args.auto_context_chain
+                if args.auto_context_chain is not None
+                else cfg.auto_context_chain,
+                report_and_compact_prompt=resolve_report_and_compact_prompt(
+                    prompt_manager
+                ),
             )
         finally:
             await client.close()
@@ -781,12 +819,25 @@ Provider names are read from ~/.agent13/config.toml
     # TUI mode - import here to avoid loading Textual for batch mode
     from ui.tui import AgentTUI
 
+    # The client above made its first request (model fetch) in THIS event
+    # loop, and the TUI runs in a fresh loop (app.run()). Pooled HTTP
+    # connections are bound to the loop that created them, so a client
+    # that has already connected here would fail its first TUI request
+    # with "Event loop is closed". Close it and hand the TUI the provider
+    # args so it creates a client in its own loop. (The fake provider is
+    # offline - no connections, safe to keep.)
+    provider_args = None
+    if args.provider != "fake":
+        provider_args = (base_url, api_key, read_timeout, connect_timeout)
+        await client.close()
+
     # Return app for TUI
     return AgentTUI(
         client=client,
         model=model,
         model_names=model_names,
         provider=provider_name,
+        provider_args=provider_args,
         pretty=args.pretty == "on",
         debug=args.debug,
         tool_response_format=args.tool_response,
@@ -798,7 +849,7 @@ Provider names are read from ~/.agent13/config.toml
         journal_mode=args.journal,
         remove_reasoning=args.remove_reasoning,
         continue_session=args.continue_session,
-        devel_mode=args.devel,
+        devel_mode=devel_mode,
         spinner_speed=args.spinner,
         clipboard_method=args.clipboard
         if args._clipboard_explicit
@@ -807,15 +858,21 @@ Provider names are read from ~/.agent13/config.toml
         polite_interval=args.polite,
         bell_threshold=args.bell,
         bell_enabled=cfg.bell_enabled,
-        bell_command=args.bell_command if args.bell_command is not None else cfg.bell_command,
+        bell_command=args.bell_command
+        if args.bell_command is not None
+        else cfg.bell_command,
         priming_enabled=args.priming_prompt,
         cursor_blink=cfg.cursor_blink,
-        auto_compact_threshold=args.auto_compact_threshold
-        if args.auto_compact_threshold is not None
-        else cfg.auto_compact_threshold,
-        auto_compact_max_iterations=args.auto_compact_max
-        if args.auto_compact_max is not None
-        else cfg.auto_compact_max_iterations,
+        auto_context_threshold=args.auto_context_threshold
+        if args.auto_context_threshold is not None
+        else cfg.auto_context_threshold,
+        auto_context_action="report_and_compact"
+        if args.report_and_compact
+        else cfg.auto_context_action,
+        auto_context_chain=args.auto_context_chain
+        if args.auto_context_chain is not None
+        else cfg.auto_context_chain,
+        report_and_compact_prompt=resolve_report_and_compact_prompt(prompt_manager),
     )
 
 
@@ -859,7 +916,11 @@ def _run_cli():
     is_repl = "--repl" in sys.argv
     is_output = "--output" in sys.argv
     _io_fmt_idx = sys.argv.index("--io-format") + 1 if "--io-format" in sys.argv else -1
-    is_pipe = _io_fmt_idx >= 0 and _io_fmt_idx < len(sys.argv) and sys.argv[_io_fmt_idx] == "json"
+    is_pipe = (
+        _io_fmt_idx >= 0
+        and _io_fmt_idx < len(sys.argv)
+        and sys.argv[_io_fmt_idx] == "json"
+    )
 
     if is_batch or is_repl or is_output or is_pipe:
         # Batch mode - run async directly
@@ -882,9 +943,7 @@ def _run_cli():
         finally:
             # Auto-save on exit if there are messages
             if app is not None and hasattr(app, "agent") and app.agent.messages:
-                auto_save_path = get_auto_save_path(
-                    session_date=app.agent.session_date
-                )
+                auto_save_path = get_auto_save_path(session_date=app.agent.session_date)
                 try:
                     save_context(app.agent, auto_save_path)
                     print(f"\nSession saved to {auto_save_path}")

@@ -78,9 +78,7 @@ from agent13 import (
 )
 from agent13.persistence import (
     load_context,
-    get_auto_save_dir,
     find_latest_auto_save,
-    list_saves,
     list_all_saves,
 )
 from agent13.commands import (
@@ -93,7 +91,7 @@ from agent13.commands import (
     format_history_groups,
 )
 from agent13.message_history import content_to_text, is_turn_start
-from agent13.prompts import get_skills_section
+from agent13.prompts import get_skills_section, resolve_report_and_compact_prompt
 from agent13.sandbox import (
     format_all_sandbox_modes,
     parse_sandbox_mode,
@@ -102,6 +100,11 @@ from agent13.sandbox import (
     get_pinned_sandbox_mode,
     pin_sandbox_mode,
     unpin_sandbox_mode,
+)
+from agent13.pins import (
+    get_pinned_devel,
+    pin_devel,
+    unpin_devel,
 )
 from tools.security import (
     set_session_sandbox_mode,
@@ -641,8 +644,9 @@ class AgentTUI(App):
         "/polite",
         "/bell",
         "/bell-command",
-        "/auto_compact_threshold",
-        "/auto_compact_max",
+        "/auto_context_threshold",
+        "/auto_context_action",
+        "/auto_context_chain",
     ]
     # Class-level attribute for type checking (instance copy created in __init__)
     SLASH_COMMANDS = _BUILTIN_SLASH_COMMANDS
@@ -664,10 +668,11 @@ class AgentTUI(App):
         "compact": "_get_prompt_completions",  # Same completions as /prompt
         "delete": "_get_delete_completions",  # Delete from history, queue, or saves
         "journal": ["on", "off", "last", "all", "status"],
+        "auto_context_action": ["compact", "report_and_compact", "none"],
         "remove-reasoning": ["on", "off"],
         "save": "_get_save_completions",  # Method to list save files
         "load": "_get_load_completions",  # Includes auto-saves
-        "devel": ["on", "off", "status"],
+        "devel": ["on", "off", "status", "pin", "unpin"],
         "skills": ["on", "off", "list", "status"],
         "snippet": "_get_snippet_completions",
         "spinner": ["fast", "slow", "off", "status"],
@@ -720,6 +725,7 @@ class AgentTUI(App):
         model: str,
         model_names: list[str],
         provider: str = "",
+        provider_args: tuple[str, str, float, float] | None = None,
         pretty: bool = True,
         debug: bool = False,
         tool_response_format: str = "raw",
@@ -741,8 +747,10 @@ class AgentTUI(App):
         bell_command: str = "",
         priming_enabled: bool = False,
         cursor_blink: bool = False,
-        auto_compact_threshold: int = 220000,
-        auto_compact_max_iterations: int = 3,
+        auto_context_threshold: int = 220000,
+        auto_context_action: str = "report_and_compact",
+        auto_context_chain: int = 3,
+        report_and_compact_prompt: str = "",
     ):
         """Initialize the TUI.
 
@@ -751,6 +759,9 @@ class AgentTUI(App):
             model: Model name to use
             model_names: List of available model names
             provider: Provider name for status bar display
+            provider_args: (base_url, api_key, read_timeout, connect_timeout)
+                for creating a fresh client in the TUI's own event loop
+                (see on_mount). None for offline providers (fake).
             pretty: Enable pretty output (markdown rendering)
             debug: Enable debug mode
             tool_response_format: Tool response format ('raw' or 'json')
@@ -777,11 +788,18 @@ class AgentTUI(App):
                 Validated on startup; invalid commands warn and fall back.
             cursor_blink: Whether the input cursor blinks. Default False
                 (no periodic terminal output, tmux-friendly).
+            auto_context_threshold: Token threshold for the auto-context check.
+            auto_context_action: What to do at the threshold - "compact",
+                "report_and_compact", or "none".
+            auto_context_chain: Turn restarts after a compact per turn (0 = none).
+            report_and_compact_prompt: Prompt text for the wrap-up turn. Empty
+                string = resolve from prompts.yaml / built-in default.
         """
         super().__init__()
         self.client = client
         self.model = model
         self.provider = provider
+        self._provider_args = provider_args
         self.pretty = pretty
         self._debug_mode = debug
         self.tool_response_format = tool_response_format
@@ -861,8 +879,11 @@ class AgentTUI(App):
             devel_mode=devel_mode,
             skills_mode=skills_mode,
             priming_enabled=priming_enabled,
-            auto_compact_threshold=auto_compact_threshold,
-            auto_compact_max_iterations=auto_compact_max_iterations,
+            auto_context_threshold=auto_context_threshold,
+            auto_context_action=auto_context_action,
+            auto_context_chain=auto_context_chain,
+            report_and_compact_prompt=report_and_compact_prompt
+            or resolve_report_and_compact_prompt(self.prompt_manager),
         )
 
         # Store available models on agent (single source of truth)
@@ -1402,6 +1423,8 @@ class AgentTUI(App):
             List of matching save names (without .ctx extension), sorted by newest first
         """
         try:
+            from agent13.persistence import list_saves
+
             saves = list_saves()
         except Exception:
             return []
@@ -1434,8 +1457,17 @@ class AgentTUI(App):
         """
         try:
             saves = list_all_saves()
-        except Exception:
-            return []
+        except Exception as e:
+            # Surface the failure where the user's eye already is — a silent
+            # empty list reads as "no saves" (and hides real errors, e.g.
+            # permission problems on the saves dir).
+            from agent13.debug_log import log_event
+
+            log_event(
+                "load_completions_failed",
+                {"error": str(e), "cwd": str(Path.cwd())},
+            )
+            return [f"saves list unavailable: {e}"[:100]]
 
         names = [s.stem for s in saves]
 
@@ -1936,6 +1968,20 @@ class AgentTUI(App):
             asyncio.create_task(self._write_system(f"Cleared {count} messages"))
 
         @self.agent.on_event
+        async def on_chat_clear(event: AgentEventData):
+            if event.event != AgentEvent.CHAT_CLEAR:
+                return
+            # A chain restart just compacted the history. Rebuild keeping the
+            # last turn - the compacted session summary pair - so the new
+            # chain visibly starts from it. Deferred (create_task) rather than
+            # mutating the widget inline - same reason /clear defers below.
+            asyncio.create_task(
+                self._clear_and_show_last_n(
+                    1, system_line="Context compacted — showing session summary"
+                )
+            )
+
+        @self.agent.on_event
         async def on_context_loaded(event: AgentEventData):
             if event.event != AgentEvent.CONTEXT_LOADED:
                 return
@@ -2114,6 +2160,21 @@ class AgentTUI(App):
 
     async def on_mount(self) -> None:
         """Set up the TUI after mounting."""
+        # Create the LLM client in THIS event loop. The client passed at
+        # construction was used in the setup loop (model fetch), so its
+        # pooled connections are bound to that now-closed loop; reusing
+        # them raises "Event loop is closed" on the first request. The
+        # setup-loop client was already closed by the CLI.
+        if self._provider_args is not None:
+            base_url, api_key, read_timeout, connect_timeout = self._provider_args
+            self.client = create_client(
+                base_url,
+                api_key,
+                read_timeout=read_timeout,
+                connect_timeout=connect_timeout,
+            )
+            self.agent.set_client(self.client)
+
         # Set skill manager context for skill tool
         if self.skill_manager:
             skill_manager_ctx.set(self.skill_manager)
@@ -2299,11 +2360,17 @@ class AgentTUI(App):
         except Exception:
             pass
 
-    async def _clear_and_show_last_n(self, keep_turns: int) -> None:
+    async def _clear_and_show_last_n(
+        self, keep_turns: int, system_line: str | None = None
+    ) -> None:
         """Clear chat window and rebuild showing only last N turns.
 
         Does not touch message history. A turn = one user message +
         the assistant response + any intervening tool calls/results.
+
+        system_line overrides the footer (chain restart passes
+        "Context compacted — showing session summary" instead of the
+        default "Showing last N turns..." / "Rebuilt chat from..." line).
         """
         if not self._chat_ready():
             return
@@ -2319,21 +2386,25 @@ class AgentTUI(App):
         user_indices = [i for i, m in enumerate(messages) if is_turn_start(m)]
         if len(user_indices) <= keep_turns:
             # Not enough turns to trim — show everything
-            await self._rebuild_chat()
-            return
-
-        cut_index = user_indices[-keep_turns]
-        recent = messages[cut_index:]
+            if system_line is None:
+                await self._rebuild_chat()
+                return
+            recent = messages
+        else:
+            cut_index = user_indices[-keep_turns]
+            recent = messages[cut_index:]
 
         try:
             await self._chat.remove_children()
         except Exception:
             pass
         await self._rebuild_from_messages(recent)
-        await self._write_system(
-            f"Showing last {keep_turns} turns ({len(recent)} messages, "
-            f"history untouched)"
-        )
+        if system_line is None:
+            system_line = (
+                f"Showing last {keep_turns} turns ({len(recent)} messages, "
+                "history untouched)"
+            )
+        await self._write_system(system_line)
         self._chat.scroll_end(animate=False)
         self._chat.anchor()
 
@@ -2550,6 +2621,12 @@ class AgentTUI(App):
             content = content_to_text(content)
 
             if role == "user":
+                # Text-only injected user messages (chain-restart nudge)
+                # carry no user intent - never render them as user widgets.
+                # Image injections (list content) keep their
+                # "[Image from tool: X]" trace.
+                if msg.get("injected") and isinstance(msg.get("content"), str):
+                    continue
                 # Display user message
                 if content:
                     await self._write_user(content)
@@ -3120,9 +3197,15 @@ class AgentTUI(App):
         # Context (always shown, positioned after duration)
         ctx_str = f"Ctx: {total_str}"
 
-        # Turn count (hidden when zero)
+        # Turn count (hidden when zero); chain restarts prepended as "c:" when > 0
         turn_count = sum(1 for m in self.agent.messages if is_turn_start(m))
-        trn_str = f" | trn: {turn_count}" if turn_count > 0 else ""
+        chain_used = getattr(self.agent, "auto_context_chain_used", 0)
+        if chain_used > 0:
+            trn_str = f" | trn: {chain_used}:{turn_count}"
+        elif turn_count > 0:
+            trn_str = f" | trn: {turn_count}"
+        else:
+            trn_str = ""
         # MCP connection status (only show when connected)
         mcp_str = ""
         if self.agent.mcp and self.agent.mcp.is_connected():
@@ -3408,10 +3491,12 @@ class AgentTUI(App):
             self._handle_bell_command(args)
         elif command == "bell-command":
             self._handle_bell_command_command(args)
-        elif command == "auto_compact_threshold":
-            self._handle_auto_compact_threshold_command(args)
-        elif command == "auto_compact_max":
-            self._handle_auto_compact_max_command(args)
+        elif command == "auto_context_threshold":
+            self._handle_auto_context_threshold_command(args)
+        elif command == "auto_context_action":
+            self._handle_auto_context_action_command(args)
+        elif command == "auto_context_chain":
+            self._handle_auto_context_chain_command(args)
         elif command in ("quit", "exit"):
             self.agent.stop(StopReason.QUIT)
             self.exit()
@@ -3616,6 +3701,7 @@ class AgentTUI(App):
             "  [yellow]/pretty [on|off][/] - Toggle markdown rendering\n"
             "  [yellow]/tool-response [raw|json][/] - Set tool response format\n"
             "  [yellow]/sandbox [mode|pin|unpin][/] - Show/set sandbox mode, pin per-project\n"
+            "  [yellow]/devel [on|off|status|pin|unpin][/] - Show devel-group tools, pin per-project\n"
             "  [yellow]/cwd [@path][/] - Show or change working directory (prefix @ for path completion)\n"
             "  [yellow]/mcp [connect|disconnect|reload][/] - List/manage MCP servers\n"
             "  [yellow]/tools[/] - Show tool usage statistics\n"
@@ -3655,12 +3741,14 @@ class AgentTUI(App):
             "  [yellow]/bell-command <cmd>[/] - Run external command instead of terminal bell\n"
             "  [yellow]/bell-command off[/] - Revert to terminal bell\n"
             "  [yellow]/bell-command[/] - Show current command\n"
-            "\n[bold]Auto-compact:[/]\n"
-            "  [yellow]/auto_compact_threshold N[/] - Compact when context exceeds N tokens (supports k suffix)\n"
-            "  [yellow]/auto_compact_threshold 0[/] - Disable auto-compact\n"
-            "  [yellow]/auto_compact_threshold[/] - Show current status\n"
-            "  [yellow]/auto_compact_max N[/] - Max compact-and-continue cycles per turn (then pause)\n"
-            "  [yellow]/auto_compact_max[/] - Show current value\n"
+            "\n[bold]Auto-context:[/]\n"
+            "  [yellow]/auto_context_threshold N[/] - Context threshold: act when context exceeds N tokens (supports k suffix)\n"
+            "  [yellow]/auto_context_threshold 0[/] - Disable auto-context\n"
+            "  [yellow]/auto_context_threshold[/] - Show current status\n"
+            "  [yellow]/auto_context_action compact|report_and_compact|none[/] - What to do at the threshold\n"
+            "  [yellow]/auto_context_action[/] - Show current value\n"
+            "  [yellow]/auto_context_chain N[/] - Restart the turn up to N times per turn after a compact\n"
+            "  [yellow]/auto_context_chain[/] - Show current value\n"
             "\n[bold]Keyboard shortcuts:[/]\n"
             "  [yellow]ESC[/] - Cancel request (use /resume to continue)\n"
             "  [yellow]Ctrl+C[/] - Clear input or quit\n"
@@ -3756,11 +3844,12 @@ class AgentTUI(App):
             cfg = get_config()
             saves_loc = cfg.saves_location
 
-            project_name = Path.cwd().name
-            auto_dir = get_auto_save_dir()
-            auto_count = len(list(auto_dir.glob(f"{project_name}-*.ctx")))
-            manual_saves = list_saves()
-            manual_count = len(manual_saves)
+            from agent13.persistence import count_saves
+
+            # count_saves classifies with the same rules as /load completion
+            # (the old glob used the central pattern in local mode, so the
+            # auto count was always 0 there and manual included auto-saves).
+            auto_count, manual_count = count_saves()
             saves_lines = []
             saves_lines.append("\n[bold]Saves[/]")
             loc_label = "local" if saves_loc == "local" else "central"
@@ -3789,6 +3878,14 @@ class AgentTUI(App):
 
         # ── Build output (Rich markup) ──
         tools_str = f"{sd.tool_successes}/{sd.tool_calls}" if sd.tool_calls > 0 else "0"
+        sandbox_suffix = (
+            f" (pinned: {sd.sandbox_pinned})" if sd.sandbox_pinned is not None else ""
+        )
+        devel_suffix = (
+            f" (pinned: {'on' if sd.devel_pinned else 'off'})"
+            if sd.devel_pinned is not None
+            else ""
+        )
 
         self._update_info_content(
             f"[bold]Session[/]\n"
@@ -3812,7 +3909,7 @@ class AgentTUI(App):
             f"\n[bold]Tools[/]\n"
             f"  success/calls: [yellow]{tools_str}[/]\n"
             f"\n[bold]Settings[/]\n"
-            f"  sandbox: [yellow]{escape_markup(sd.sandbox_mode)}[/]\n"
+            f"  sandbox: [yellow]{escape_markup(sd.sandbox_mode + sandbox_suffix)}[/]\n"
             f"  pretty: [yellow]{'on' if self.pretty else 'off'}[/]\n"
             f"  tool-response: [yellow]{escape_markup(self.tool_response_format)}[/]\n"
             f"  spinner: [yellow]{self._spinner_speed}[/]\n"
@@ -3820,9 +3917,15 @@ class AgentTUI(App):
             f"  bell: [yellow]{self._bell.status_text()}[/]\n"
             f"  bell-cmd: [yellow]{escape_markup(self._bell.command) if self._bell.command else '(terminal bell)'}[/]\n"
             f"  remove-reasoning: [yellow]{'on' if sd.remove_reasoning else 'off'}[/]\n"
-            f"  devel: [yellow]{'on' if sd.devel_mode else 'off'}[/]\n"
+            f"  devel: [yellow]{'on' if sd.devel_mode else 'off'}{devel_suffix}[/]\n"
             f"  skill tool: [yellow]{'on' if sd.skills_mode else 'off'}[/]\n"
-            f"  journal: [yellow]{'on' if sd.journal_mode else 'off'}[/]"
+            f"  journal: [yellow]{'on' if sd.journal_mode else 'off'}[/]\n"
+            f"  auto-context: [yellow]"
+            f"{'off' if sd.auto_context_threshold == 0 else f'{sd.auto_context_threshold:,} tokens'}"
+            f"[/]\n"
+            f"  auto-action: [yellow]{sd.auto_context_action}[/]\n"
+            f"  auto-chain: [yellow]{sd.auto_context_chain}[/]\n"
+            f"  chains: [yellow]{sd.auto_context_chain_used}/{sd.auto_context_chain}[/]"
         )
         self._info_pane_mode = "status"
 
@@ -4365,7 +4468,7 @@ class AgentTUI(App):
                 lines.append("  Session override: [dim]none (using config default)[/]")
             lines.append(f"  Config default: [dim]{config_default.value}[/]")
             if pinned:
-                lines.append("  Pinned: [yellow]yes[/]")
+                lines.append(f"  Pinned: [yellow]{pinned.value}[/]")
             else:
                 lines.append("  Pinned: [dim]no[/]")
             lines.append("")
@@ -4756,17 +4859,42 @@ class AgentTUI(App):
                 "[yellow]Devel mode disabled[/]\n"
                 "Devel-group tools are now hidden from the AI."
             )
+        elif args == "pin":
+            enabled = self.agent.devel_mode
+            pin_devel(enabled)
+            self._update_info_content(
+                f"[green]Pinned devel mode '{'on' if enabled else 'off'}' for this project.[/]\n"
+                "[dim]Devel mode will auto-apply on startup in this directory.[/]"
+            )
+        elif args == "unpin":
+            if unpin_devel():
+                self._update_info_content(
+                    "[green]Removed devel pin for this project.[/]"
+                )
+            else:
+                self._update_info_content(
+                    "[yellow]No devel pin exists for this project.[/]"
+                )
         elif args == "status" or not args:
             status = "on" if self.agent.devel_mode else "off"
             color = "green" if self.agent.devel_mode else "yellow"
-            self._update_info_content(f"[{color}]Devel mode: {status}[/]")
+            pinned = get_pinned_devel()
+            if pinned is not None:
+                pinned_text = f"[yellow]{'on' if pinned else 'off'}[/]"
+            else:
+                pinned_text = "[dim]no[/]"
+            self._update_info_content(
+                f"[{color}]Devel mode: {status}[/]\n  Pinned: {pinned_text}"
+            )
         else:
             status = "on" if self.agent.devel_mode else "off"
             self._update_info_content(
-                f"[red]Usage: /devel [on|off|status][/]\n"
+                f"[red]Usage: /devel [on|off|status|pin|unpin][/]\n"
                 f"  [yellow]/devel on[/] - Show devel-group tools to the AI\n"
                 f"  [yellow]/devel off[/] - Hide devel-group tools from the AI\n"
                 f"  [yellow]/devel status[/] - Show current state\n"
+                f"  [yellow]/devel pin[/] - Pin current state for this project\n"
+                f"  [yellow]/devel unpin[/] - Remove pin for this project\n"
                 f"  Current: {status}"
             )
 
@@ -5004,21 +5132,30 @@ class AgentTUI(App):
                 return
             self._update_info_content(f"[green]Bell command: {escape_markup(args)}[/]")
 
-    def _handle_auto_compact_threshold_command(self, args: str) -> None:
-        """Handle /auto_compact_threshold - set or show the auto-compact threshold.
+    def _handle_auto_context_threshold_command(self, args: str) -> None:
+        """Handle /auto_context_threshold - set or show the auto-context threshold.
 
-        /auto_compact_threshold N   - Set threshold to N tokens (supports k suffix)
-        /auto_compact_threshold 0   - Disable auto-compact
-        /auto_compact_threshold     - Show current status
+        /auto_context_threshold N   - Set threshold to N tokens (supports k suffix)
+        /auto_context_threshold 0   - Disable auto-context
+        /auto_context_threshold     - Show current status
         """
         args = args.strip()
         if not args:
-            if self.agent.auto_compact_threshold > 0:
+            if self.agent.auto_context_threshold > 0:
+                if self.agent.auto_context_action == "none":
+                    action_line = "Action: none (chain ignored)"
+                else:
+                    action_line = (
+                        f"Action: {self.agent.auto_context_action} "
+                        f"(chain: {self.agent.auto_context_chain})"
+                    )
                 self._update_info_content(
-                    f"[green]Auto-compact: on ({self.agent.auto_compact_threshold:,} tokens)[/]"
+                    f"[green]Auto-context: on "
+                    f"({self.agent.auto_context_threshold:,} tokens)[/]\n"
+                    f"[dim]{action_line}[/]"
                 )
             else:
-                self._update_info_content("[yellow]Auto-compact: off[/]")
+                self._update_info_content("[yellow]Auto-context: off (threshold 0)[/]")
             return
 
         try:
@@ -5029,45 +5166,72 @@ class AgentTUI(App):
                 threshold = int(val)
             if threshold < 0:
                 raise ValueError("negative")
-            self.agent.auto_compact_threshold = threshold
+            self.agent.auto_context_threshold = threshold
             if threshold == 0:
-                self._update_info_content("[yellow]Auto-compact: off[/]")
+                self._update_info_content("[yellow]Auto-context: off[/]")
             else:
                 self._update_info_content(
-                    f"[green]Auto-compact: on ({threshold:,} tokens)[/]"
+                    f"[green]Auto-context: on ({threshold:,} tokens)[/]"
                 )
         except ValueError:
             self._update_info_content(
-                "[red]Usage: /auto_compact_threshold [N|0][/]\n"
-                "  [yellow]/auto_compact_threshold 150k[/] - Compact at 150,000 tokens\n"
-                "  [yellow]/auto_compact_threshold 0[/] - Disable\n"
-                "  [yellow]/auto_compact_threshold[/] - Show current status"
+                "[red]Usage: /auto_context_threshold [N|0][/]\n"
+                "  [yellow]/auto_context_threshold 150k[/] - Act at 150,000 tokens\n"
+                "  [yellow]/auto_context_threshold 0[/] - Disable\n"
+                "  [yellow]/auto_context_threshold[/] - Show current status"
             )
 
-    def _handle_auto_compact_max_command(self, args: str) -> None:
-        """Handle /auto_compact_max - set or show the max compact-and-continue cycles.
+    def _handle_auto_context_chain_command(self, args: str) -> None:
+        """Handle /auto_context_chain - set or show the chain (restarts per turn).
 
-        /auto_compact_max N   - Set max cycles to N (minimum 1)
-        /auto_compact_max     - Show current value
+        /auto_context_chain N   - Set the chain to N (minimum 0)
+        /auto_context_chain     - Show current value
         """
         args = args.strip()
         if not args:
             self._update_info_content(
-                f"[green]Auto-compact max cycles: {self.agent.auto_compact_max_iterations}[/]"
+                f"[green]Auto-context chain: {self.agent.auto_context_chain}[/] "
+                "[dim](restarts per turn; 0 = stop after the action)[/]"
             )
             return
 
         try:
-            max_iter = int(args)
-            if max_iter < 1:
-                raise ValueError("must be >= 1")
-            self.agent.auto_compact_max_iterations = max_iter
-            self._update_info_content(f"[green]Auto-compact max cycles: {max_iter}[/]")
+            chain = int(args)
+            if chain < 0:
+                raise ValueError("must be >= 0")
+            self.agent.auto_context_chain = chain
+            self._update_info_content(f"[green]Auto-context chain: {chain}[/]")
         except ValueError:
             self._update_info_content(
-                "[red]Usage: /auto_compact_max N[/]\n"
-                "  [yellow]/auto_compact_max 3[/] - Pause after 3 compact-and-continue cycles\n"
-                "  [yellow]/auto_compact_max[/] - Show current value"
+                "[red]Usage: /auto_context_chain N[/]\n"
+                "  [yellow]/auto_context_chain 2[/] - Restart the turn up to 2 times per turn\n"
+                "  [yellow]/auto_context_chain[/] - Show current value"
+            )
+
+    def _handle_auto_context_action_command(self, args: str) -> None:
+        """Handle /auto_context_action - set or show the auto-context action.
+
+        /auto_context_action <value>  - Set the action (compact|report_and_compact|none)
+        /auto_context_action          - Show current value
+        """
+        args = args.strip()
+        valid = ("compact", "report_and_compact", "none")
+        if not args:
+            self._update_info_content(
+                f"[green]Auto-context action: {self.agent.auto_context_action}[/] "
+                "[dim](valid: compact | report_and_compact | none)[/]"
+            )
+            return
+        if args in valid:
+            self.agent.auto_context_action = args
+            self._update_info_content(f"[green]Auto-context action: {args}[/]")
+        else:
+            self._update_info_content(
+                "[red]Usage: /auto_context_action [compact|report_and_compact|none][/]\n"
+                "  [yellow]/auto_context_action compact[/] - Full compact at the threshold\n"
+                "  [yellow]/auto_context_action report_and_compact[/] - Wrap up, report, then compact\n"
+                "  [yellow]/auto_context_action none[/] - Pause at the threshold (no action)\n"
+                "  [yellow]/auto_context_action[/] - Show current value"
             )
 
     def _handle_save_command(self, args: str) -> None:

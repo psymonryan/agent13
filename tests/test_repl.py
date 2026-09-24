@@ -20,6 +20,7 @@ Features tested:
 import asyncio
 import datetime
 import io
+import re
 import sys
 from contextlib import ExitStack
 from unittest.mock import patch, MagicMock
@@ -128,6 +129,10 @@ class MockAgent:
         self.devel_mode = False
         self.skills_mode = False
         self.remove_reasoning = False
+        self.auto_context_threshold = 220000
+        self.auto_context_action = "report_and_compact"
+        self.auto_context_chain = 3
+        self.auto_context_chain_used = 0
         self._mcp_server_configs = {}
 
     @property
@@ -941,6 +946,23 @@ class TestStatusCommand:
         assert "journal:" in output
         assert "devel:" in output
         assert "skills:" in output
+
+    async def test_status_shows_auto_context(self):
+        """/status shows the four auto-context settings (live agent values)."""
+        output, agent = await run_scenario(["/status", "/quit"])
+
+        assert re.search(r"auto-context:\s+220,000 tokens", output)
+        assert re.search(r"auto-action:\s+report_and_compact", output)
+        assert re.search(r"auto-chain:\s+3", output)
+        assert re.search(r"chains:\s+0/3", output)
+
+    async def test_status_shows_auto_context_off(self):
+        """/status shows 'off' when the auto-context threshold is 0."""
+        output, agent = await run_scenario(
+            ["/auto_context_threshold 0", "/status", "/quit"]
+        )
+
+        assert re.search(r"auto-context:\s+off", output)
 
     async def test_status_shows_mcp(self):
         """/status shows MCP connectivity status."""

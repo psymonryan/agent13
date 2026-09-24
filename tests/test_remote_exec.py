@@ -1,5 +1,6 @@
 """Tests for remote_exec module (command v2, Phase 2)."""
 
+import asyncio
 import base64
 import pytest
 
@@ -609,3 +610,180 @@ class TestRunRemoteCommand:
         assert result["truncated"] is True
         assert len(result["stdout"]) <= 1000 + 100  # Allow for truncation message
         assert "truncated" in result["stdout"]
+
+
+class TestEncodingGuarantees:
+    """Spec item 3: CRLF normalization + status/output_encoding fields."""
+
+    def setup_method(self):
+        clear_remote_shell_cache()
+
+    def teardown_method(self):
+        clear_remote_shell_cache()
+
+    @staticmethod
+    def _mock_process(returncode=0, stdout=b"", stderr=b""):
+        from unittest.mock import AsyncMock, MagicMock
+
+        mock_proc = MagicMock()
+        mock_proc.returncode = returncode
+        mock_proc.pid = 12345
+        mock_proc.wait = AsyncMock(return_value=returncode)
+        mock_proc.stdin = MagicMock()
+        mock_proc.stdin.write = MagicMock()
+        mock_proc.stdin.close = MagicMock()
+
+        async def fake_read_out(n):
+            # sleep(0) so the read suspends like a real StreamReader —
+            # a never-suspending read would spin the pump synchronously
+            # and starve the event loop's timers.
+            await asyncio.sleep(0)
+            return stdout
+
+        async def fake_read_err(n):
+            await asyncio.sleep(0)
+            return stderr
+
+        mock_proc.stdout = MagicMock()
+        mock_proc.stdout.read = fake_read_out
+        mock_proc.stderr = MagicMock()
+        mock_proc.stderr.read = fake_read_err
+        return mock_proc
+
+    @pytest.mark.asyncio
+    async def test_powershell_payload_crlf_normalized(self):
+        """LF-only scripts arrive CRLF on a powershell remote (spec item 3)."""
+        import base64
+
+        from unittest.mock import patch
+
+        mock_proc = self._mock_process()
+
+        async def mock_create_subprocess_exec(*args, **kwargs):
+            return mock_proc
+
+        with patch(
+            "agent13.remote_exec.asyncio.create_subprocess_exec",
+            mock_create_subprocess_exec,
+        ):
+            await run_remote_command(
+                host="myhost",
+                command="line1\nline2\n",
+                remote_shell="powershell",
+                timeout=10,
+            )
+
+        sent_b64 = mock_proc.stdin.write.call_args[0][0].decode("ascii")
+        decoded = base64.b64decode(sent_b64).decode("utf-8")
+        assert decoded == "line1\r\nline2\r\n"
+
+    @pytest.mark.asyncio
+    async def test_posix_payload_newlines_untouched(self):
+        """POSIX payloads keep their original line endings."""
+        import base64
+
+        from unittest.mock import patch
+
+        mock_proc = self._mock_process()
+
+        async def mock_create_subprocess_exec(*args, **kwargs):
+            return mock_proc
+
+        with patch(
+            "agent13.remote_exec.asyncio.create_subprocess_exec",
+            mock_create_subprocess_exec,
+        ):
+            await run_remote_command(
+                host="myhost",
+                command="line1\nline2\n",
+                remote_shell="posix",
+                timeout=10,
+            )
+
+        sent_b64 = mock_proc.stdin.write.call_args[0][0].decode("ascii")
+        decoded = base64.b64decode(sent_b64).decode("utf-8")
+        assert decoded == "line1\nline2\n"
+
+    @pytest.mark.asyncio
+    async def test_result_has_status_and_output_encoding(self):
+        """Every remote result carries status + output_encoding (spec item 3)."""
+        from unittest.mock import patch
+
+        mock_proc = self._mock_process(returncode=3, stdout=b"out")
+
+        async def mock_create_subprocess_exec(*args, **kwargs):
+            return mock_proc
+
+        with patch(
+            "agent13.remote_exec.asyncio.create_subprocess_exec",
+            mock_create_subprocess_exec,
+        ):
+            result = await run_remote_command(
+                host="myhost", command="exit 3", remote_shell="posix", timeout=10
+            )
+
+        assert result["status"] == "completed"
+        assert result["output_encoding"] == "utf-8"
+        assert result["exit_code"] == 3
+        assert result["success"] is False
+
+    @pytest.mark.asyncio
+    async def test_timeout_is_distinct_status(self):
+        """A timeout is status='timeout', not a completed run (spec item 3)."""
+        from unittest.mock import patch, MagicMock
+
+        mock_proc = MagicMock()
+        mock_proc.returncode = None
+        mock_proc.pid = 12345
+
+        async def blocking_wait():
+            await asyncio.sleep(60)
+
+        mock_proc.wait = blocking_wait
+        mock_proc.stdin = MagicMock()
+        mock_proc.stdin.write = MagicMock()
+        mock_proc.stdin.close = MagicMock()
+
+        async def fake_read(n):
+            return b""
+
+        mock_proc.stdout = MagicMock()
+        mock_proc.stdout.read = fake_read
+        mock_proc.stderr = MagicMock()
+        mock_proc.stderr.read = fake_read
+
+        async def mock_create_subprocess_exec(*args, **kwargs):
+            return mock_proc
+
+        with patch(
+            "agent13.remote_exec.asyncio.create_subprocess_exec",
+            mock_create_subprocess_exec,
+        ):
+            result = await run_remote_command(
+                host="myhost", command="sleep 99", remote_shell="posix", timeout=0.1
+            )
+
+        assert result["status"] == "timeout"
+        assert result["timed_out"] is True
+        assert result["success"] is False
+        assert result["exit_code"] == -1
+
+    @pytest.mark.asyncio
+    async def test_ssh_missing_is_error_status(self):
+        """ssh binary missing => status='error' (spec item 3)."""
+        from unittest.mock import patch
+
+        async def mock_create_subprocess_exec(*args, **kwargs):
+            raise FileNotFoundError("ssh")
+
+        with patch(
+            "agent13.remote_exec.asyncio.create_subprocess_exec",
+            mock_create_subprocess_exec,
+        ):
+            result = await run_remote_command(
+                host="myhost", command="echo hi", remote_shell="posix", timeout=10
+            )
+
+        assert result["status"] == "error"
+        assert result["output_encoding"] == "utf-8"
+        assert "ssh not found" in result["stderr"]

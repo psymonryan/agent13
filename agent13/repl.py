@@ -63,6 +63,11 @@ from agent13.sandbox import (
     pin_sandbox_mode,
     unpin_sandbox_mode,
 )
+from agent13.pins import (
+    get_pinned_devel,
+    pin_devel,
+    unpin_devel,
+)
 from tools.security import (
     set_session_sandbox_mode,
     get_session_sandbox_mode,
@@ -97,14 +102,15 @@ COMMANDS = {
     "/sandbox": "Sandbox mode: /sandbox [mode|pin|unpin] (no args shows status)",
     "/bell": "Bell on idle: /bell [N|off] (0=always, N=threshold seconds)",
     "/bell-command": "Set external bell command: /bell-command [cmd|off]",
-    "/devel": "Toggle devel mode: /devel [on|off|status]",
+    "/devel": "Devel mode: /devel [on|off|status|pin|unpin] (no args shows status)",
     "/tools": "Show tool usage statistics",
     "/mcp": "Show MCP server status: /mcp [connect|disconnect|reload]",
     "/cwd": "Show or change working directory: /cwd [path]",
     "/upgrade": "Check for and apply updates",
     "/polite": "Multi-agent lock coordination: /polite N | /polite off",
-    "/auto_compact_threshold": "Auto-compact threshold: /auto_compact_threshold [N|0] (supports k suffix)",
-    "/auto_compact_max": "Auto-compact max cycles: /auto_compact_max [N] (min 1)",
+    "/auto_context_threshold": "Auto-context threshold: /auto_context_threshold [N|0] (supports k suffix)",
+    "/auto_context_action": "Auto-context action: /auto_context_action [compact|report_and_compact|none]",
+    "/auto_context_chain": "Auto-context chain (restarts per turn): /auto_context_chain [N]",
 }
 
 
@@ -241,8 +247,10 @@ async def run_repl(
     bell_enabled: bool = True,
     bell_command: str = "",
     priming_enabled: bool = False,
-    auto_compact_threshold: int = 220000,
-    auto_compact_max_iterations: int = 3,
+    auto_context_threshold: int = 220000,
+    auto_context_action: str = "report_and_compact",
+    auto_context_chain: int = 3,
+    report_and_compact_prompt: str = "",
 ):
     """Run the agent in interactive REPL mode.
 
@@ -353,8 +361,10 @@ async def run_repl(
         skills_mode=skills_mode,
         journal_mode=journal_mode,
         priming_enabled=priming_enabled,
-        auto_compact_threshold=auto_compact_threshold,
-        auto_compact_max_iterations=auto_compact_max_iterations,
+        auto_context_threshold=auto_context_threshold,
+        auto_context_action=auto_context_action,
+        auto_context_chain=auto_context_chain,
+        report_and_compact_prompt=report_and_compact_prompt,
     )
 
     # Store available models on agent
@@ -478,6 +488,15 @@ async def run_repl(
         if event.event != AgentEvent.ASSISTANT_COMPLETE or shutting_down:
             return
         display.complete_response()
+
+    @agent.on_event
+    async def on_notification(event):
+        if event.event != AgentEvent.NOTIFICATION or shutting_down:
+            return
+        message = event.data.get("message", "")
+        level = event.data.get("level", "info")
+        color = {"warning": "yellow", "error": "red"}.get(level, "blue")
+        output_ctrl.write(f"[{color}]{message}[/]\n")
 
     @agent.on_event
     async def on_tool_call(event):
@@ -794,14 +813,38 @@ async def run_repl(
                     print(f"    success/calls: {tools_str}")
                     print()
                     print("  Settings")
-                    print(f"    sandbox:           {sd.sandbox_mode}")
+                    sandbox_suffix = (
+                        f" (pinned: {sd.sandbox_pinned})"
+                        if sd.sandbox_pinned is not None
+                        else ""
+                    )
+                    devel_suffix = (
+                        f" (pinned: {'on' if sd.devel_pinned else 'off'})"
+                        if sd.devel_pinned is not None
+                        else ""
+                    )
+                    print(f"    sandbox:           {sd.sandbox_mode}{sandbox_suffix}")
                     print(
                         f"    remove-reasoning:  {'on' if sd.remove_reasoning else 'off'}"
                     )
-                    print(f"    devel:             {'on' if sd.devel_mode else 'off'}")
+                    print(
+                        f"    devel:             {'on' if sd.devel_mode else 'off'}{devel_suffix}"
+                    )
                     print(f"    skills:            {'on' if sd.skills_mode else 'off'}")
                     print(
                         f"    journal:           {'on' if sd.journal_mode else 'off'}"
+                    )
+                    auto_ctx = (
+                        "off"
+                        if sd.auto_context_threshold == 0
+                        else f"{sd.auto_context_threshold:,} tokens"
+                    )
+                    print(f"    auto-context:      {auto_ctx}")
+                    print(f"    auto-action:       {sd.auto_context_action}")
+                    print(f"    auto-chain:        {sd.auto_context_chain}")
+                    print(
+                        f"    chains:            "
+                        f"{sd.auto_context_chain_used}/{sd.auto_context_chain}"
                     )
                     print(f"    bell:              {bell.status_text()}")
                     print(
@@ -1182,7 +1225,7 @@ async def run_repl(
                             print("    Session override: none (using config default)")
                         print(f"    Config default: {config_default.value}")
                         if pinned:
-                            print("    Pinned: yes")
+                            print(f"    Pinned: {pinned.value}")
                         else:
                             print("    Pinned: no")
                         print()
@@ -1226,15 +1269,35 @@ async def run_repl(
                         agent.set_devel_mode(False)
                         print("  Devel mode disabled")
                         print("  Devel-group tools are now hidden from the AI.")
+                    elif args == "pin":
+                        enabled = agent.devel_mode
+                        pin_devel(enabled)
+                        state = "on" if enabled else "off"
+                        print(f"  Pinned devel mode '{state}' for this project")
+                        print(
+                            "  Devel mode will auto-apply on startup in this directory."
+                        )
+                    elif args == "unpin":
+                        if unpin_devel():
+                            print("  Removed devel pin for this project")
+                        else:
+                            print("  No devel pin exists for this project")
                     elif args == "status" or not args:
                         status = "on" if agent.devel_mode else "off"
+                        pinned = get_pinned_devel()
                         print(f"  Devel mode: {status}")
+                        if pinned is not None:
+                            print(f"  Pinned: {'on' if pinned else 'off'}")
+                        else:
+                            print("  Pinned: no")
                     else:
                         status = "on" if agent.devel_mode else "off"
-                        print("  Usage: /devel [on|off|status]")
+                        print("  Usage: /devel [on|off|status|pin|unpin]")
                         print("    /devel on      - Show devel-group tools to the AI")
                         print("    /devel off     - Hide devel-group tools from the AI")
                         print("    /devel status  - Show current state")
+                        print("    /devel pin     - Pin current state for this project")
+                        print("    /devel unpin   - Remove pin for this project")
                         print(f"  Current: {status}")
 
                 elif cmd == "/tools":
@@ -1419,15 +1482,22 @@ async def run_repl(
                         else:
                             print(f"  Bell command: {args}")
 
-                elif cmd == "/auto_compact_threshold":
+                elif cmd == "/auto_context_threshold":
                     args = cmd_arg.strip()
                     if not args:
-                        if agent.auto_compact_threshold > 0:
+                        if agent.auto_context_threshold > 0:
                             print(
-                                f"  Auto-compact: on ({agent.auto_compact_threshold:,} tokens)"
+                                f"  Auto-context: on ({agent.auto_context_threshold:,} tokens)"
                             )
+                            if agent.auto_context_action == "none":
+                                print("  Action: none (chain ignored)")
+                            else:
+                                print(
+                                    f"  Action: {agent.auto_context_action} "
+                                    f"(chain: {agent.auto_context_chain})"
+                                )
                         else:
-                            print("  Auto-compact: off")
+                            print("  Auto-context: off (threshold 0)")
                     else:
                         try:
                             val = args.lower()
@@ -1437,40 +1507,67 @@ async def run_repl(
                                 threshold = int(val)
                             if threshold < 0:
                                 raise ValueError("negative")
-                            agent.auto_compact_threshold = threshold
+                            agent.auto_context_threshold = threshold
                             if threshold == 0:
-                                print("  Auto-compact: off")
+                                print("  Auto-context: off")
                             else:
-                                print(f"  Auto-compact: on ({threshold:,} tokens)")
+                                print(f"  Auto-context: on ({threshold:,} tokens)")
                         except ValueError:
-                            print("  Usage: /auto_compact_threshold [N|0]")
+                            print("  Usage: /auto_context_threshold [N|0]")
                             print(
-                                "    /auto_compact_threshold 150k - Compact at 150,000 tokens"
+                                "    /auto_context_threshold 150k - Compact at 150,000 tokens"
                             )
-                            print("    /auto_compact_threshold 0    - Disable")
+                            print("    /auto_context_threshold 0    - Disable")
                             print(
-                                "    /auto_compact_threshold      - Show current status"
+                                "    /auto_context_threshold      - Show current status"
                             )
 
-                elif cmd == "/auto_compact_max":
+                elif cmd == "/auto_context_action":
                     args = cmd_arg.strip()
                     if not args:
                         print(
-                            f"  Auto-compact max cycles: {agent.auto_compact_max_iterations}"
+                            f"  Auto-context action: {agent.auto_context_action} "
+                            "(valid: compact | report_and_compact | none)"
+                        )
+                    elif args in ("compact", "report_and_compact", "none"):
+                        agent.auto_context_action = args
+                        print(f"  Auto-context action: {args}")
+                    else:
+                        print(
+                            "  Usage: /auto_context_action "
+                            "[compact|report_and_compact|none]"
+                        )
+                        print(
+                            "    /auto_context_action compact - Full compact at the threshold"
+                        )
+                        print(
+                            "    /auto_context_action report_and_compact - Wrap up, report, then compact"
+                        )
+                        print(
+                            "    /auto_context_action none - Pause at the threshold (no action)"
+                        )
+                        print("    /auto_context_action - Show current value")
+
+                elif cmd == "/auto_context_chain":
+                    args = cmd_arg.strip()
+                    if not args:
+                        print(
+                            f"  Auto-context chain: {agent.auto_context_chain} "
+                            "(restarts per turn; 0 = stop after the action)"
                         )
                     else:
                         try:
-                            max_iter = int(args)
-                            if max_iter < 1:
-                                raise ValueError("must be >= 1")
-                            agent.auto_compact_max_iterations = max_iter
-                            print(f"  Auto-compact max cycles: {max_iter}")
+                            chain = int(args)
+                            if chain < 0:
+                                raise ValueError("must be >= 0")
+                            agent.auto_context_chain = chain
+                            print(f"  Auto-context chain: {chain}")
                         except ValueError:
-                            print("  Usage: /auto_compact_max [N]")
+                            print("  Usage: /auto_context_chain [N]")
                             print(
-                                "    /auto_compact_max 3 - Pause after 3 compact-and-continue cycles"
+                                "    /auto_context_chain 2 - Restart the turn up to 2 times per turn"
                             )
-                            print("    /auto_compact_max   - Show current value")
+                            print("    /auto_context_chain   - Show current value")
 
                 else:
                     print(f"  Unknown command: {user_input}")

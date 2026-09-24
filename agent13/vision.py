@@ -54,36 +54,72 @@ def resize_image_uri(data_uri: str, max_dimension: int) -> str:
 
     try:
         img = Image.open(io.BytesIO(base64.b64decode(b64_data)))
-    except Exception:
-        # Not a valid image — return unchanged
+        w, h = img.size
+        if max(w, h) <= max_dimension:
+            return data_uri  # Already small enough
+
+        # Resize preserving aspect ratio
+        scale = max_dimension / max(w, h)
+        new_size = (int(w * scale), int(h * scale))
+        img = img.resize(new_size, Image.LANCZOS)
+
+        # Re-encode
+        buf = io.BytesIO()
+        fmt = media_type.split("/")[1].upper()
+        if fmt in ("JPEG", "JPG"):
+            fmt = "JPEG"
+        elif fmt in ("TIF", "TIFF"):
+            fmt = "TIFF"
+        try:
+            img.save(buf, format=fmt)
+        except Exception:
+            # Fallback to PNG if format not supported for saving
+            buf = io.BytesIO()
+            img.save(buf, format="PNG")
+            media_type = "image/png"
+
+        new_b64 = base64.b64encode(buf.getvalue()).decode()
+        return f"data:{media_type};base64,{new_b64}"
+    except Exception as e:
+        # Not a valid image, or corrupt/truncated. PIL's Image.open is lazy —
+        # it only reads the header, so decode errors (e.g. "image file is
+        # truncated") surface at resize/save, not at open. Return the
+        # original URI unchanged; callers should check image_uri_decodable()
+        # before sending to a provider.
+        from agent13.debug_log import log_event
+
+        log_event(
+            "vision_resize_fallback",
+            {"reason": f"{type(e).__name__}: {e}", "media_type": media_type},
+        )
         return data_uri
 
-    w, h = img.size
-    if max(w, h) <= max_dimension:
-        return data_uri  # Already small enough
 
-    # Resize preserving aspect ratio
-    scale = max_dimension / max(w, h)
-    new_size = (int(w * scale), int(h * scale))
-    img = img.resize(new_size, Image.LANCZOS)
+def image_uri_decodable(data_uri: str) -> bool:
+    """Return True if the image in a data URI fully decodes.
 
-    # Re-encode
-    buf = io.BytesIO()
-    fmt = media_type.split("/")[1].upper()
-    if fmt in ("JPEG", "JPG"):
-        fmt = "JPEG"
-    elif fmt in ("TIF", "TIFF"):
-        fmt = "TIFF"
+    PIL's Image.open is lazy (header only); this forces a full pixel
+    decode so corrupt/truncated images are caught before being sent to a
+    provider — which would reject the whole request with a 500.
+
+    Returns True when PIL is unavailable (can't validate locally; let the
+    provider decide).
+    """
+    match = _DATA_URI_RE.match(data_uri)
+    if not match:
+        return False
+
     try:
-        img.save(buf, format=fmt)
-    except Exception:
-        # Fallback to PNG if format not supported for saving
-        buf = io.BytesIO()
-        img.save(buf, format="PNG")
-        media_type = "image/png"
+        from PIL import Image
+    except ImportError:
+        return True
 
-    new_b64 = base64.b64encode(buf.getvalue()).decode()
-    return f"data:{media_type};base64,{new_b64}"
+    try:
+        img = Image.open(io.BytesIO(base64.b64decode(match.group(2))))
+        img.load()
+        return True
+    except Exception:
+        return False
 
 
 async def describe_image(

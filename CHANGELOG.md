@@ -5,6 +5,37 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0] - 2026-09-24
+
+### Added
+
+- **Auto-context** - a new system for keeping long sessions usable (renamed from auto-compact / stop-and-report). When the context nears its limit, agent13 wraps up its work, writes a running journal of the session, compacts the context, and carries on with the task from a compact summary of the current state - so long work keeps going without losing track
+- `/auto_context_action` - set the auto-context action (`compact` | `report_and_compact` | `none`) from the REPL or TUI; bare command shows the current value
+- Per-project pinning for devel mode - devel mode can now be pinned per project so it auto-applies when you start in that directory; sandbox and devel pins now live together in `~/.agent13/pins.toml` (if you have existing sandbox pins in `~/.agent13/sandbox-pins.toml`, rename the file and add a `[sandbox]` header)
+- Remote command tool v2 - file transfer to/from remote hosts, detached long-running remote jobs that survive the ssh session (on Windows via a scheduled task), and guaranteed encoding
+- `/status` additions - chain count in the status bar and a settings block showing the auto-context configuration
+
+### Fixed
+
+- TUI "Event loop is closed" error on the first message - the TUI now creates its own client in its own event loop
+- Corrupt or truncated images no longer kill the turn - they're detected up front and reported as a text note instead
+- Windows `--upgrade` - the helper now moves the whole tool directory to get past the directory lock, fixing stuck updates
+- Pausing and resuming mid-turn - the status bar now reports WAITING instead of sticking on IDLE
+- The Ctx counter now drops immediately after compaction instead of showing the stale pre-compact count
+- Empty LLM responses are retried on a fresh connection, and a stranded turn can be recovered with `/resume`
+- After a restart, the agent continues the outstanding work instead of re-summarising
+- Auto-context flags can no longer get stranded over the threshold after an interrupted turn
+
+### Changed
+
+- Auto-context new defaults: report-and-compact action, a chain of 3 turn restarts, and 180k threshold in the bundled starter config; the compaction check now happens before a turn starts, so it triggers when you continue rather than when a turn ends
+- Chain restarts keep the compacted summary as the first message of the new conversation
+- Minimum Python version is now 3.11 (the tomli fallback for 3.10 was dropped)
+- Pinned `openai==3.13.0` and `httpx==0.28.1` - openai 3.x is in flux, so bump deliberately with a test run
+- Saves can now be found and listed from two locations; `/status` counts are correct and failed completions are visible
+- Config: documented `skill_paths`, `include_skills`, `bell.command` and MCP timeout keys; MCP `connect_timeout` default aligned to 300s
+- `/status`, `/sandbox` and `/devel` now show the pinned value
+
 ## [0.4.2] - 2026-09-12
 
 ### Changed

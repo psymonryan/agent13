@@ -27,24 +27,37 @@ method = "osc52"
 # threshold = 0   → always ring (default)
 # threshold = 30  → only ring if turn took longer than 30 seconds
 # enabled = false → disable entirely
+# command = "..."  → run an external command instead of the terminal bell
+#   (e.g. a sound file). The first token must be an executable on PATH.
 # Change at runtime with: /bell 30, /bell 0, /bell off, /bell
 [bell]
 enabled = true
 threshold = 0
+# command = "afplay /System/Library/Sounds/Glass.aiff"
 
-# Auto-compact threshold (tokens)
+# Auto-context threshold (tokens)
 # When the context window (prompt_tokens) reaches this value mid-turn,
-# the agent stops at the next safe point and journals (if journal is on)
-# or compacts the full history (if journal is off).
-# Default 220000 (220k) suits ~260k-context models (e.g. Qwen 3.8) with a
-# safety buffer. Must be an integer - no "k" suffix (220000, not "220k").
-# Set to 0 to disable. Change at runtime with: /auto_compact_threshold 150k
-[auto_compact]
-threshold = 220000
-# Max times the agent will compact-and-continue within a single turn before
-# pausing (so you can /compact, /journal all, or /model to a bigger-context
-# model, then /resume). Change at runtime with: /auto_compact_max N
-max_iterations = 3
+# the agent stops at the next safe point and takes the configured action
+# (compact / report_and_compact / none).
+# 180000 (180k) here suits ~260k-context models (e.g. Qwen 3.8) with a
+# safety buffer. Must be an integer - no "k" suffix (180000, not "180k").
+# Set to 0 to disable. Change at runtime with: /auto_context_threshold 150k
+[auto_context]
+threshold = 180000
+# Action to take at the threshold. Change at runtime with:
+# /auto_context_action <value>
+#   compact            - full compact, then idle (chain>0: restart the turn)
+#   report_and_compact - snapshot, run a wrap-up report turn, compact, then
+#                        idle/restart
+#   none               - leave the context untouched; pause so you can /model
+#                        to a bigger-context model, /compact, or /journal all,
+#                        then /resume.
+# Equivalent CLI flag for report_and_compact: --report-and-compact
+# action = "report_and_compact"
+# How many times the agent may restart the turn after a compact within a single
+# user turn. 0 = no restarts (the action fires once, then idle). Ignored when
+# action = "none". Change at runtime with: /auto_context_chain N
+# chain = 3
 
 # UI settings
 # cursor_blink = false  → solid cursor, no periodic terminal output (default, tmux-friendly)
@@ -110,6 +123,13 @@ api_key_env_var = "OPENAI_API_KEY"
 # enabled_tools = []
 # disabled_tools = ["tui_*"]
 
+# Skills
+# skill_paths = extra directories to search for skills (highest priority,
+#   searched before the built-in default_skills). Example:
+# skill_paths = ["~/my-skills"]
+# include_skills = true  # inject skills into the system prompt (default false;
+#   also settable with the --skills CLI flag)
+
 # MCP Servers - HTTP transport (remote)
 # [[mcp_servers]]
 # name = "hvac_server"
@@ -117,6 +137,10 @@ api_key_env_var = "OPENAI_API_KEY"
 # url = "http://c10:4040/mcp"
 # enabled_tools = []
 # disabled_tools = []
+# connect_timeout = 300  # Seconds to establish the connection (default: 300)
+# tool_timeout = 60      # Seconds per tool call (default: 60)
+# retry_attempts = 3     # Connection retry attempts (default: 3)
+# retry_delay = 1.0      # Initial retry delay in seconds (default: 1.0)
 
 # MCP Servers - stdio transport (local process)
 # --with mcp<2: pin MCP SDK 1.x — many MCP servers import mcp.server.fastmcp
@@ -135,6 +159,10 @@ api_key_env_var = "OPENAI_API_KEY"
 # env = { "SEARXNG_BASE_URL" = "http://searxng/search" }
 # enabled_tools = []
 # disabled_tools = []
+# connect_timeout = 300  # Seconds to establish the connection (default: 300)
+# tool_timeout = 60      # Seconds per tool call (default: 60)
+# retry_attempts = 3     # Connection retry attempts (default: 3)
+# retry_delay = 1.0      # Initial retry delay in seconds (default: 1.0)
 
 [[mcp_servers]]
 name = "fetch_server"

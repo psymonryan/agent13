@@ -168,6 +168,11 @@ async def _run_sftp(
         stdout_b, stderr_b = await asyncio.wait_for(
             process.communicate(), timeout=timeout
         )
+    except asyncio.CancelledError:
+        # The transfer task was cancelled (e.g. TUI exit) - kill sftp so it
+        # cannot outlive the tool call, then re-raise.
+        await _kill_process_tree(process)
+        raise
     except asyncio.TimeoutError:
         await _kill_process_tree(process)
         return {
@@ -176,20 +181,28 @@ async def _run_sftp(
             "stdout": "",
             "stderr": f"sftp timed out after {timeout}s",
         }
-
-    stderr = stderr_b.decode(_SUBPROCESS_ENCODING, errors="replace")
-    if process.returncode != 0 and "subsystem request failed" in stderr:
-        stderr += (
-            "\nThe remote sshd does not offer the sftp subsystem. Enable it "
-            "(sshd_config: Subsystem sftp ...) or copy the file in base64 "
-            "chunks via command(remote=...) instead."
-        )
-    return {
-        "success": process.returncode == 0,
-        "exit_code": process.returncode,
-        "stdout": stdout_b.decode(_SUBPROCESS_ENCODING, errors="replace"),
-        "stderr": stderr,
-    }
+    else:
+        stderr = stderr_b.decode(_SUBPROCESS_ENCODING, errors="replace")
+        if process.returncode != 0 and "subsystem request failed" in stderr:
+            stderr += (
+                "\nThe remote sshd does not offer the sftp subsystem. Enable it "
+                "(sshd_config: Subsystem sftp ...) or copy the file in base64 "
+                "chunks via command(remote=...) instead."
+            )
+        return {
+            "success": process.returncode == 0,
+            "exit_code": process.returncode,
+            "stdout": stdout_b.decode(_SUBPROCESS_ENCODING, errors="replace"),
+            "stderr": stderr,
+        }
+    finally:
+        # communicate() closes the streams on every path (including
+        # cancellation); close the subprocess transport too, in case the
+        # process survived the kill (unclosed transports warn at GC and
+        # raise ValueError("I/O operation on closed pipe") on Windows).
+        transport = getattr(process, "_transport", None)
+        if transport is not None:
+            transport.close()
 
 
 async def _ensure_remote_dir(host: str, shell: str, dir_path: str) -> dict:

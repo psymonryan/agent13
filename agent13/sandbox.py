@@ -858,8 +858,6 @@ async def run_sandboxed_async(
             await asyncio.wait_for(asyncio.gather(pump_out, pump_err), timeout=5)
         except asyncio.TimeoutError:
             await _kill_process_tree(process)
-            pump_out.cancel()
-            pump_err.cancel()
 
         stdout = b"".join(chunks_out).decode(_SUBPROCESS_ENCODING, errors="replace")
         stderr = b"".join(chunks_err).decode(_SUBPROCESS_ENCODING, errors="replace")
@@ -893,9 +891,12 @@ async def run_sandboxed_async(
             "sandbox_mode": mode.value,
         }
 
+    except asyncio.CancelledError:
+        # The command task was cancelled (TUI exit, ESC) - kill the process
+        # tree so the child cannot outlive the tool call, then re-raise.
+        await _kill_process_tree(process)
+        raise
     except FileNotFoundError as e:
-        pump_out.cancel()
-        pump_err.cancel()
         return {
             "success": False,
             "exit_code": -1,
@@ -908,8 +909,8 @@ async def run_sandboxed_async(
             "sandbox_mode": mode.value,
         }
     except Exception as e:
-        pump_out.cancel()
-        pump_err.cancel()
+        # Best-effort: don't leave the child running on an unexpected error.
+        await _kill_process_tree(process)
         return {
             "success": False,
             "exit_code": -1,
@@ -921,6 +922,23 @@ async def run_sandboxed_async(
             "output_encoding": "utf-8",
             "sandbox_mode": mode.value,
         }
+    finally:
+        # Cancel in-flight pumps and close the streams + subprocess transport
+        # on every path. asyncio only counts pipe transports as closed when
+        # close() is called; left open, their __del__ at interpreter shutdown
+        # warns "unclosed transport" and __repr__ raises
+        # ValueError("I/O operation on closed pipe") on Windows.
+        pump_out.cancel()
+        pump_err.cancel()
+        # StreamReader has no close(); close the underlying pipe transport.
+        for stream in (process.stdout, process.stderr):
+            if stream is not None:
+                pipe_transport = getattr(stream, "_transport", None)
+                if pipe_transport is not None:
+                    pipe_transport.close()
+        transport = getattr(process, "_transport", None)
+        if transport is not None:
+            transport.close()
 
 
 def _timeout_result(
@@ -996,5 +1014,6 @@ async def _kill_process_tree(proc: asyncio.subprocess.Process) -> None:
             else:
                 proc.kill()
         await proc.wait()
-    except (ProcessLookupError, PermissionError, OSError):
+    except (ProcessLookupError, PermissionError, OSError, RuntimeError):
+        # RuntimeError: event loop already closed (interpreter shutdown)
         pass  # Process already dead

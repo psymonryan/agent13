@@ -101,7 +101,7 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 Install the latest release:
 
 ```bash
-uv tool install https://github.com/psymonryan/agent13/releases/download/v0.5.0/agent13-0.5.0-py3-none-any.whl
+uv tool install https://github.com/psymonryan/agent13/releases/download/v0.5.1/agent13-0.5.1-py3-none-any.whl
 ```
 
 ### Uninstall Agent13

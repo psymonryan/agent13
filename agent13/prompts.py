@@ -166,7 +166,10 @@ DEFAULT_REPORT_AND_COMPACT_PROMPT = (
     '      No delta: write "- none" and nothing else.\n'
     "\n"
     "Name the journal after the PROJECT, not this session's sub-task; put the\n"
-    "sub-task in the entry header. No cumulative version history. No prose\n"
+    "sub-task in the entry header. The project name: if the user named the\n"
+    "project in any message, use that name for {project} (both files and the\n"
+    "truth title); only with no name given, fall back to the directory name.\n"
+    "No cumulative version history. No prose\n"
     "restatement of prior entries. Keep it tight - a cold reader must be able to\n"
     "act on it.\n"
     "\n"
@@ -208,6 +211,8 @@ DEFAULT_COMPACT_PROMPT = (
     "- The project's durable record \u2014 the journal and current-truth files\n"
     "  under docs_archive/ (e.g. <project>_current_truth.md). Always name them,\n"
     "  even if untouched this session, with a cue on when to read them.\n"
+    "  If the user named the project, carry that name - it determines the\n"
+    "  file names when the wrap-up creates them.\n"
     "  Mid-session journal appends (user-requested, or to make a hard-won\n"
     "  finding survive a crash) are fine: same dated heading with terse\n"
     '  outcome, plain "- " bullets, NO a-h sections - those belong to the\n'

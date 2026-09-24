@@ -2277,6 +2277,27 @@ class AgentTUI(App):
             )
             # Keep selection visible - don't clear
 
+    async def _shutdown(self) -> None:
+        await super()._shutdown()
+        # on_unmount (dispatched during super()._shutdown) cancels the MCP
+        # session tasks, but their unwind is async: the SDK's shielded stdio
+        # shutdown needs loop iterations to close the child pipes and
+        # transport. asyncio.run's teardown mass-cancels any task still
+        # unwinding, leaving transports unclosed whose __del__ raises
+        # ValueError("I/O operation on closed pipe") at exit. Drain them
+        # here while the loop is still open (bounded: the SDK's internal
+        # shutdown timeouts sum to ~4.5s worst case).
+        mcp = self.agent.mcp
+        if mcp is None:
+            return
+        tasks = [
+            server.session_task
+            for server in mcp.servers.values()
+            if server.session_task is not None and not server.session_task.done()
+        ]
+        if tasks:
+            await asyncio.wait(tasks, timeout=5.0)
+
     def on_unmount(self) -> None:
         """Clean up when unmounting."""
         self._shutting_down = True

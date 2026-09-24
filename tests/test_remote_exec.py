@@ -787,3 +787,105 @@ class TestEncodingGuarantees:
         assert result["status"] == "error"
         assert result["output_encoding"] == "utf-8"
         assert "ssh not found" in result["stderr"]
+
+
+class TestTransportCleanup:
+    """run_remote_command must close pipe + subprocess transports on every
+    path (same rationale as TestTransportCleanup in test_sandbox.py:
+    unclosed pipe transports warn at GC and raise
+    ValueError("I/O operation on closed pipe") on Windows).
+
+    ssh is stood in for by a local command via a patched build_remote_argv,
+    so real asyncio transports exist to assert on. The stand-in is
+    sys.executable (not shell builtins like echo/sleep) because
+    create_subprocess_exec runs without a shell on Windows.
+    """
+
+    @staticmethod
+    def _assert_transports_closed(proc):
+        for stream in (proc.stdout, proc.stderr):
+            if stream is not None:
+                t = stream._transport
+                assert t is not None and t._closing, "pipe transport left open"
+        assert proc._transport is not None and proc._transport._closed, (
+            "subprocess transport left open"
+        )
+
+    @staticmethod
+    def _patches(argv, processes):
+        from unittest.mock import AsyncMock, patch
+
+        real = asyncio.create_subprocess_exec
+
+        async def capture(*args, **kwargs):
+            proc = await real(*args, **kwargs)
+            processes.append(proc)
+            return proc
+
+        return (
+            patch(
+                "agent13.remote_exec.detect_remote_shell",
+                new=AsyncMock(return_value="posix"),
+            ),
+            patch("agent13.remote_exec.build_remote_argv", return_value=argv),
+            patch("asyncio.create_subprocess_exec", capture),
+        )
+
+    @staticmethod
+    def _py(code):
+        import sys
+
+        return [sys.executable, "-c", code]
+
+    @pytest.mark.asyncio
+    async def test_normal_path_closes_transports(self):
+        processes = []
+        p1, p2, p3 = self._patches(self._py("print('hi')"), processes)
+        start = len(processes)
+        with p1, p2, p3:
+            result = await run_remote_command(
+                host="myhost", command="echo hi", timeout=10
+            )
+        assert result["success"]
+        # processes[start] is the command itself (on Windows the timeout
+        # kill may append a taskkill after it).
+        self._assert_transports_closed(processes[start])
+
+    @pytest.mark.asyncio
+    async def test_cancel_path_closes_transports_and_kills(self):
+        processes = []
+        p1, p2, p3 = self._patches(
+            self._py("import time; time.sleep(30)"), processes
+        )
+        start = len(processes)
+        with p1, p2, p3:
+            task = asyncio.create_task(
+                run_remote_command(host="myhost", command="sleep 30", timeout=60)
+            )
+            # Poll until the spawn has completed: a cancel before spawn
+            # leaves no process to assert on (slow CI machines).
+            for _ in range(100):
+                if len(processes) > start:
+                    break
+                await asyncio.sleep(0.1)
+            assert len(processes) > start, "spawn did not complete before cancel"
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        proc = processes[start]
+        self._assert_transports_closed(proc)
+        assert proc.returncode is not None, "ssh not killed on cancel"
+
+    @pytest.mark.asyncio
+    async def test_timeout_path_closes_transports(self):
+        processes = []
+        p1, p2, p3 = self._patches(
+            self._py("import time; time.sleep(30)"), processes
+        )
+        start = len(processes)
+        with p1, p2, p3:
+            result = await run_remote_command(
+                host="myhost", command="sleep 30", timeout=1
+            )
+        assert result["timed_out"]
+        self._assert_transports_closed(processes[start])

@@ -211,6 +211,11 @@ async def _run_ssh_probe(host: str, remote_cmd: str, timeout: float) -> dict:
         stdout_b, stderr_b = await asyncio.wait_for(
             process.communicate(), timeout=timeout
         )
+    except asyncio.CancelledError:
+        # Cancelled (e.g. TUI exit) - kill ssh so it cannot outlive the
+        # probe, then re-raise.
+        await _kill_process_tree(process)
+        raise
     except asyncio.TimeoutError:
         await _kill_process_tree(process)
         return {
@@ -303,9 +308,11 @@ async def run_remote_command(
     # Write the base64 payload to stdin, then close it. The remote
     # template reads all of stdin (b64=$(cat) / ReadToEnd), decodes,
     # and runs the script.
+    stdin_closed = False
     try:
         process.stdin.write(b64.encode("ascii"))
         process.stdin.close()
+        stdin_closed = True
     except Exception:
         pass  # stdin write failure will surface as a remote error
 
@@ -338,8 +345,6 @@ async def run_remote_command(
             await asyncio.wait_for(asyncio.gather(pump_out, pump_err), timeout=5)
         except asyncio.TimeoutError:
             await _kill_process_tree(process)
-            pump_out.cancel()
-            pump_err.cancel()
 
         stdout = b"".join(chunks_out).decode(_SUBPROCESS_ENCODING, errors="replace")
         stderr = b"".join(chunks_err).decode(_SUBPROCESS_ENCODING, errors="replace")
@@ -374,9 +379,14 @@ async def run_remote_command(
             "remote_shell": shell,
         }
 
+    except asyncio.CancelledError:
+        # The command task was cancelled (TUI exit, ESC) - kill the ssh
+        # process so it cannot outlive the tool call, then re-raise.
+        await _kill_process_tree(process)
+        raise
     except Exception as e:
-        pump_out.cancel()
-        pump_err.cancel()
+        # Best-effort: don't leave ssh running on an unexpected error.
+        await _kill_process_tree(process)
         return {
             "success": False,
             "exit_code": -1,
@@ -389,6 +399,23 @@ async def run_remote_command(
             "remote": host,
             "remote_shell": shell,
         }
+    finally:
+        # Cancel in-flight pumps and close the streams + subprocess
+        # transport on every path (same rationale as run_sandboxed_async:
+        # unclosed pipe transports warn at GC and raise
+        # ValueError("I/O operation on closed pipe") on Windows).
+        pump_out.cancel()
+        pump_err.cancel()
+        if not stdin_closed and process.stdin is not None:
+            process.stdin.close()
+        for stream in (process.stdout, process.stderr):
+            if stream is not None:
+                pipe_transport = getattr(stream, "_transport", None)
+                if pipe_transport is not None:
+                    pipe_transport.close()
+        transport = getattr(process, "_transport", None)
+        if transport is not None:
+            transport.close()
 
 
 def _remote_timeout_result(

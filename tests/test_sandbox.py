@@ -20,6 +20,7 @@ from agent13.sandbox import (
     get_effective_sandbox_mode,
     build_sandbox_command,
     run_sandboxed,
+    run_sandboxed_async,
     format_sandbox_mode_info,
     format_all_sandbox_modes,
     get_temp_dir,
@@ -1025,3 +1026,75 @@ class TestKillProcessTree:
             f"parent was killed (rc={r.returncode}); group-kill guard regressed: {r.stderr}"
         )
         assert "SURVIVED True" in r.stdout
+
+
+class TestTransportCleanup:
+    """run_sandboxed_async must close pipe + subprocess transports on every
+    path, or their __del__ at interpreter shutdown warns "unclosed transport"
+    and raises ValueError("I/O operation on closed pipe") on Windows
+    (Proactor loop). See windows_release_fixes."""
+
+    @staticmethod
+    def _assert_transports_closed(proc):
+        for stream in (proc.stdout, proc.stderr):
+            if stream is not None:
+                t = stream._transport
+                assert t is not None and t._closing, "pipe transport left open"
+        assert proc._transport is not None and proc._transport._closed, (
+            "subprocess transport left open"
+        )
+
+    @staticmethod
+    def _capture_exec(processes):
+        real = asyncio.create_subprocess_exec
+
+        async def capture(*args, **kwargs):
+            proc = await real(*args, **kwargs)
+            processes.append(proc)
+            return proc
+
+        return patch("asyncio.create_subprocess_exec", capture)
+
+    @pytest.mark.asyncio
+    async def test_normal_path_closes_transports(self):
+        processes = []
+        with self._capture_exec(processes):
+            result = await run_sandboxed_async(
+                command="echo hi", mode=SandboxMode.OFF, timeout=10
+            )
+        assert result["success"]
+        self._assert_transports_closed(processes[0])
+
+    @pytest.mark.asyncio
+    async def test_cancel_path_closes_transports_and_kills(self):
+        processes = []
+        with self._capture_exec(processes):
+            task = asyncio.create_task(
+                run_sandboxed_async(
+                    command="sleep 30", mode=SandboxMode.OFF, timeout=60
+                )
+            )
+            # Poll until the spawn has completed: on Windows the command
+            # runs in PowerShell, whose cold start can exceed a fixed
+            # sleep - a cancel before spawn leaves no process to assert on.
+            for _ in range(100):
+                if processes:
+                    break
+                await asyncio.sleep(0.1)
+            assert processes, "spawn did not complete before cancel"
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        proc = processes[0]
+        self._assert_transports_closed(proc)
+        assert proc.returncode is not None, "child not killed on cancel"
+
+    @pytest.mark.asyncio
+    async def test_timeout_path_closes_transports(self):
+        processes = []
+        with self._capture_exec(processes):
+            result = await run_sandboxed_async(
+                command="sleep 30", mode=SandboxMode.OFF, timeout=1
+            )
+        assert result["timed_out"]
+        self._assert_transports_closed(processes[0])

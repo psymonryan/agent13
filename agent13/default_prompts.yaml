@@ -156,7 +156,10 @@ report_and_compact: |
         No delta: write "- none" and nothing else.
 
   Name the journal after the PROJECT, not this session's sub-task; put the
-  sub-task in the entry header. No cumulative version history. No prose
+  sub-task in the entry header. The project name: if the user named the
+  project in any message, use that name for {project} (both files and the
+  truth title); only with no name given, fall back to the directory name.
+  No cumulative version history. No prose
   restatement of prior entries. Keep it tight - a cold reader must be able to
   act on it.
 
@@ -170,6 +173,8 @@ compaction: |
   - The project's durable record — the journal and current-truth files
     under docs_archive/ (e.g. <project>_current_truth.md). Always name them,
     even if untouched this session, with a cue on when to read them.
+    If the user named the project, carry that name - it determines the
+    file names when the wrap-up creates them.
     Mid-session journal appends (user-requested, or to make a hard-won
     finding survive a crash) are fine: same dated heading with terse
     outcome, plain "- " bullets, NO a-h sections - those belong to the

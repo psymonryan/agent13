@@ -144,6 +144,55 @@ class TestReflectOnToolUse:
             assert "tools" in messages[-1]["content"]
 
     @pytest.mark.asyncio
+    async def test_reflection_control_events_not_emitted_as_text(self):
+        """Regression: stream-end 'finish' dict leaked into ASSISTANT_REASONING.
+
+        stream_response_with_tools yields ("finish", {"finish_reason": ...})
+        and ("keepalive", {}) — dict payloads. reflect_on_tool_use emitted
+        any truthy payload as reasoning "text", so the TUI widget received
+        a dict and crashed on `self._content += text`
+        (TypeError: can only concatenate str (not "dict") to str).
+        """
+        client = MockClient()
+        agent = Agent(client, model="test-model")
+
+        agent.messages = [
+            {"role": "user", "content": "What is 2+2?"},
+            {"role": "assistant", "content": "It's 4."},
+        ]
+
+        async def mock_stream(*args, **kwargs):
+            yield ("keepalive", {})
+            yield ("reasoning", "Checking the sum.")
+            yield ("content", "Attempted: math. Found: 4.")
+            yield ("finish", {"finish_reason": "stop"})
+
+        emitted = []
+
+        async def record_emit(event, data):
+            emitted.append((event, data))
+
+        agent.journal._emit = record_emit
+
+        with patch("agent13.llm.stream_response_with_tools") as mock_reflect:
+            mock_reflect.return_value = mock_stream()
+
+            result = await agent.journal.reflect_on_tool_use()
+
+        assert result == "Attempted: math. Found: 4."
+
+        reasoning_texts = [
+            data.get("text")
+            for event, data in emitted
+            if event == AgentEvent.ASSISTANT_REASONING
+        ]
+        # Only the two text payloads were emitted, in stream order —
+        # the keepalive/finish dicts were not.
+        assert reasoning_texts == ["Checking the sum.", "Attempted: math. Found: 4."]
+        # Every emitted reasoning "text" must be a str (the UI concatenates it)
+        assert all(isinstance(t, str) for t in reasoning_texts)
+
+    @pytest.mark.asyncio
     async def test_reflection_failure_returns_none(self):
         """Should return None if reflection API call fails."""
         client = MockClient()

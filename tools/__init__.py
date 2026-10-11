@@ -47,6 +47,7 @@ class ToolResult:
     def __str__(self) -> str:
         return self.text
 
+
 # Lazy import to avoid circular dependency with agent package
 _log_event = None
 _log_error = None
@@ -79,6 +80,9 @@ _async_registry: dict[str, Callable] = {}
 _schemas: list[dict] = []
 # Map of tool name -> list of group names
 _tool_groups_map: dict[str, list[str]] = {}
+# Per-tool tool-result character caps (declared via @tool(max_result_chars=...)).
+# A cap here wins over the global [tools] max_result_chars config.
+_tool_max_result_chars: dict[str, int] = {}
 _discovered = False
 
 
@@ -166,6 +170,7 @@ def tool(
     is_async: bool = False,
     timeout: float | None = None,
     groups: list[str] | None = None,
+    max_result_chars: int | None = None,
 ) -> Callable:
     """
     Decorator to register a function as a tool.
@@ -178,6 +183,10 @@ def tool(
         timeout: Maximum execution time in seconds (default: None)
         groups: List of group names this tool belongs to (default: None)
                 Tools in the "devel" group are hidden unless --devel is active.
+        max_result_chars: Per-tool cap on the result's text size in chars
+                (default: None = the global [tools] max_result_chars applies).
+                Over-cap results are spilled to a temp file; the model gets
+                head + marker + tail.
 
     Extracts schema from type hints and docstring.
     """
@@ -196,6 +205,9 @@ def tool(
             f._tool_groups = groups
         else:
             f._tool_groups = []
+
+        # Store the per-tool result cap in function metadata
+        f._max_result_chars = max_result_chars
 
         # Get type hints
         hints = get_type_hints(f)
@@ -248,6 +260,10 @@ def tool(
         # Track group membership
         if groups:
             _tool_groups_map[name] = groups
+
+        # Track the per-tool result cap
+        if max_result_chars is not None:
+            _tool_max_result_chars[name] = max_result_chars
 
         return f
 
@@ -645,6 +661,20 @@ def get_tool_groups(name: str) -> list[str]:
     """
     _ensure_discovered()
     return _tool_groups_map.get(name, [])
+
+
+def get_tool_max_result_chars(name: str) -> int | None:
+    """Get the per-tool result character cap declared on the tool.
+
+    Args:
+        name: The tool name
+
+    Returns:
+        The cap (chars) if the tool declared one via
+        @tool(max_result_chars=...), else None (the global [tools]
+        max_result_chars config applies).
+    """
+    return _tool_max_result_chars.get(name)
 
 
 def get_tool_names() -> list[str]:

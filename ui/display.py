@@ -17,8 +17,11 @@ from typing import Optional
 from rich.console import Console
 from rich.live import Live
 from rich.markdown import Markdown
+from rich.markup import escape as escape_markup
 from rich.panel import Panel
 from rich.rule import Rule
+
+from ui.summary import budget_for, first_line, tool_what, truncate_line
 
 
 class RichDisplay:
@@ -47,6 +50,8 @@ class RichDisplay:
         pretty: bool = True,
         debug: bool = False,
         debug_streaming: bool = False,
+        reasoning_collapsed: bool = True,
+        toolview_collapsed: bool = True,
     ):
         """Initialize the display.
 
@@ -55,15 +60,25 @@ class RichDisplay:
             pretty: Enable pretty output (spinners, panels, markdown)
             debug: Enable debug mode (for logging, not display)
             debug_streaming: Show token boundaries during streaming
+            reasoning_collapsed: Print no reasoning text (the REPL has no
+                collapsible widgets, so "folded" means "not printed" - the
+                spinner already says "Thinking" while it streams)
+            toolview_collapsed: Print one dim line per tool call ("name")
+                instead of a panel with args, and no result body
         """
         self.console = console if console is not None else Console()
         self.pretty = pretty
         self.debug = debug
         self.debug_streaming = debug_streaming
+        self.reasoning_collapsed = reasoning_collapsed
+        self.toolview_collapsed = toolview_collapsed
 
         # State tracking
         self._in_reasoning = False
         self._in_content = False
+        # Folded reasoning: buffer the thought text so start_response() can
+        # print its one-line "what" hint. Cleared on each flush.
+        self._reasoning_folded_buf = ""
         self._status = None  # Rich status spinner
 
         # Markdown streaming state (pretty mode only)
@@ -83,7 +98,7 @@ class RichDisplay:
             # Stop any existing spinner first to avoid conflicts
             self.stop_waiting()
             self._status = self.console.status(
-                f"[bold blue]{status}...", spinner="dots"
+                f"[bold bright_blue]{status}...", spinner="dots"
             )
             self._status.__enter__()
 
@@ -117,6 +132,9 @@ class RichDisplay:
         self._in_content = True
         self._response_buffer = ""
         self._live_display = None
+
+        # Folded reasoning just ended: show its one-line "what" before the header.
+        self._flush_folded_reasoning()
 
         # Add newline after reasoning if we were thinking
         if was_in_reasoning:
@@ -156,12 +174,51 @@ class RichDisplay:
             # Non-pretty mode: print raw text
             self._print(text, end="")
 
+    def _console_width(self) -> int:
+        """Current terminal width in cells (0 if unknown/mocked)."""
+        try:
+            return int(self.console.size.width)
+        except (TypeError, ValueError, AttributeError):
+            return 0
+
+    def _call_budget(self, name: str, seq: int | None = None) -> int:
+        """Cell budget for a folded tool-call 'what'."""
+        label = f"{name} {seq}" if seq else name
+        return budget_for(f"⚙ {label}: ", self._console_width(), indicator=False)
+
+    def _hint_budget(self) -> int:
+        """Cell budget for a folded reasoning 'what'."""
+        return budget_for("Thoughts: ", self._console_width(), indicator=False)
+
+    def _flush_folded_reasoning(self) -> None:
+        """Print the one-line 'what' for a folded reasoning block, once.
+
+        No-op when nothing was buffered; idempotent (clears the buffer), so it
+        can be called from both start_response() and complete_response().
+        """
+        buf, self._reasoning_folded_buf = self._reasoning_folded_buf, ""
+        if not buf:
+            return
+        hint = truncate_line(first_line(buf), self._hint_budget())
+        if not hint:
+            return
+        if self.pretty:
+            self._print(f"[dim]Thoughts: {escape_markup(hint)}[/]")
+        else:
+            self._print(f"Thoughts: {hint}")
+
     def add_reasoning(self, text: str):
         """Add reasoning text.
 
         Args:
             text: Reasoning text to display
         """
+        # Folded: buffer the thought so the block can show its one-line "what"
+        # when it ends. The spinner already says "Thinking"; a linear stream
+        # has no way to expand a folded block later.
+        if self.reasoning_collapsed:
+            self._reasoning_folded_buf += text
+            return
         # Stop spinner and show "Thinking:" prefix before first reasoning token
         if not self._in_reasoning:
             self.stop_waiting()
@@ -187,6 +244,9 @@ class RichDisplay:
         """
         # Stop any remaining spinner (safety check)
         self.stop_waiting()
+        # A turn can end on reasoning with no content after it (so
+        # start_response() never ran); flush its one-line "what" here too.
+        self._flush_folded_reasoning()
         # Finalize Live display if active
         if self._live_display:
             # Final update with complete buffer
@@ -208,13 +268,33 @@ class RichDisplay:
         # Newline after response content (separates from next prompt)
         self._print("")
 
-    def show_tool_call(self, name: str, arguments: dict):
+    def show_tool_call(self, name: str, arguments: dict, seq: int | None = None):
         """Show a tool call.
 
         Args:
             name: Tool name
             arguments: Tool arguments
+            seq: Per-turn 1-based index of this call in its batch - rendered
+                in the line so a result can be paired with its call.
         """
+        label = f"{name} {seq}" if seq else name
+        if self.toolview_collapsed:
+            # Folded: one dim line carrying the "what" (the command running,
+            # the file being edited), no panel and no args body. That line is
+            # the only "what is it doing right now" signal in a linear stream.
+            what = truncate_line(
+                tool_what(name, arguments), self._call_budget(name, seq)
+            )
+            if what:
+                shown = (
+                    f"⚙ {label}: {escape_markup(what)}"
+                    if self.pretty
+                    else f"⚙ {label}: {what}"
+                )
+            else:
+                shown = f"⚙ {label}"
+            self._print(f"[dim]{shown}[/]" if self.pretty else shown)
+            return
         args_str = (
             json.dumps(arguments, indent=2)
             if len(json.dumps(arguments)) > 50
@@ -225,16 +305,22 @@ class RichDisplay:
         else:
             self._print_panel(f"{name}({json.dumps(arguments)})", "Tool Call")
 
-    def show_tool_result(self, result: str):
+    def show_tool_result(self, result: str, seq: int | None = None):
         """Show a tool result.
 
         Args:
             result: Tool result string
+            seq: Per-turn 1-based index of the call this result belongs to -
+                prefixed to the line so it can be paired with its call.
         """
+        # Folded: the result body is the bulk of the noise - print nothing.
+        if self.toolview_collapsed:
+            return
         result_display = (
             result[:500] + "..." if len(result) > 500 and self.pretty else result
         )
-        self._print(f"→ {result_display}", style="dim")
+        prefix = f"{seq}: " if seq else ""
+        self._print(f"→ {prefix}{result_display}", style="dim")
 
     def show_error(self, message: str):
         """Show an error message.
@@ -264,7 +350,7 @@ class RichDisplay:
             style = "bold red"
             prefix = "✗ Error:"
         else:  # info
-            style = "bold blue"
+            style = "bold bright_blue"
             prefix = "ℹ Info:"
 
         if self.pretty:

@@ -238,5 +238,3 @@ class TestPipeModeLifecycle:
         )
         # stderr should have the session end message
         assert "Pipe session ended" in stderr
-
-

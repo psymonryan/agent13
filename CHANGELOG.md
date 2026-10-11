@@ -5,6 +5,53 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.0] - 2026-10-11
+
+### Added
+
+- **Degeneration guard** - when a stream ends on a token cap or a wall of whitespace, agent13 nudges the model to continue; it stops and saves a snapshot once the nudge cap is reached
+- `/chain` - a manual chain restart (wraps up if the records are stale, then clears and re-injects them); it carries manually-loaded skills, and `/chain no-skills` drops and forgets them
+- `/wrapup` - a manual journal + truth update without compaction, with an optional project name
+- `/new_session` and `/rebuild [N]` replace `/clear all` and `/clear N`
+- Session chain count and start time are now persisted and shown in `/status`, and in the status bar as `trn:totalchains:chainssincelastturn:turncount`
+- When a chain of auto-context restarts is exhausted, a persistent footer explains that the turn stopped and the context was compacted, and that sending a message continues
+- `--focus` at startup inserts the truth document and the last journal entry into the session
+- `/focus` now reports its state in the info pane like the other state commands (with no argument it shows the current name), and the effective focus name is shown in the status bar and `/status`
+- Reasoning and tool widgets are folded by default (configurable via `[ui]`, CLI flags, and `/reasoning` + `/toolview`); folded widgets show a one-line "what" (the command/file, or the first line of thought), falling back to a short scalar argument when a tool has no string argument
+- The interactive update prompt now shows the what's-new changelog since your last update
+- The `--auto-context-threshold` flag accepts a `k` suffix (e.g. `180k`), matching the slash command
+- Over-long tool output is now bounded, with the excess spilled to a temp file; `/status` shows a bounded count in the Tools section
+- The TUI shows an "MCP servers connecting..." line while a connection cycle is in progress
+
+### Fixed
+
+- A TUI crash where a journal reflection leaked a stream-end marker into the reasoning tokens
+- Journal reflection now runs after resumed incomplete turns
+- Dark blue toasts and the spinner are now a brighter blue, so they're readable in dark mode
+- A `/status` crash on older saved sessions
+- Remote shell auto-detection (positive-only probes), fixing macOS detection issues and related TUI crashes
+- The command tool's 120-second REPL stall on Windows (stdin is now discarded and line endings normalised for byte-exact output)
+- The command tool's Windows run-mode now uses a temp `.ps1` script, fixing a stdin-steal that produced empty output
+- Switching models with `/model` re-grounds the token count
+- The auto-context staleness check now uses a history-shrink test (replacing the character-based ceiling), fixing a threshold misfire
+- The token count is re-grounded after compaction, with a guard against stale grounding that caused spurious wrap-ups
+- `/pause` during a polite-mode lock wait now pauses the turn instead of interrupting it
+
+### Changed
+
+- `/status` now documents the TUI status bar, MCP connection state, and the bounded tool-output count
+- Durable records (focus and notes) are re-injected automatically after compaction
+- Chain restarts are now mechanical - a pre-baked intro replaces the previous AI summary call, and they carry the turn-start instruction verbatim as a standing intent
+- `/focus` applies immediately rather than being queued, so a name set mid-turn takes effect before the auto-context wrap-up
+- The focus name is now persisted in context saves.
+- Manual `/compact` now derives bridge eligibility from history and uses the bridge summary produced by a wrap-up; the `report_and_compact` auto-compact produces a short bridge summary
+- The `--report-and-compact` flag is renamed to `--auto-context-action` (`compact` | `report_and_compact` | `none`)
+- Agent turns now wait for MCP servers to connect (and reconnect) before starting, and the status bar refreshes when the connection finishes
+- The command tool's guidance now steers away from nested here-strings and inline base64 (use `remote_put`) and prefers non-interactive command forms
+- The `context7` skill was removed and the `humaniser2` skill was upgraded
+- The post-turn auto-context decision (reason, chain, chain used) is now logged
+- Improved the prompts used for chain restarts and the degeneration nudge
+
 ## [0.5.1] - 2026-09-24
 
 ### Changed

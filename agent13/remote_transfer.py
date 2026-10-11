@@ -25,8 +25,7 @@ from typing import Optional
 
 from agent13.remote_exec import (
     _validate_host,
-    _validate_remote_shell,
-    detect_remote_shell,
+    resolve_remote_shell,
     run_remote_command,
 )
 from agent13.sandbox import _SUBPROCESS_ENCODING, _kill_process_tree
@@ -264,7 +263,7 @@ async def remote_put(
         remote, bytes, local_sha256, remote_sha256, verified, stderr.
     """
     host = _validate_host(host)
-    shell = _validate_remote_shell(remote_shell) or await detect_remote_shell(host)
+    shell = await resolve_remote_shell(host, remote_shell)
     remote_path = _normalize_remote_path(remote_path, shell)
     result = _transfer_result("put", host, local_path, remote_path, shell)
 
@@ -341,7 +340,7 @@ async def remote_get(
         remote, bytes, local_sha256, remote_sha256, verified, stderr.
     """
     host = _validate_host(host)
-    shell = _validate_remote_shell(remote_shell) or await detect_remote_shell(host)
+    shell = await resolve_remote_shell(host, remote_shell)
     remote_path = _normalize_remote_path(remote_path, shell)
     result = _transfer_result("get", host, local_path, remote_path, shell)
 

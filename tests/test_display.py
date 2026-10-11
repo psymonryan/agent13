@@ -4,6 +4,7 @@ from unittest.mock import MagicMock, patch
 from io import StringIO
 
 from rich.console import Console
+from rich.panel import Panel
 
 from ui.display import RichDisplay
 
@@ -17,6 +18,9 @@ class TestRichDisplay:
 
         assert display.pretty is True
         assert display.debug is False
+        # Widgets fold by default (interactive UIs); batch mode opts out.
+        assert display.reasoning_collapsed is True
+        assert display.toolview_collapsed is True
         assert display._in_reasoning is False
         assert display._in_content is False
         assert display._response_buffer == ""
@@ -110,7 +114,9 @@ class TestRichDisplay:
     def test_add_reasoning_pretty(self):
         """Should print reasoning in italic in pretty mode."""
         console = MagicMock(spec=Console)
-        display = RichDisplay(console=console, pretty=True)
+        display = RichDisplay(
+            console=console, pretty=True, reasoning_collapsed=False
+        )
 
         display.add_reasoning("thinking...")
 
@@ -122,7 +128,9 @@ class TestRichDisplay:
     def test_add_reasoning_plain(self):
         """Should print reasoning without styling in plain mode."""
         console = MagicMock(spec=Console)
-        display = RichDisplay(console=console, pretty=False)
+        display = RichDisplay(
+            console=console, pretty=False, reasoning_collapsed=False
+        )
 
         display.add_reasoning("thinking...")
 
@@ -131,7 +139,7 @@ class TestRichDisplay:
 
     def test_reasoning_to_content_transition(self):
         """Should handle transition from reasoning to content."""
-        display = RichDisplay(pretty=False)
+        display = RichDisplay(pretty=False, reasoning_collapsed=False)
 
         display.add_reasoning("thinking...")
         assert display._in_reasoning is True
@@ -164,7 +172,9 @@ class TestRichDisplay:
     def test_show_tool_result(self):
         """Should show tool result."""
         console = MagicMock(spec=Console)
-        display = RichDisplay(console=console, pretty=True)
+        display = RichDisplay(
+            console=console, pretty=True, toolview_collapsed=False
+        )
 
         display.show_tool_result("25")
 
@@ -173,7 +183,9 @@ class TestRichDisplay:
     def test_show_tool_result_truncates_long(self):
         """Should truncate long tool results in pretty mode."""
         console = MagicMock(spec=Console)
-        display = RichDisplay(console=console, pretty=True)
+        display = RichDisplay(
+            console=console, pretty=True, toolview_collapsed=False
+        )
 
         long_result = "x" * 600
         display.show_tool_result(long_result)
@@ -293,3 +305,179 @@ class TestRichDisplay:
         assert display._live_display is None
 
         display.complete_response()
+
+
+class TestCollapsedDisplay:
+    """The folded (default) view: the REPL has no widgets, so it prints less.
+
+    Reasoning prints a one-line "Thoughts: <first line>" hint when the block
+    ends - the linear stream cannot expand a folded block later, and the full
+    thought is the bulk. A tool call prints one dim line carrying its "what"
+    (the command running, the file being edited): that line is the "what is it
+    doing right now" signal.
+    """
+
+    @staticmethod
+    def _printed(console):
+        """The text arguments of every console.print call."""
+        return [c.args[0] if c.args else "" for c in console.print.call_args_list]
+
+    def test_defaults_are_folded(self):
+        display = RichDisplay()
+        assert display.reasoning_collapsed is True
+        assert display.toolview_collapsed is True
+
+    def test_flags_are_public_for_the_repl_command(self):
+        """/reasoning and /toolview set these on the live display."""
+        display = RichDisplay()
+        display.reasoning_collapsed = False
+        display.toolview_collapsed = False
+        assert display.reasoning_collapsed is False
+        assert display.toolview_collapsed is False
+
+    def test_folded_reasoning_prints_nothing(self):
+        console = MagicMock(spec=Console)
+        display = RichDisplay(console=console, pretty=True)
+
+        display.add_reasoning("thinking...")
+
+        assert console.print.call_args_list == []
+        # No "Thinking:" prefix, so the state flag stays down
+        assert display._in_reasoning is False
+
+    def test_folded_reasoning_prints_a_one_line_hint(self):
+        """start_response() shows the block's one-line 'what', not the block.
+
+        The hint is the first line of the thought (not the whole block), and no
+        empty newline is printed - that only happens for expanded reasoning.
+        """
+        console = MagicMock(spec=Console)
+        console.size.width = 120
+        display = RichDisplay(console=console, pretty=True, debug=True)
+
+        display.add_reasoning("let me look at the log first\nthen the failing test")
+        display.start_response()
+
+        printed = self._printed(console)
+        assert any("Assistant:" in str(p) for p in printed)
+        assert any("Thoughts:" in str(p) for p in printed)
+        assert "let me look at the log first" in str(printed)
+        assert "failing test" not in str(printed), "only the first line, not the whole block"
+        assert "" not in printed, "folded reasoning must not print a newline"
+
+    def test_expanded_reasoning_does_end_its_line(self):
+        """The control: expanded reasoning DOES print the trailing newline."""
+        console = MagicMock(spec=Console)
+        display = RichDisplay(
+            console=console,
+            pretty=True,
+            debug=True,
+            reasoning_collapsed=False,
+        )
+
+        display.add_reasoning("thinking...")
+        display.start_response()
+
+        assert "" in self._printed(console)
+
+    def test_folded_tool_call_is_one_dim_line(self):
+        console = MagicMock(spec=Console)
+        display = RichDisplay(console=console, pretty=True)
+
+        display.show_tool_call("write_file", {"filepath": "test.py"})
+
+        printed = self._printed(console)
+        assert len(printed) == 1
+        assert "⚙ write_file" in printed[0]
+        assert "test.py" in printed[0], "the one line carries the 'what'"
+        assert "{" not in printed[0], "the full args JSON stays folded"
+        assert "dim" in printed[0]
+
+    def test_folded_tool_result_prints_nothing(self):
+        console = MagicMock(spec=Console)
+        display = RichDisplay(console=console, pretty=True)
+
+        display.show_tool_result("x" * 5000)
+
+        assert console.print.call_args_list == []
+
+    def test_folded_tool_call_plain_mode_has_no_markup(self):
+        console = MagicMock(spec=Console)
+        display = RichDisplay(console=console, pretty=False)
+
+        display.show_tool_call("write_file", {"filepath": "test.py"})
+
+        assert self._printed(console) == ["⚙ write_file: test.py"]
+
+    def test_expanded_tool_call_prints_a_panel(self):
+        """The control: expanded keeps the old panel with args."""
+        console = MagicMock(spec=Console)
+        display = RichDisplay(
+            console=console, pretty=True, toolview_collapsed=False
+        )
+
+        display.show_tool_call("write_file", {"filepath": "test.py"})
+
+        args = console.print.call_args_list[0].args
+        assert isinstance(args[0], Panel)
+        assert "test.py" in str(args[0].renderable)
+
+    def test_expanded_tool_result_prints_the_body(self):
+        console = MagicMock(spec=Console)
+        display = RichDisplay(
+            console=console, pretty=True, toolview_collapsed=False
+        )
+
+        display.show_tool_result("25")
+
+        assert any("25" in str(p) for p in self._printed(console))
+
+    def test_folded_tool_call_line_carries_the_seq(self):
+        """The gear line numbers the call so its result can be paired with it."""
+        console = MagicMock(spec=Console)
+        console.size.width = 100
+        display = RichDisplay(console=console, pretty=True)
+
+        display.show_tool_call("command", {"command": "ls -la"}, seq=1)
+
+        assert self._printed(console) == ["[dim]⚙ command 1: ls -la[/]"]
+
+    def test_folded_tool_call_line_without_seq_is_unnumbered(self):
+        console = MagicMock(spec=Console)
+        console.size.width = 100
+        display = RichDisplay(console=console, pretty=True)
+
+        display.show_tool_call("command", {"command": "ls -la"})
+
+        assert self._printed(console) == ["[dim]⚙ command: ls -la[/]"]
+
+    def test_folded_tool_call_seq_shrinks_the_what_budget(self):
+        """'⚙ name N: ' is wider than '⚙ name: ', so the hint truncates earlier."""
+        console = MagicMock(spec=Console)
+        console.size.width = 40
+        display = RichDisplay(console=console, pretty=True)
+        long_cmd = "command" * 20
+
+        display.show_tool_call("command", {"command": long_cmd}, seq=1)
+        numbered = self._printed(console)[0]
+        console.print.call_args_list.clear()
+
+        display.show_tool_call("command", {"command": long_cmd})
+        unnumbered = self._printed(console)[0]
+
+        assert "…" in numbered and "…" in unnumbered
+        numbered_what = numbered.split(": ", 1)[1].removesuffix("[/]")
+        unnumbered_what = unnumbered.split(": ", 1)[1].removesuffix("[/]")
+        assert len(numbered_what) == len(unnumbered_what) - 2, (
+            "the number costs cells in the what budget"
+        )
+
+    def test_expanded_tool_result_line_carries_the_seq(self):
+        console = MagicMock(spec=Console)
+        display = RichDisplay(
+            console=console, pretty=True, toolview_collapsed=False
+        )
+
+        display.show_tool_result("total 8", seq=2)
+
+        assert any("→ 2: total 8" in str(p) for p in self._printed(console))

@@ -11,6 +11,7 @@ from agent13.remote_exec import (
     build_remote_argv,
     clear_remote_shell_cache,
     detect_remote_shell,
+    resolve_remote_shell,
     run_remote_command,
     _remote_shell_cache,
 )
@@ -157,6 +158,25 @@ class TestBuildRemoteArgv:
         argv2 = build_remote_argv("host2", "powershell")
         assert argv1[2] == argv2[2]
 
+    def test_powershell_template_uses_temp_file_not_stdin_pipe(self):
+        """Regression: the Windows template must run the script from a temp
+        .ps1 via `powershell -File`, NOT pipe it via `powershell -Command -`.
+
+        The stdin-pipe form is racy: a child the script spawns (e.g. csc.exe
+        from Add-Type) inherits the script's stdin pipe and can steal bytes,
+        truncating the script -> empty/partial stdout with exit 0. Reproduced
+        15/15 on c122 with an Add-Type + same-line continuation script.
+        See commandv2issues.md section 1.
+        """
+        argv = build_remote_argv("myhost", "powershell")
+        cmd = argv[2]
+        # Runs the script from a temp file on disk.
+        assert "-File" in cmd
+        assert "WriteAllBytes" in cmd  # decoded script written to a temp .ps1
+        assert ".ps1" in cmd
+        # The old, racy stdin-pipe form must be gone.
+        assert "-Command -" not in cmd
+
 
 class TestDetectRemoteShell:
     """Tests for detect_remote_shell (with mocked ssh probe)."""
@@ -187,13 +207,23 @@ class TestDetectRemoteShell:
 
     @pytest.mark.asyncio
     async def test_powershell_detection(self):
-        """uname fails => powershell."""
+        """uname fails, powershell probe succeeds => powershell."""
         async def mock_probe(host, remote_cmd, timeout):
+            if remote_cmd == "uname":
+                return {
+                    "success": False,
+                    "exit_code": 1,
+                    "stdout": "",
+                    "stderr": "'uname' is not recognized...",
+                }
+            assert remote_cmd == (
+                "powershell -NoProfile -NonInteractive -Command exit 0"
+            )
             return {
-                "success": False,
-                "exit_code": 1,
+                "success": True,
+                "exit_code": 0,
                 "stdout": "",
-                "stderr": "'uname' is not recognized...",
+                "stderr": "",
             }
 
         from unittest.mock import patch
@@ -201,6 +231,64 @@ class TestDetectRemoteShell:
             result = await detect_remote_shell("winhost")
         assert result == "powershell"
         assert _remote_shell_cache["winhost"] == "powershell"
+
+    @pytest.mark.asyncio
+    async def test_uname_failure_alone_is_not_windows(self):
+        """A failed uname probe (timeout, busy host, auth hiccup) must NOT
+        be read as a positive Windows verdict: if the powershell probe also
+        fails, detect raises instead of guessing."""
+        calls = []
+
+        async def mock_probe(host, remote_cmd, timeout):
+            calls.append(remote_cmd)
+            return {
+                "success": False,
+                "exit_code": -1,
+                "stdout": "",
+                "stderr": "ssh probe timed out after 15s",
+            }
+
+        from unittest.mock import patch
+        with patch("agent13.remote_exec._run_ssh_probe", mock_probe):
+            with pytest.raises(ValueError, match="Cannot detect the remote shell"):
+                await detect_remote_shell("myhost")
+        # Both probes were attempted (uname, then powershell).
+        assert calls == [
+            "uname",
+            "powershell -NoProfile -NonInteractive -Command exit 0",
+        ]
+        # Nothing cached: a transient failure must not poison the host.
+        assert "myhost" not in _remote_shell_cache
+
+    @pytest.mark.asyncio
+    async def test_transient_failure_self_heals(self):
+        """After a failed detection (not cached), the next call re-probes
+        and succeeds once the host is reachable again."""
+        state = {"up": False}
+
+        async def mock_probe(host, remote_cmd, timeout):
+            if state["up"] and remote_cmd == "uname":
+                return {
+                    "success": True,
+                    "exit_code": 0,
+                    "stdout": "Linux\n",
+                    "stderr": "",
+                }
+            return {
+                "success": False,
+                "exit_code": -1,
+                "stdout": "",
+                "stderr": "Connection timed out",
+            }
+
+        from unittest.mock import patch
+        with patch("agent13.remote_exec._run_ssh_probe", mock_probe):
+            with pytest.raises(ValueError):
+                await detect_remote_shell("myhost")
+            state["up"] = True
+            result = await detect_remote_shell("myhost")
+        assert result == "posix"
+        assert _remote_shell_cache["myhost"] == "posix"
 
     @pytest.mark.asyncio
     async def test_cache_prevents_reprobe(self):
@@ -224,8 +312,9 @@ class TestDetectRemoteShell:
         assert call_count == 1  # Only one probe
 
     @pytest.mark.asyncio
-    async def test_ssh_not_found(self):
-        """ssh binary missing => powershell fallback (probe fails)."""
+    async def test_ssh_not_found_raises(self):
+        """ssh binary missing => both probes fail => actionable error
+        (no silent OS guess, nothing cached)."""
         async def mock_probe(host, remote_cmd, timeout):
             return {
                 "success": False,
@@ -236,9 +325,138 @@ class TestDetectRemoteShell:
 
         from unittest.mock import patch
         with patch("agent13.remote_exec._run_ssh_probe", mock_probe):
-            result = await detect_remote_shell("myhost")
-        # Probe failed => assume powershell (conservative)
-        assert result == "powershell"
+            with pytest.raises(
+                ValueError,
+                match="Cannot detect the remote shell for myhost",
+            ):
+                await detect_remote_shell("myhost")
+        assert "myhost" not in _remote_shell_cache
+
+
+class TestResolveRemoteShell:
+    """Tests for resolve_remote_shell (override vs auto-detect)."""
+
+    def setup_method(self):
+        clear_remote_shell_cache()
+
+    def teardown_method(self):
+        clear_remote_shell_cache()
+
+    @pytest.mark.asyncio
+    async def test_explicit_override_wins_without_probing(self):
+        """An explicit override must not trigger a probe at all."""
+        called = []
+
+        async def mock_probe(host, remote_cmd, timeout):
+            called.append(remote_cmd)
+            return {
+                "success": True,
+                "exit_code": 0,
+                "stdout": "Linux\n",
+                "stderr": "",
+            }
+
+        from unittest.mock import patch
+        with patch("agent13.remote_exec._run_ssh_probe", mock_probe):
+            assert await resolve_remote_shell("myhost", "powershell") == "powershell"
+            assert await resolve_remote_shell("myhost", "posix") == "posix"
+            assert await resolve_remote_shell("myhost", "auto") is not None
+        # 'powershell'/'posix' short-circuit; only 'auto' probes.
+        assert called == ["uname"]
+
+    @pytest.mark.asyncio
+    async def test_invalid_override_raises(self):
+        with pytest.raises(ValueError, match="Invalid remote_shell"):
+            await resolve_remote_shell("myhost", "zsh")
+
+    @pytest.mark.asyncio
+    async def test_auto_detection_error_is_actionable(self):
+        """The raised message teaches the escape hatch (remote_shell=...)."""
+        async def mock_probe(host, remote_cmd, timeout):
+            return {
+                "success": False,
+                "exit_code": -1,
+                "stdout": "",
+                "stderr": "no route to host",
+            }
+
+        from unittest.mock import patch
+        with patch("agent13.remote_exec._run_ssh_probe", mock_probe):
+            with pytest.raises(
+                ValueError, match="remote_shell='posix' or remote_shell='powershell'"
+            ):
+                await resolve_remote_shell("myhost", None)
+
+
+class TestToolLevelDetectionErrors:
+    """The command tool must turn detection/override ValueErrors into
+    actionable results (no unhandled exceptions to the model)."""
+
+    def setup_method(self):
+        clear_remote_shell_cache()
+
+    def teardown_method(self):
+        clear_remote_shell_cache()
+
+    @pytest.mark.asyncio
+    async def test_command_run_detection_failure_is_arg_error(self):
+        from tools.command import command as command_tool
+
+        async def fail_probe(host, remote_cmd, timeout):
+            return {
+                "success": False,
+                "exit_code": -1,
+                "stdout": "",
+                "stderr": "no route to host",
+            }
+
+        from unittest.mock import patch
+        with patch("agent13.remote_exec._run_ssh_probe", fail_probe):
+            result = await command_tool(command="echo hi", remote="myhost")
+        assert result["success"] is False
+        assert result["status"] == "error"
+        assert "Cannot detect the remote shell" in result["stderr"]
+        assert "remote_shell=" in result["stderr"]
+
+    @pytest.mark.asyncio
+    async def test_command_detach_detection_failure_is_arg_error(self):
+        from tools.command import command as command_tool
+
+        async def fail_probe(host, remote_cmd, timeout):
+            return {
+                "success": False,
+                "exit_code": -1,
+                "stdout": "",
+                "stderr": "no route to host",
+            }
+
+        from unittest.mock import patch
+        with patch("agent13.remote_exec._run_ssh_probe", fail_probe):
+            result = await command_tool(
+                command="echo hi", remote="myhost", mode="detach"
+            )
+        assert result["success"] is False
+        assert "Cannot detect the remote shell" in result["stderr"]
+
+    @pytest.mark.asyncio
+    async def test_remote_put_detection_failure_is_arg_error(self):
+        from tools.remote_transfer import remote_put as remote_put_tool
+
+        async def fail_probe(host, remote_cmd, timeout):
+            return {
+                "success": False,
+                "exit_code": -1,
+                "stdout": "",
+                "stderr": "no route to host",
+            }
+
+        from unittest.mock import patch
+        with patch("agent13.remote_exec._run_ssh_probe", fail_probe):
+            result = await remote_put_tool(
+                local_path="/tmp/x", remote_path="/tmp/x", remote="myhost"
+            )
+        assert result["success"] is False
+        assert "Cannot detect the remote shell" in result["stderr"]
 
 
 class TestRunRemoteCommand:

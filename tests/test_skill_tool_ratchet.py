@@ -26,6 +26,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from agent13.skills.manager import SkillManager
+from agent13.durable_records import DurableRecords
 
 
 async def _wait_for(predicate, timeout: float = 5.0) -> None:
@@ -82,6 +83,7 @@ def _make_app(skill_manager, skills_mode: bool):
         )
 
     agent = MagicMock()
+    agent.durable_records = DurableRecords()
     agent.skills_mode = skills_mode
     agent.set_skills_mode = MagicMock()
     agent.add_message = AsyncMock()

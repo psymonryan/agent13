@@ -29,12 +29,17 @@ from agent13.debug_log import (
 from agent13.prompts import DEFAULT_PROMPT
 from agent13.message_history import LOCAL_MSG_KEYS
 
-# Cache for AGENTS.md content - read once at module load time
+# Cache for AGENTS.md content - read once at module load time, then only
+# refreshed explicitly via reload_agents_md() (e.g. the TUI /prompt command).
 _AGENTS_MD_CACHE: str | None = None
 
 
-def _load_agents_md_cache() -> None:
-    """Load AGENTS.md into module-level cache. Called once at import time."""
+def reload_agents_md() -> None:
+    """Read AGENTS.md from disk into the module-level cache.
+
+    Called once at import time and again on demand (e.g. the TUI /prompt
+    command) to pick up edits. If the file is missing, the cache is cleared.
+    """
     global _AGENTS_MD_CACHE
     agents_path = Path.cwd() / "AGENTS.md"
     if agents_path.exists():
@@ -42,10 +47,12 @@ def _load_agents_md_cache() -> None:
             _AGENTS_MD_CACHE = agents_path.read_text(encoding="utf-8").strip()
         except (IOError, OSError):
             _AGENTS_MD_CACHE = None
+    else:
+        _AGENTS_MD_CACHE = None
 
 
 # Load cache at module import time
-_load_agents_md_cache()
+reload_agents_md()
 
 
 class LLMError(Exception):
@@ -605,10 +612,20 @@ async def stream_response_with_tools(
     tool_calls_accum = {}  # index -> {"id": str, "name": str, "arguments": str}
     chunk_count = 0
     last_chunk = None
+    # Why the stream ended ("stop", "length", "tool_calls") - the terminal
+    # chunk carries it in choices[0].finish_reason. The usage-only chunk
+    # (stream_options include_usage) has EMPTY choices, so this must be
+    # captured in-loop, not read off last_chunk afterwards. "length" = the
+    # model hit the max-output cap mid-generation - NOT a true end; this is
+    # the signal the degeneration guard acts on (core.py). Logged for every
+    # stream (log_stream_end) so a backend that omits it is visible.
+    finish_reason = None
 
     try:
         async for chunk in stream:
             last_chunk = chunk
+            if chunk.choices and chunk.choices[0].finish_reason:
+                finish_reason = chunk.choices[0].finish_reason
             delta = chunk.choices[0].delta if chunk.choices else None
             if not delta:
                 continue
@@ -680,8 +697,14 @@ async def stream_response_with_tools(
         if _close:
             await _close()
 
-    # Log stream end
-    log_stream_end(chunk_count)
+    # Log stream end (finish_reason included when the backend sent one)
+    log_stream_end(chunk_count, finish_reason=finish_reason)
+
+    # Why the stream ended - the degeneration guard's key signal. Yielded
+    # only when known (an omitted finish_reason = no signal, the guard
+    # treats the end as normal). Forwarded by _stream_and_emit unchanged.
+    if finish_reason:
+        yield ("finish", {"finish_reason": finish_reason})
 
     # Yield token usage if available (from stream_options: include_usage)
     if last_chunk is not None and hasattr(last_chunk, "usage") and last_chunk.usage:

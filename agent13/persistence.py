@@ -305,6 +305,10 @@ def _is_incomplete_turn(messages: list) -> bool:
     - Last message is assistant with tool_calls (tools not yet executed)
     - Last message is tool (results not yet processed by LLM)
     - Last message is user (no assistant reply — e.g. quit while streaming)
+    - Last message is the [Interrupted] marker (interrupt: True) — the turn
+      was cut short (ESC, crash) and repair_interrupted() closed it with a
+      marker; the work is still pending, so --continue + /resume should
+      pick it back up.
 
     Args:
         messages: List of message dicts.
@@ -332,13 +336,21 @@ def _is_incomplete_turn(messages: list) -> bool:
     if last_msg.get("role") == "user":
         return True
 
+    # Case 4: [Interrupted] marker — see _is_incomplete_turn docstring.
+    # The marker is an assistant message WITHOUT tool_calls, so it falls
+    # through cases 1-3; without this check a session cut short by ESC
+    # saves as "complete" and its pending work becomes unreachable.
+    if last_msg.get("role") == "assistant" and last_msg.get("interrupt"):
+        return True
+
     return False
 
 
 def save_context(agent: "Agent", path: Path | str) -> None:
     """Save agent context to a file.
 
-    Saves messages, model, system_prompt, token usage, and incomplete turn flag.
+    Saves messages, model, system_prompt, session_date, focus name, token
+    usage, and incomplete turn flag.
     Strips reasoning tokens from messages before saving.
     Applies pending compaction if available (without modifying agent state).
 
@@ -360,6 +372,16 @@ def save_context(agent: "Agent", path: Path | str) -> None:
         "model": agent.model,
         "system_prompt": agent.system_prompt,
         "session_date": getattr(agent, "session_date", None),
+        # Focus name (durable-records state, agent13.durable_records). The
+        # record paths derive from the name, so only the name is saved.
+        **agent.durable_records.save(),
+        # Session-lifetime compaction total + original start time (additive
+        # fields - absent in older saves; load defaults 0/"" = keep current).
+        "chain_count": getattr(agent, "_chain_count", 0),
+        "session_started_at": getattr(agent, "_session_started_at", ""),
+        # Session-lifetime degenerate-nudge total (additive - absent in older
+        # saves; load defaults 0 = keep current).
+        "nudges_total": getattr(agent, "_degenerate_nudges_total", 0),
         "messages": messages_copy,
         "token_usage": {
             "prompt": agent.prompt_tokens,
@@ -434,6 +456,23 @@ def load_context(agent: "Agent", path: Path | str) -> tuple[bool, str, bool]:
     if "token_usage" in context:
         agent.prompt_tokens = context["token_usage"].get("prompt", 0)
         agent.completion_tokens = context["token_usage"].get("completion", 0)
+
+    # Restore the explicit focus name (additive field - absent in saves
+    # written before focus persistence). set_focus_name() re-derives both
+    # record paths from it. An explicit focus already on the agent (e.g. the
+    # --focus CLI flag, applied before the continue-load) is authoritative
+    # and wins over the saved value - the rule lives in DurableRecords.load.
+    agent.durable_records.load(context)
+
+    # Restore the session-lifetime compaction total and original start
+    # time (additive fields - absent in saves written before persistence;
+    # the agent then keeps its fresh-process values).
+    agent._chain_count = int(context.get("chain_count", 0) or 0)
+    saved_start = context.get("session_started_at", "")
+    if saved_start:
+        agent._session_started_at = saved_start
+    # Degenerate-nudge total (additive; absent = keep the fresh value).
+    agent._degenerate_nudges_total = int(context.get("nudges_total", 0) or 0)
 
     # Check for incomplete turn and set agent flag.
     # Set unconditionally (True or False) so a later /load of a complete

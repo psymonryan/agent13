@@ -35,6 +35,7 @@ from agent13 import (
 )
 from ui.display import RichDisplay
 from agent13.timing import TokenTimingTracker
+from agent13.durable_records import startup_focus
 from agent13.file_injection import expand_file_mentions
 from agent13.bell import BellManager
 from agent13.models import fetch_models, resolve_model_selection
@@ -50,12 +51,13 @@ from agent13.commands import (
     execute_retry,
     execute_prioritise,
     execute_deprioritise,
+    execute_collapse,
     list_save_names,
     format_queue_items,
     format_history_groups,
 )
 from agent13.message_history import content_to_text
-from agent13.status import get_tool_stats_summary
+from agent13.status import get_tool_stats_summary, parse_token_count
 from agent13.sandbox import (
     parse_sandbox_mode,
     get_default_sandbox_mode,
@@ -88,7 +90,8 @@ COMMANDS = {
     "/save": "Save session (e.g. /save mysession)",
     "/load": "Load session (e.g. /load mysession)",
     "/multi": "Enter multi-line mode (end with . on its own line) or just put a \\ on the end of the line",
-    "/clear": "Clear display: /clear (display only), /clear N (show last N turns), /clear all (wipe history + display)",
+    "/clear": "No display in the REPL - history untouched. Use /new_session to wipe history and start fresh",
+    "/new_session": "Wipe message history and start a new session (compaction total + start time reset)",
     "/history": "Show message history (grouped)",
     "/queue": "Show queued messages",
     "/retry": "Retry the last message",
@@ -97,12 +100,16 @@ COMMANDS = {
     "/delete": "Delete items: /delete h N (history group), /delete q N (queue item), /delete s NAME (save)",
     "/journal": "Control journal mode: /journal [on|off|last|all|status]",
     "/compact": "Compact history: /compact [next-task focus] | /compact --prompt <name>",
+    "/wrapup": "Update journal + current-truth files now, then idle: /wrapup [name]",
+    "/focus": "Set the focus name: /focus [name] (no args shows current; empty history loads its records)",
     "/model": "Switch model: /model [name|number] (no args lists available models)",
     "/provider": "Switch provider: /provider <name|url>",
     "/sandbox": "Sandbox mode: /sandbox [mode|pin|unpin] (no args shows status)",
     "/bell": "Bell on idle: /bell [N|off] (0=always, N=threshold seconds)",
     "/bell-command": "Set external bell command: /bell-command [cmd|off]",
     "/devel": "Devel mode: /devel [on|off|status|pin|unpin] (no args shows status)",
+    "/reasoning": "Fold reasoning widgets: /reasoning [hide|show|pin|unpin] (display only)",
+    "/toolview": "Fold tool call/result widgets: /toolview [hide|show|pin|unpin] (display only)",
     "/tools": "Show tool usage statistics",
     "/mcp": "Show MCP server status: /mcp [connect|disconnect|reload]",
     "/cwd": "Show or change working directory: /cwd [path]",
@@ -111,6 +118,7 @@ COMMANDS = {
     "/auto_context_threshold": "Auto-context threshold: /auto_context_threshold [N|0] (supports k suffix)",
     "/auto_context_action": "Auto-context action: /auto_context_action [compact|report_and_compact|none]",
     "/auto_context_chain": "Auto-context chain (restarts per turn): /auto_context_chain [N]",
+    "/auto_context_nudge_cap": "Degeneration guard cap: /auto_context_nudge_cap [N] (0 = guard off)",
 }
 
 
@@ -141,6 +149,10 @@ class OutputController:
     def fileno(self):
         return self._real.fileno()
 
+    @property
+    def frozen(self) -> bool:
+        return self._frozen
+
     def freeze(self) -> None:
         """Freeze output — buffer everything (entering input mode)."""
         self._frozen = True
@@ -152,6 +164,37 @@ class OutputController:
             self._real.write(text)
         self._buffer.clear()
         self._real.flush()
+
+
+def _drain_if_busy(agent) -> None:
+    """Let an in-flight turn finish before exiting on stdin EOF.
+
+    SYNC variant — for the input worker thread (read_no_prompt): the main
+    thread is parked in the event loop awaiting this worker, so a sleep
+    poll does not block the turn from completing. A stdin EOF (pipe
+    closed, or a spurious Windows-pipe EOF) must not cancel the user's
+    running turn — finish it, then exit. Deliberately NOT applied to
+    Ctrl+C: an interrupt should cancel immediately.
+    """
+    if agent.is_idle:
+        return
+    print("\n  stdin closed — waiting for the current turn to finish…", flush=True)
+    while not agent.is_idle:
+        time.sleep(0.2)
+
+
+async def _drain_if_busy_async(agent) -> None:
+    """ASYNC variant of _drain_if_busy — for the main thread (EOFError path).
+
+    Must yield to the event loop while waiting: the in-flight turn runs
+    ON that loop, so a blocking sleep here would deadlock (turn can't
+    finish -> is_idle never flips -> drain polls forever).
+    """
+    if agent.is_idle:
+        return
+    print("\n  stdin closed — waiting for the current turn to finish…", flush=True)
+    while not agent.is_idle:
+        await asyncio.sleep(0.2)
 
 
 def _sanitize(text: str, max_len: int = 120) -> str:
@@ -242,14 +285,18 @@ async def run_repl(
     output_path: Optional[str] = None,
     model_names: Optional[list[str]] = None,
     read_files: list[str] | None = None,
+    focus_name: str | None = None,
     polite_interval: float | None = None,
     bell_threshold: float | str | None = None,
     bell_enabled: bool = True,
     bell_command: str = "",
     priming_enabled: bool = False,
+    reasoning_collapsed: bool = True,
+    toolview_collapsed: bool = True,
     auto_context_threshold: int = 220000,
     auto_context_action: str = "report_and_compact",
     auto_context_chain: int = 3,
+    auto_context_nudge_cap: int = 2,
     report_and_compact_prompt: str = "",
 ):
     """Run the agent in interactive REPL mode.
@@ -341,7 +388,13 @@ async def run_repl(
     else:
         chat_console = Console(file=output_ctrl)
 
-    display = RichDisplay(console=chat_console, pretty=pretty, debug=debug)
+    display = RichDisplay(
+        console=chat_console,
+        pretty=pretty,
+        debug=debug,
+        reasoning_collapsed=reasoning_collapsed,
+        toolview_collapsed=toolview_collapsed,
+    )
 
     # Create agent
     config = get_config()
@@ -364,11 +417,25 @@ async def run_repl(
         auto_context_threshold=auto_context_threshold,
         auto_context_action=auto_context_action,
         auto_context_chain=auto_context_chain,
+        auto_context_nudge_cap=auto_context_nudge_cap,
         report_and_compact_prompt=report_and_compact_prompt,
     )
 
     # Store available models on agent
     agent.available_models = model_names or []
+
+    # Focus name from --focus: authoritative state; on a fresh session the
+    # records become the first turn - the model reads them and replies a
+    # minimal ack while the user types (the --read pattern). The agent loop
+    # starts below, so the queued item is processed immediately.
+    # One wiring for all four UIs - see agent13.durable_records.startup_focus.
+    message, _level, enqueue_msg = startup_focus(
+        agent.durable_records, focus_name, agent.messages
+    )
+    if enqueue_msg:
+        await agent.add_message(enqueue_msg, kind="prompt")
+    if message:
+        print(message, file=sys.stderr)
 
     # Load MCP server configs
     if config and config.mcp_servers:
@@ -495,7 +562,16 @@ async def run_repl(
             return
         message = event.data.get("message", "")
         level = event.data.get("level", "info")
-        color = {"warning": "yellow", "error": "red"}.get(level, "blue")
+        color = {"warning": "yellow", "error": "red"}.get(level, "bright_blue")
+        output_ctrl.write(f"[{color}]{message}[/]\n")
+
+    @agent.on_event
+    async def on_degenerate_nudge(event):
+        if event.event != AgentEvent.DEGENERATE_NUDGE or shutting_down:
+            return
+        message = event.data.get("message", "")
+        level = event.data.get("level", "info")
+        color = "yellow" if level == "warning" else "bright_blue"
         output_ctrl.write(f"[{color}]{message}[/]\n")
 
     @agent.on_event
@@ -504,15 +580,21 @@ async def run_repl(
             return
         name = event.data.get("name", "")
         arguments = event.data.get("arguments", {})
-        output_ctrl.write(f"[tool: {name}]\n")
-        display.show_tool_call(name, arguments)
+        seq = event.data.get("seq")
+        # Folded: the gear line below is the only line for the call, so drop
+        # the redundant [tool: name] progress marker. Expanded keeps it, as a
+        # sibling of [processing].
+        if not display.toolview_collapsed:
+            output_ctrl.write(f"[tool: {name}]\n")
+        display.show_tool_call(name, arguments, seq)
 
     @agent.on_event
     async def on_tool_result(event):
         if event.event != AgentEvent.TOOL_RESULT or shutting_down:
             return
         result = event.data.get("result", "")
-        display.show_tool_result(result)
+        seq = event.data.get("seq")
+        display.show_tool_result(result, seq)
 
     @agent.on_event
     async def on_error(event):
@@ -640,6 +722,7 @@ async def run_repl(
         try:
             line = sys.stdin.readline()
             if not line:  # EOF
+                _drain_if_busy(agent)
                 return "/quit"
             return line.rstrip("\n")
         except KeyboardInterrupt:
@@ -759,6 +842,7 @@ async def run_repl(
                 elif cmd == "/status":
                     from agent13.status import gather_status, format_duration
                     import time as _time
+                    from datetime import datetime as _dt
 
                     # Build last-turn info if available
                     sd = gather_status(
@@ -780,7 +864,27 @@ async def run_repl(
                     print("  Session")
                     print(f"    status:    {sd.agent_status}")
                     print(f"    run time:  {sd.run_time}")
+                    # Session age: original start (persisted in saves,
+                    # survives resume) + lifetime compaction total. Both
+                    # reset only on /new_session.
+                    if sd.session_started_at:
+                        try:
+                            _start = _dt.fromisoformat(sd.session_started_at)
+                            _age = format_duration(
+                                _time.time() - _start.timestamp()
+                            )
+                            print(
+                                f"    session:   "
+                                f"{_start.strftime('%Y-%m-%d %H:%M')} "
+                                f"({_age} ago) | chains: {sd.chain_count}"
+                            )
+                        except (ValueError, OSError):
+                            print(f"    chains:    {sd.chain_count}")
+                    else:
+                        print(f"    chains:    {sd.chain_count}")
                     print(f"    cwd:       {sd.cwd}")
+                    if sd.focus_name:
+                        print(f"    focus:     {sd.focus_name}")
                     if sd.last_turn_duration:
                         print(
                             f"    last turn: {sd.last_turn_duration} (completed {sd.last_turn_ago})"
@@ -811,6 +915,7 @@ async def run_repl(
                     print()
                     print("  Tools")
                     print(f"    success/calls: {tools_str}")
+                    print(f"    bounded: {sd.bounded_count}")
                     print()
                     print("  Settings")
                     sandbox_suffix = (
@@ -825,7 +930,13 @@ async def run_repl(
                     )
                     print(f"    sandbox:           {sd.sandbox_mode}{sandbox_suffix}")
                     print(
-                        f"    remove-reasoning:  {'on' if sd.remove_reasoning else 'off'}"
+                        f"    remove-api-reasoning: {'on' if sd.remove_reasoning else 'off'}"
+                    )
+                    print(
+                        f"    reasoning widgets: {'collapsed' if display.reasoning_collapsed else 'expanded'}"
+                    )
+                    print(
+                        f"    tool widgets:    {'collapsed' if display.toolview_collapsed else 'expanded'}"
                     )
                     print(
                         f"    devel:             {'on' if sd.devel_mode else 'off'}{devel_suffix}"
@@ -846,6 +957,7 @@ async def run_repl(
                         f"    chains:            "
                         f"{sd.auto_context_chain_used}/{sd.auto_context_chain}"
                     )
+                    print(f"    nudges:            {sd.nudges}")
                     print(f"    bell:              {bell.status_text()}")
                     print(
                         f"    bell-cmd:          {bell.command if bell.command else '(terminal bell)'}"
@@ -965,27 +1077,39 @@ async def run_repl(
                 elif cmd == "/clear":
                     arg = cmd_arg.strip().lower()
                     if arg == "all":
-                        if agent.is_idle:
-                            count = agent.clear_messages()
-                            print(f"  Cleared {count} messages")
-                        else:
-                            await agent.request_clear(mode="all")
-                            print(
-                                "  Clear queued (will take effect after current response)"
-                            )
+                        print(
+                            "  /clear all has moved: use /new_session "
+                            "(wipe history, start a new session)"
+                        )
                     elif arg.isdigit():
                         # /clear N in REPL — no display to rebuild,
                         # history untouched
                         print(
                             f"  History preserved ({len(agent.messages)} messages). "
-                            "Use /clear all to wipe."
+                            "Use /new_session to wipe."
                         )
                     else:
                         # /clear with no args in REPL — no display to wipe,
                         # history untouched
                         print(
                             f"  History preserved ({len(agent.messages)} messages). "
-                            "Use /clear all to wipe."
+                            "Use /new_session to wipe."
+                        )
+
+                elif cmd == "/new_session":
+                    # Destructive: wipe history + reset session identity
+                    # (compaction total + start time). Idle fast path is
+                    # immediate; mid-turn goes through the queue dispatch
+                    # (which resets the counters at the safe boundary).
+                    if agent.is_idle:
+                        count = agent.clear_messages()
+                        agent.reset_session_counters()
+                        print(f"  New session (cleared {count} messages)")
+                    else:
+                        await agent.request_clear(mode="all")
+                        print(
+                            "  New session queued (history + counters reset "
+                            "after current response)"
                         )
 
                 elif cmd == "/history":
@@ -1119,9 +1243,67 @@ async def run_repl(
                         await agent.add_message(
                             queued_text,
                             kind="compact",
-                            data={"compact_prompt": compact_prompt_text},
+                            data={
+                                "compact_prompt": compact_prompt_text,
+                                "user_specified_prompt": bool(arg),
+                            },
                         )
 
+                elif cmd == "/wrapup":
+                    # Track turn start so the idle handler prints
+                    # "[complete]" and re-shows the prompt. Optional arg:
+                    # focus name (rest of line), becomes the authoritative
+                    # focus name for the {focus} files.
+                    _processing_start_time = time.time()
+                    arg = cmd_arg.strip()
+                    if arg:
+                        await agent.add_message(
+                            f"/wrapup {arg}",
+                            kind="wrapup",
+                            data={"focus_name": arg},
+                        )
+                    else:
+                        await agent.add_message("/wrapup", kind="wrapup")
+
+                elif cmd == "/focus":
+                    # /focus [NAME] - set the authoritative focus name
+                    # immediately (not queued): the name must land before
+                    # a threshold-triggered wrap-up builds its prompt, so
+                    # record targeting follows a mid-turn /focus. On an
+                    # empty history the durable records are seeded in;
+                    # no arg shows the current name. Unfreeze so the
+                    # notification is visible at the input prompt (output
+                    # is frozen there); re-freeze only if we were - a
+                    # mid-turn /focus must not freeze streaming output.
+                    was_frozen = output_ctrl.frozen
+                    output_ctrl.unfreeze()
+                    message, level = await agent.apply_focus_name(
+                        cmd_arg.strip()
+                    )
+                    color = {"warning": "yellow", "error": "red"}.get(
+                        level, "bright_blue"
+                    )
+                    output_ctrl.write(f"[{color}]{message}[/]\n")
+                    if was_frozen:
+                        output_ctrl.freeze()
+
+                elif cmd == "/chain":
+                    # /chain - manual chain restart: wrap-up (if stale)
+                    # → clear history → inject records. No AI calls when
+                    # the wrap-up is already current. "no-skills" drops
+                    # manually-loaded skills from this restart and forgets
+                    # them (the REPL has no /skillname, so it is a no-op
+                    # there today; kept for parity with the TUI).
+                    _processing_start_time = time.time()
+                    no_skills = (
+                        cmd_arg.strip().lower()
+                        .lstrip("-")
+                        .replace("-", "")
+                        .replace("_", "")
+                        == "noskills"
+                    )
+                    data = {"no_skills": True} if no_skills else {}
+                    await agent.add_message("/chain", kind="chain", data=data)
                 elif cmd == "/model":
                     if not cmd_arg:
                         # List available models
@@ -1258,6 +1440,24 @@ async def run_repl(
                             print(f"  Sandbox mode set to: {mode.value}")
                         except ValueError as e:
                             print(f"  Error: {e}")
+
+                elif cmd in ("/reasoning", "/toolview"):
+                    kind = cmd[1:]
+                    current = (
+                        display.reasoning_collapsed
+                        if kind == "reasoning"
+                        else display.toolview_collapsed
+                    )
+
+                    def _set_collapse(value: bool, _kind=kind) -> None:
+                        if _kind == "reasoning":
+                            display.reasoning_collapsed = value
+                        else:
+                            display.toolview_collapsed = value
+
+                    result = execute_collapse(kind, cmd_arg, current, _set_collapse)
+                    for line in result.message.splitlines():
+                        print(f"  {line}")
 
                 elif cmd == "/devel":
                     args = cmd_arg.strip().lower()
@@ -1500,13 +1700,7 @@ async def run_repl(
                             print("  Auto-context: off (threshold 0)")
                     else:
                         try:
-                            val = args.lower()
-                            if val.endswith("k"):
-                                threshold = int(val[:-1]) * 1000
-                            else:
-                                threshold = int(val)
-                            if threshold < 0:
-                                raise ValueError("negative")
+                            threshold = parse_token_count(args)
                             agent.auto_context_threshold = threshold
                             if threshold == 0:
                                 print("  Auto-context: off")
@@ -1568,6 +1762,40 @@ async def run_repl(
                                 "    /auto_context_chain 2 - Restart the turn up to 2 times per turn"
                             )
                             print("    /auto_context_chain   - Show current value")
+
+                elif cmd == "/auto_context_nudge_cap":
+                    args = cmd_arg.strip()
+                    if not args:
+                        cap = agent.auto_context_nudge_cap
+                        if cap > 0:
+                            print(
+                                f"  Degeneration guard: on (cap {cap} consecutive "
+                                "degenerate ends; nudges: "
+                                f"{agent.degenerate_nudges})"
+                            )
+                        else:
+                            print("  Degeneration guard: off (nudge cap 0)")
+                    else:
+                        try:
+                            nudge_cap = int(args)
+                            if nudge_cap < 0:
+                                raise ValueError("must be >= 0")
+                            agent.auto_context_nudge_cap = nudge_cap
+                            if nudge_cap == 0:
+                                print("  Degeneration guard: off (nudge cap 0)")
+                            else:
+                                print(f"  Degeneration guard cap: {nudge_cap}")
+                        except ValueError:
+                            print("  Usage: /auto_context_nudge_cap [N]")
+                            print(
+                                "    /auto_context_nudge_cap 2 - Stop after 2 consecutive degenerate ends"
+                            )
+                            print(
+                                "    /auto_context_nudge_cap 0 - Disable the guard"
+                            )
+                            print(
+                                "    /auto_context_nudge_cap   - Show current value"
+                            )
 
                 else:
                     print(f"  Unknown command: {user_input}")
@@ -1646,12 +1874,25 @@ async def run_repl(
             multi_buffer = []
             print("\n  Multi-line input cancelled")
         elif is_eof:
-            # Ctrl+D on empty line: exit cleanly (same as /quit)
+            # Ctrl+D on empty line: exit cleanly (same as /quit) — but let
+            # a running turn finish first (EOF must not cancel it). Async
+            # drain: we're on the main thread; the turn runs on this loop.
+            await _drain_if_busy_async(agent)
             print("\n  EOF — exiting")
         else:
             print("\n  Interrupted")
 
     finally:
+        # Unblock any worker thread still parked in a blocking stdin read —
+        # a blocking C call that cancellation cannot reach. Without this,
+        # asyncio.run()'s executor-shutdown join hangs the process at exit
+        # (observed on Windows: REPL unable to exit while a streaming-mode
+        # stdin read is in flight).
+        try:
+            sys.stdin.close()
+        except Exception:
+            pass
+
         # Flush any buffered output before cleanup
         output_ctrl.unfreeze()
 

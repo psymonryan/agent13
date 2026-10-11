@@ -14,6 +14,7 @@ experiences across the full cycle, in a real REPL process:
 
 import json
 import os
+import time
 
 import pytest
 import pytest_httpserver
@@ -37,6 +38,37 @@ def _chunk(delta: dict, finish=None) -> str:
     return f"data: {json.dumps(payload)}\n\n"
 
 
+# Seconds the mock keeps phase 1's stream open before the tool call arrives
+# (see _slow_response). The test types /pause inside this window.
+PHASE1_HOLD = 2.5
+
+
+def _slow_response(early, late, hold: float = PHASE1_HOLD) -> Response:
+    """Stream `early`, hold the connection open for `hold` seconds, then `late`.
+
+    The tool call is executed as soon as its chunks arrive, and the post-tool
+    safe point follows within milliseconds - so a test that types /pause after
+    seeing the tool-call line is racing ~30ms of work. It used to win that
+    race on display time alone (a tool panel + result body printed slower than
+    the keystroke); a folded tool view prints one line, so the race flipped.
+    Holding the tool call back puts the pause request in the stream window,
+    where the ordering is deterministic.
+    """
+
+    def gen():
+        for part in early:
+            yield part.encode()
+        time.sleep(hold)
+        for part in late:
+            yield part.encode()
+
+    return Response(
+        gen(),
+        content_type="text/event-stream",
+        headers={"Cache-Control": "no-cache"},
+    )
+
+
 def make_scripted_chat_handler(captured, counter):
     """Chat handler implementing the scripted cycle.
 
@@ -51,31 +83,8 @@ def make_scripted_chat_handler(captured, counter):
         counter["n"] += 1
 
         if n == 0:
-            # Phase 1: assistant requests a tool call
-            sse = (
-                _chunk({"role": "assistant", "content": ""})
-                + _chunk(
-                    {
-                        "tool_calls": [
-                            {
-                                "index": 0,
-                                "id": "call_resume_1",
-                                "type": "function",
-                                "function": {
-                                    "name": "square_number",
-                                    "arguments": '{"x": 4}',
-                                },
-                            }
-                        ]
-                    }
-                )
-                + _chunk({}, finish="tool_calls")
-                + _chunk(
-                    {},
-                )
-                + "data: [DONE]\n\n"
-            )
-            # usage chunk (no choices) for token accounting
+            # Phase 1: assistant requests a tool call. The role chunk opens
+            # the stream, the tool call arrives only after the hold.
             usage = {
                 "id": "chatcmpl-test",
                 "object": "chat.completion.chunk",
@@ -86,8 +95,30 @@ def make_scripted_chat_handler(captured, counter):
                     "total_tokens": 15,
                 },
             }
-            sse += f"data: {json.dumps(usage)}\n\ndata: [DONE]\n\n"
-            return Response(sse, content_type="text/event-stream")
+            return _slow_response(
+                early=[_chunk({"role": "assistant", "content": ""})],
+                late=[
+                    _chunk(
+                        {
+                            "tool_calls": [
+                                {
+                                    "index": 0,
+                                    "id": "call_resume_1",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "square_number",
+                                        "arguments": '{"x": 4}',
+                                    },
+                                }
+                            ]
+                        }
+                    ),
+                    _chunk({}, finish="tool_calls"),
+                    # usage chunk (no choices) for token accounting
+                    f"data: {json.dumps(usage)}\n\n",
+                    "data: [DONE]\n\n",
+                ],
+            )
 
         # Phase 2: plain reply
         sse = (
@@ -180,18 +211,23 @@ class TestPauseQuitContinueResumeCycle:
         proc, _banner1 = spawn_repl(env)
         try:
             proc.sendline("square 4 for me")
-            # Phase 1 response streams: tool call is issued and executed
-            proc.expect(r"square_number", timeout=20)
-            # Tool result arrives, then the model would continue — but we
-            # pause before its next LLM stream (safe point is hit after the
-            # tool result, before the next stream; either the model reply
-            # already happened or pause holds it — both must save validly).
+            # Wait for the turn to start, then type /pause INSIDE the stream
+            # window: the mock withholds the tool call for PHASE1_HOLD, so the
+            # pause request is in effect before the agent reaches its first
+            # safe point (the tool call is executed as soon as it arrives, and
+            # the safe point follows within milliseconds - typing /pause after
+            # the tool-call line is a ~30ms race that the display used to win
+            # by printing more). Before the turn starts the agent is idle and
+            # /pause is refused, so [processing] is the gate.
+            proc.expect(r"\[processing\]", timeout=20)
             proc.sendline("/pause")
-            proc.expect(r"(?i)paus", timeout=10)
-            # Give the loop a beat to reach the safe point / reply, then quit.
-            import time
-
-            time.sleep(0.5)
+            proc.expect(r"(?i)pausing at next safe point", timeout=10)
+            # The mock releases the tool call at PHASE1_HOLD; it executes and
+            # the loop stops at the safe point before the next LLM call. The
+            # tool line can't be waited on: the REPL's output controller
+            # buffers agent output while the prompt owns the screen, and the
+            # /pause reply has just handed the screen back to the prompt.
+            time.sleep(PHASE1_HOLD + 1.0)
             proc.sendline("/quit")
             proc.expect(r"Session saved|Goodbye", timeout=20)
         finally:
@@ -213,7 +249,7 @@ class TestPauseQuitContinueResumeCycle:
 
         # The turn is incomplete: either pending tool_calls or a trailing
         # tool result the model hasn't processed yet.
-        assert data["incomplete_turn"] is True
+        assert data["incomplete_turn"] is True, json.dumps(data, indent=1)[:3000]
         last = msgs[-1]
         assert last["role"] in ("assistant", "tool"), f"unexpected tail: {last}"
 

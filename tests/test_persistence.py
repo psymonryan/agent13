@@ -7,8 +7,10 @@ from pathlib import Path
 import pytest
 
 from agent13.config import Config
+from agent13.durable_records import DurableRecords
 from agent13.persistence import (
     _ensure_ctx_stem,
+    _is_incomplete_turn,
     _sanitize_save_stem,
     count_saves,
     find_latest_auto_save,
@@ -56,10 +58,18 @@ def _make_agent_stub(messages=None, model="test-model", system_prompt=""):
             self.prompt_tokens = 0
             self.completion_tokens = 0
             self._incomplete = False
+            # The REAL record object, not a hand-mirror of its behaviour:
+            # save/load_context read and write focus state through it, so a
+            # mirror here would drift from the code under test in silence.
+            self.durable_records = DurableRecords()
+            self._chain_count = 0
+            self._session_started_at = ""
 
         def mark_incomplete_turn(self, val):
             self._incomplete = val
 
+        def set_focus_name(self, name):
+            self.durable_records.set_focus_name(name)
     return _Stub()
 
 
@@ -656,10 +666,237 @@ class TestSaveLoadContext:
         assert agent2.prompt_tokens == 1234
         assert agent2.completion_tokens == 5678
 
+    def test_focus_name_round_trip(self, tmp_path):
+        """Save then load restores the explicit focus name + derived paths."""
+        path = tmp_path / "focus.ctx"
+        agent = _make_agent_stub(
+            messages=[{"role": "user", "content": "hello"}],
+        )
+        agent.set_focus_name("auto_context")
+        save_context(agent, path)
+
+        agent2 = _make_agent_stub()
+        ok, _, _ = load_context(agent2, path)
+        assert ok is True
+        assert agent2.durable_records.focus_name == "auto_context"
+        assert (
+            agent2.durable_records.truth_path
+            == "docs_archive/auto_context_current_truth.md"
+        )
+        assert agent2.durable_records.journal_path == "docs_archive/auto_context_journal.md"
+
+    def test_focus_name_missing_in_old_save(self, tmp_path):
+        """Old save files without focus_name don't break load."""
+        path = tmp_path / "old_focus.ctx"
+        path.write_text(json.dumps({
+            "version": 1,
+            "model": "test",
+            "messages": [{"role": "user", "content": "hi"}],
+        }))
+        agent = _make_agent_stub()
+        ok, _, _ = load_context(agent, path)
+        assert ok is True
+        assert agent.durable_records.focus_name == ""
+
+    def test_chain_count_round_trip(self, tmp_path):
+        """Save then load restores the lifetime compaction total + start."""
+        path = tmp_path / "chains.ctx"
+        agent = _make_agent_stub(
+            messages=[{"role": "user", "content": "hello"}],
+        )
+        agent._chain_count = 20
+        agent._session_started_at = "2026-09-21T14:32:00"
+        save_context(agent, path)
+
+        agent2 = _make_agent_stub()
+        ok, _, _ = load_context(agent2, path)
+        assert ok is True
+        assert agent2._chain_count == 20
+        assert agent2._session_started_at == "2026-09-21T14:32:00"
+
+    def test_chain_count_missing_in_old_save(self, tmp_path):
+        """Old saves without the new fields load cleanly with defaults."""
+        path = tmp_path / "old_chains.ctx"
+        path.write_text(json.dumps({
+            "version": 1,
+            "model": "test",
+            "messages": [{"role": "user", "content": "hi"}],
+        }))
+        agent = _make_agent_stub()
+        agent._session_started_at = "2026-10-07T09:00:00"  # fresh-process value
+        ok, _, _ = load_context(agent, path)
+        assert ok is True
+        assert agent._chain_count == 0
+        # No saved start -> the agent keeps its own (fresh) value
+        assert agent._session_started_at == "2026-10-07T09:00:00"
+
+    def test_saved_focus_loses_to_explicit_focus(self, tmp_path):
+        """A focus already on the agent (e.g. --focus CLI flag) wins over the
+        saved value - explicit user input is authoritative."""
+        path = tmp_path / "saved_focus.ctx"
+        agent = _make_agent_stub(
+            messages=[{"role": "user", "content": "hello"}],
+        )
+        agent.set_focus_name("saved_focus")
+        save_context(agent, path)
+
+        agent2 = _make_agent_stub()
+        agent2.set_focus_name("cli_focus")
+        ok, _, _ = load_context(agent2, path)
+        assert ok is True
+        assert agent2.durable_records.focus_name == "cli_focus"
+        assert agent2.durable_records.truth_path == "docs_archive/cli_focus_current_truth.md"
+
+    def test_no_saved_focus_keeps_agent_focus(self, tmp_path):
+        """Loading a save without a focus name leaves an existing agent focus
+        untouched."""
+        path = tmp_path / "nofocus.ctx"
+        path.write_text(json.dumps({
+            "version": 1,
+            "model": "test",
+            "messages": [{"role": "user", "content": "hi"}],
+        }))
+        agent = _make_agent_stub()
+        agent.set_focus_name("kept")
+        ok, _, _ = load_context(agent, path)
+        assert ok is True
+        assert agent.durable_records.focus_name == "kept"
+
 
 # ---------------------------------------------------------------------------
 # Config: saves_location
 # ---------------------------------------------------------------------------
+
+
+class TestIsIncompleteTurn:
+    """_is_incomplete_turn — all four incomplete shapes plus the negative.
+
+    Case 4 (the [Interrupted] marker) is the 09-28 fix: an ESC-cut turn
+    saves with a trailing marker assistant message; without the case the
+    session looks complete and its pending work is unreachable after
+    --continue (the marker is exactly what repair_interrupted() enforces
+    as the last message).
+    """
+
+    def test_empty_is_complete(self):
+        assert _is_incomplete_turn([]) is False
+
+    def test_case1_assistant_with_tool_calls(self):
+        msgs = [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "", "tool_calls": [{"id": "c1"}]},
+        ]
+        assert _is_incomplete_turn(msgs) is True
+
+    def test_case2_trailing_tool(self):
+        msgs = [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "", "tool_calls": [{"id": "c1"}]},
+            {"role": "tool", "tool_call_id": "c1", "content": "ok"},
+        ]
+        assert _is_incomplete_turn(msgs) is True
+
+    def test_case3_trailing_user(self):
+        msgs = [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "hello"},
+            {"role": "user", "content": "and more"},
+        ]
+        assert _is_incomplete_turn(msgs) is True
+
+    def test_case4_interrupt_marker(self):
+        """Trailing [Interrupted] marker (assistant, interrupt: True)."""
+        msgs = [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "working..."},
+            {"role": "assistant", "content": "[Interrupted]", "interrupt": True},
+        ]
+        assert _is_incomplete_turn(msgs) is True
+
+    def test_plain_assistant_tail_is_complete(self):
+        """A completed session always ends on a plain assistant message."""
+        msgs = [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "hello!"},
+        ]
+        assert _is_incomplete_turn(msgs) is False
+
+    def test_save_context_stores_marker_case(self, tmp_path):
+        """save_context computes incomplete_turn=True for a marker tail."""
+        agent = _make_agent_stub(
+            messages=[
+                {"role": "user", "content": "hi"},
+                {
+                    "role": "assistant",
+                    "content": "[Interrupted]",
+                    "interrupt": True,
+                },
+            ]
+        )
+        path = tmp_path / "marker.ctx"
+        save_context(agent, path)
+        data = json.loads(path.read_text())
+        assert data["incomplete_turn"] is True
+
+
+class TestMessageHistoryHasIncompleteTurn:
+    """MessageHistory.has_incomplete_turn — mirrors persistence case 4.
+
+    Both detectors must agree: the save flag (persistence) and the in-process
+    check (MessageHistory, drives /resume and continue_incomplete_turn's
+    case-2 dispatch) are documented mirrors.
+    """
+
+    def test_case4_interrupt_marker(self):
+        from agent13.message_history import MessageHistory
+
+        h = MessageHistory(
+            [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": "working..."},
+                {"role": "assistant", "content": "[Interrupted]", "interrupt": True},
+            ]
+        )
+        assert h.has_incomplete_turn() is True
+
+    def test_plain_assistant_tail_is_complete(self):
+        from agent13.message_history import MessageHistory
+
+        h = MessageHistory(
+            [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": "hello!"},
+            ]
+        )
+        assert h.has_incomplete_turn() is False
+
+    def test_agrees_with_persistence_detector(self):
+        """The two mirrors agree on every shape (incl. the marker)."""
+        from agent13.message_history import MessageHistory
+
+        shapes = [
+            [],
+            [{"role": "user", "content": "hi"}],
+            [{"role": "assistant", "content": "done"}],
+            [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": "", "tool_calls": [{"id": "c1"}]},
+            ],
+            [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": "", "tool_calls": [{"id": "c1"}]},
+                {"role": "tool", "tool_call_id": "c1", "content": "ok"},
+            ],
+            [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": "working..."},
+                {"role": "assistant", "content": "[Interrupted]", "interrupt": True},
+            ],
+        ]
+        for msgs in shapes:
+            assert MessageHistory(msgs).has_incomplete_turn() == _is_incomplete_turn(
+                msgs
+            ), f"detectors disagree on: {msgs!r}"
 
 
 class TestSavesLocationConfig:

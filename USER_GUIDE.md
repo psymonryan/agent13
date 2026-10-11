@@ -101,7 +101,7 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 Install the latest release:
 
 ```bash
-uv tool install https://github.com/psymonryan/agent13/releases/download/v0.5.1/agent13-0.5.1-py3-none-any.whl
+uv tool install https://github.com/psymonryan/agent13/releases/download/v0.6.0/agent13-0.6.0-py3-none-any.whl
 ```
 
 ### Uninstall Agent13
@@ -257,11 +257,11 @@ agent13 <provider> --model <name> --io-format json
 
 **Output** (stdout): NDJSON events, one per line:
 
-| Event | When | Key fields |
-|-------|------|------------|
-| `system` | Once at startup | `session_id`, `data.model`, `data.provider` |
+| Event       | When                                    | Key fields                                                           |
+| ----------- | --------------------------------------- | -------------------------------------------------------------------- |
+| `system`    | Once at startup                         | `session_id`, `data.model`, `data.provider`                          |
 | `assistant` | Per step (text, tool call, tool result) | `message.content[]` with `text`, `tool_use`, or `tool_result` blocks |
-| `result` | Once per turn (success or failure) | `is_error`, `result`, `usage`, `num_turns`, `duration_ms` |
+| `result`    | Once per turn (success or failure)      | `is_error`, `result`, `usage`, `num_turns`, `duration_ms`            |
 
 All events share `session_id` (stable UUID) and `type`. Diagnostics go to stderr.
 
@@ -282,36 +282,40 @@ Full protocol spec: `agent13-pipe-mode-spec.md`. Orchestrator usage guide: `docs
 
 ## Command-Line Options
 
-| Option                      | Description                                                                                              | Default               |
-| --------------------------- | -------------------------------------------------------------------------------------------------------- | --------------------- |
-| `provider`                  | Provider name from config or OpenAI-compatible URL                                                       | -                     |
-| `--list-providers`          | List available providers and exit                                                                        | -                     |
-| `--version`                 | Show version and exit                                                                                    | -                     |
-| `-p`, `--prompt`            | Run in batch mode with this prompt                                                                       | -                     |
-| `--model`                   | Select model by name or number; with no value, lists models                                              | prompts interactively |
-| `--system-prompt`           | System prompt to use                                                                                     | default               |
-| `--sandbox`                 | Sandbox mode (permissive-open, permissive-closed, etc.)                                                  | permissive-open       |
-| `--pretty on\|off`          | Enable/disable markdown rendering                                                                        | on                    |
-| `--debug`                   | Enable debug logging                                                                                     | off                   |
-| `--tool-response raw\|json` | Tool response format                                                                                     | raw                   |
-| `--mcp`                     | Connect to MCP servers on startup (TUI and batch modes)                                                  | off                   |
-| `--skills`                  | Show discovered skills in the system prompt and enable the `skill` tool                                  | off                   |
-| `--journal`                 | Enable journal mode (context compaction)                                                                 | off                   |
-| `--auto-context-threshold N` | Auto-context token threshold for this run (0 = disabled)                                                 | 220000                |
-| `--report-and-compact`      | Auto-context action = `report_and_compact` for this run                                                  | from config           |
-| `--auto-context-chain N`    | Auto-context chain (restarts per turn) for this run                                                      | 3                     |
-| `--remove-reasoning`        | Strip reasoning tokens between turns                                                                     | off                   |
-| `-c`, `--continue`          | Continue from last auto-saved session                                                                    | -                     |
-| `--devel`                   | Enable devel mode (show devel-group tools); also pinnable per project via `/devel pin`                    | off                   |
-| `--spinner fast\|slow\|off` | Spinner style                                                                                            | fast                  |
-| `--upgrade`                 | Check for updates and apply, then exit                                                                   | -                     |
-| `--clipboard osc52\|system` | Clipboard method for this session                                                                        | osc52                 |
-| `--bell`                    | Bell threshold: N seconds (0=always), or 'off'                                                           | off                   |
-| `--polite`                  | Polite mode: N seconds poll interval or 'off'                                                            | 10                    |
-| `--read FILE`               | Read file(s) into the user message before processing                                                     | -                     |
-| `--repl`                    | Run in REPL mode (readline-based, no TUI)                                                                | off                   |
-| `--output FILE`             | Write REPL chat transcript to file (implies `--repl`) (the REPL still gets output for command responses) | -                     |
-| `--io-format text\|json`    | I/O format: `text` (default) or `json` (NDJSON pipe mode)                                                 | text                  |
+| Option                                                    | Description                                                                                                                                                                                                    | Default               |
+| --------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------- |
+| `provider`                                                | Provider name from config or OpenAI-compatible URL                                                                                                                                                             | -                     |
+| `--list-providers`                                        | List available providers and exit                                                                                                                                                                              | -                     |
+| `--version`                                               | Show version and exit                                                                                                                                                                                          | -                     |
+| `-p`, `--prompt`                                          | Run in batch mode with this prompt                                                                                                                                                                             | -                     |
+| `--model`                                                 | Select model by name or number; with no value, lists models                                                                                                                                                    | prompts interactively |
+| `--system-prompt`                                         | System prompt to use                                                                                                                                                                                           | default               |
+| `--sandbox`                                               | Sandbox mode (permissive-open, permissive-closed, etc.)                                                                                                                                                        | permissive-open       |
+| `--pretty on\|off`                                        | Enable/disable markdown rendering                                                                                                                                                                              | on                    |
+| `--debug`                                                 | Enable debug logging                                                                                                                                                                                           | off                   |
+| `--tool-response raw\|json`                               | Tool response format                                                                                                                                                                                           | raw                   |
+| `--mcp`                                                   | Connect to MCP servers on startup (TUI and batch modes)                                                                                                                                                        | off                   |
+| `--skills`                                                | Show discovered skills in the system prompt and enable the `skill` tool                                                                                                                                        | off                   |
+| `--journal`                                               | Enable journal mode (context compaction)                                                                                                                                                                       | off                   |
+| `--auto-context-threshold N`                              | Auto-context token threshold for this run (k suffix ok, e.g. `150k`; 0 = disabled)                                                                                                                             | 220000                |
+| `--auto-context-action compact\|report_and_compact\|none` | Auto-context action for this run (`none` = disabled)                                                                                                                                                           | from config           |
+| `--auto-context-chain N`                                  | Auto-context chain (restarts per turn) for this run                                                                                                                                                            | 3                     |
+| `--auto-context-nudge-cap N`                              | Degeneration guard: consecutive cut-off/empty outputs before the turn is stopped for this run (0 = off)                                                                                                        | from config           |
+| `--remove-api-reasoning`                                  | Strip reasoning tokens between turns (API context, not display)                                                                                                                                                | off                   |
+| `--reasoning collapsed\|expanded`                         | Initial fold state of reasoning widgets for this run (display only)                                                                                                                                            | from config/pin       |
+| `--toolview collapsed\|expanded`                          | Initial fold state of tool call/result widgets for this run (display only)                                                                                                                                     | from config/pin       |
+| `-c`, `--continue`                                        | Continue from last auto-saved session                                                                                                                                                                          | -                     |
+| `--devel`                                                 | Enable devel mode (show devel-group tools); also pinnable per project via `/devel pin`                                                                                                                         | off                   |
+| `--spinner fast\|slow\|off`                               | Spinner style                                                                                                                                                                                                  | fast                  |
+| `--upgrade`                                               | Check for updates and apply, then exit                                                                                                                                                                         | -                     |
+| `--clipboard osc52\|system`                               | Clipboard method for this session                                                                                                                                                                              | osc52                 |
+| `--bell`                                                  | Bell threshold: N seconds (0=always), or 'off'                                                                                                                                                                 | off                   |
+| `--polite`                                                | Polite mode: N seconds poll interval or 'off'                                                                                                                                                                  | 10                    |
+| `--read FILE`                                             | Read file(s) into the user message before processing                                                                                                                                                           | -                     |
+| `--focus NAME`                                            | Set the focus name at startup and, on an empty session, reads the durable records (docs_archive/NAME_current_truth.md + last journal entry) as the first turn - the model reads them and replies a minimal ack | -                     |
+| `--repl`                                                  | Run in REPL mode (readline-based, no TUI)                                                                                                                                                                      | off                   |
+| `--output FILE`                                           | Write REPL chat transcript to file (implies `--repl`) (the REPL still gets output for command responses)                                                                                                       | -                     |
+| `--io-format text\|json`                                  | I/O format: `text` (default) or `json` (NDJSON pipe mode)                                                                                                                                                      | text                  |
 
 ## TUI Reference
 
@@ -330,22 +334,38 @@ Full protocol spec: `agent13-pipe-mode-spec.md`. Orchestrator usage guide: `docs
 | `Tab`                     | Autocomplete (slash commands, model names, file paths)                                |
 | Mouse drag select         | Auto copies selection to paste buffer                                                 |
 
+### Status bar
+
+The bar at the bottom of the TUI shows live session state. The left side carries the current status text, `provider/model`, the focus name (when set), and the queue count; the right side carries these fields (hidden while they have nothing to show):
+
+| Field        | Meaning                                                                                                                                      |
+| ------------ | -------------------------------------------------------------------------------------------------------------------------------------------- |
+| `dur: M:SS`  | Elapsed session time (last turn's duration when idle)                                                                                        |
+| `Ctx: N`     | Context size in tokens (`~` prefix = estimate; an exact grounded value shows without it)                                                     |
+| `trn: A:B:C` | Auto-context chain budget : restarts used this turn : user turns in history. Hidden in a brand-new session; the budget persists across saves |
+| `mcp: on`    | MCP servers connected                                                                                                                        |
+| `jnl: on`    | Journal mode enabled                                                                                                                         |
+| `pol: N`     | Polite-mode interval in seconds                                                                                                              |
+| `Tools: S/T` | Tool successes / calls (devel mode only, after the first call)                                                                               |
+| `tps: N.N`   | Recent output tokens per second                                                                                                              |
+
 ### Slash Commands
 
 Commands are typed in the input field with a `/` prefix:
 
 #### Session Control
 
-| Command             | Description                                            |
-| ------------------- | ------------------------------------------------------ |
-| `/help`             | Show commands and keyboard shortcuts                   |
-| `/status`           | Show session status, settings, and save info           |
-| `/quit` `/exit`     | Exit the application                                   |
-| `/clear`            | Clear conversation context                             |
-| `/clear all`        | Clear conversation and reset UI widgets                |
-| `/save [name] [-y]` | Save conversation context to file (optional overwrite) |
-| `/load [name]`      | Load conversation context from file                    |
-| `/cwd [path]`       | Show or change the working directory                   |
+| Command             | Description                                                 |
+| ------------------- | ----------------------------------------------------------- |
+| `/help`             | Show commands and keyboard shortcuts                        |
+| `/status`           | Show session status, settings, and save info                |
+| `/quit` `/exit`     | Exit the application                                        |
+| `/clear`            | Clear the chat display (message history untouched)          |
+| `/rebuild [N]`      | Rebuild chat display from history (optionally last N turns) |
+| `/new_session`      | Wipe message history + display, start a new session         |
+| `/save [name] [-y]` | Save conversation context to file (optional overwrite)      |
+| `/load [name]`      | Load conversation context from file                         |
+| `/cwd [path]`       | Show or change the working directory                        |
 
 #### Model and Provider
 
@@ -371,22 +391,24 @@ Note: both /model and /provider can use numbered or named models and providers. 
 
 #### Display
 
-| Command                     | Description                                                    |
-| --------------------------- | -------------------------------------------------------------- |
-| `/pretty on\|off`           | Toggle markdown rendering                                      |
-| `/tool-response raw\|json`  | Toggle tool output format api request                          |
-| `/spinner fast\|slow\|off`  | Change spinner style for slow connections (eg from your phone) |
-| `/remove-reasoning on\|off` | Strip reasoning between turns                                  |
-| `/bell [N\|off]`            | Show bell threshold, or set to N seconds / off                 |
-| `/polite [N\|off]`          | Show polite mode status, or set interval / disable             |
+| Command                               | Description                                                    |
+| ------------------------------------- | -------------------------------------------------------------- |
+| `/pretty on\|off`                     | Toggle markdown rendering                                      |
+| `/tool-response raw\|json`            | Toggle tool output format api request                          |
+| `/spinner fast\|slow\|off`            | Change spinner style for slow connections (eg from your phone) |
+| `/remove-api-reasoning on\|off`       | Strip reasoning between turns (API context, not display)       |
+| `/reasoning [hide\|show\|pin\|unpin]` | Fold reasoning widgets; no args shows status                   |
+| `/toolview [hide\|show\|pin\|unpin]`  | Fold tool call/result widgets; no args shows status            |
+| `/bell [N\|off]`                      | Show bell threshold, or set to N seconds / off                 |
+| `/polite [N\|off]`                    | Show polite mode status, or set interval / disable             |
 
 #### Tools and Skills
 
-| Command                  | Description                                  |
-| ------------------------ | -------------------------------------------- |
-| `/tools`                 | List active tools                            |
-| `/skills [on|off|status]` | List skills, toggle the skills list, or show status |
-| `/sandbox [mode]`        | Change sandbox mode (tab-complete for modes) |
+| Command                                | Description                                   |
+| -------------------------------------- | --------------------------------------------- |
+| `/tools`                               | List active tools                             |
+| `/skills [on                           | off                                           |
+| `/sandbox [mode]`                      | Change sandbox mode (tab-complete for modes)  |
 | `/devel [on\|off\|status\|pin\|unpin]` | Toggle devel tool visibility, pin per project |
 
 #### MCP
@@ -408,11 +430,15 @@ Note: both /model and /provider can use numbered or named models and providers. 
 
 #### Auto-Context
 
-| Command                                                        | Description                                                                                   |
-| -------------------------------------------------------------- | --------------------------------------------------------------------------------------------- |
-| `/auto_context_threshold [N\|0]`                               | Act when context exceeds N tokens (supports k suffix, e.g. `150k`; 0 disables); no arg = status |
-| `/auto_context_action [compact\|report_and_compact\|none]`     | What to do at the threshold; no arg shows current value                                       |
-| `/auto_context_chain [N]`                                      | Restart the turn up to N times per turn after a compact (0 = none); no arg shows current value |
+| Command                                                    | Description                                                                                                                                                                                                                                                               |
+| ---------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `/auto_context_threshold [N\|0]`                           | Act when context exceeds N tokens (supports k suffix, e.g. `150k`; 0 disables); no arg = status                                                                                                                                                                           |
+| `/auto_context_action [compact\|report_and_compact\|none]` | What to do at the threshold; no arg shows current value                                                                                                                                                                                                                   |
+| `/auto_context_chain [N]`                                  | Restart the turn up to N times per turn after a compact (0 = none); no arg shows current value                                                                                                                                                                            |
+| `/auto_context_nudge_cap [N]`                              | Degeneration guard cap: consecutive degenerate outputs before the guard stops the turn (0 = off); no arg shows current value                                                                                                                                              |
+| `/wrapup [name]`                                           | Update the journal + current-truth files now, then idle (no compact); optional name sets the focus name                                                                                                                                                                   |
+| `/chain [no-skills]`                                       | Manually restart the loop: wrap-up if stale, then clear history and re-inject the focus records (no compact; no AI call when the wrap-up is current). `no-skills` also drops manually-loaded skills from the restart and forgets them                                     |
+| `/focus [name]`                                            | Set the focus name (no args shows current); on an empty history it loads the focus's records (truth file + last journal entry) into the session. Applied immediately, even mid-turn - a name set while a turn is running takes effect for the next wrap-up's record files |
 
 #### Other
 
@@ -535,6 +561,21 @@ disabled_tools = ["square_number", "re:^tui_.*$"]
 
 Tool filtering applies to both built-in and MCP tools.
 
+### Tool Output Bounding
+
+Cap the size of a single tool result's text so one huge output can't blow up the context:
+
+```toml
+[tools]
+max_result_chars = 30000   # 0 = disable bounding
+```
+
+When a tool result's text exceeds the cap, the FULL text is written to a file in the platform temp dir (`agent13_tool_output/...`) and the model receives the first 15,000 chars + a marker + the last 15,000 chars. The marker names the spill file so the model can read the middle back - `read_file` for multi-line output, or `command` + `grep` for a single-line JSON payload. Multi-line output is cut on line boundaries; a single-line payload (a JSON envelope's escaped `stdout`) is cut in place so the JSON structure stays intact.
+
+A tool can override the global cap by declaring `max_result_chars` on its function (`@tool(max_result_chars=...)`); the per-tool value wins when present.
+
+The number of results bounded this session appears in `/status` under Tools (`bounded: N`).
+
 ### Clipboard Configuration
 
 Control how text is copied to the clipboard:
@@ -564,6 +605,37 @@ method = "osc52"    # "osc52" (terminal escape sequence, default) or "system" (O
 ```bash
 agent13 --clipboard system studio
 ```
+
+### Chat Display Configuration
+
+What you see in the chat - the other axis from what the API receives
+(see [Reasoning Token Control](#reasoning-token-control)).
+
+```toml
+[ui]
+reasoning_collapsed = true   # reasoning widgets start folded
+toolview_collapsed = true    # tool call/result widgets start folded
+```
+
+Precedence, highest first: `--reasoning` / `--toolview` flag > per-project pin >
+`[ui]` config > built-in default (`true` = start folded).
+
+- **TUI** - a folded widget is a one-line header with a `▶` indicator; click the header to expand. The header carries a one-line "what": a tool call shows its command or file (`⚙ command 1: git log ...` / `⚙ edit_file 1: src/foo.py`) - or, when it has neither, a short number/boolean argument (`⚙ square_number 1: 5`) - and a finished reasoning block shows the first line of the thought (`Thoughts: let me check the log ...`). Every tool call in a user turn is numbered from 1 - the number continues across the agent's iterations within the turn and restarts at each new user message - and its result header carries the same number (`✓ Result 1 (command):`), so a result is pairable with its call even when a batch's results render after all its calls.
+- **REPL** - a linear stream has nothing to click, so a folded reasoning block prints one dim `Thoughts: <first line>` hint when it ends, and a folded tool call prints one dim `⚙ name N: <what>` line (N = the call's number within the user turn; the command running, the file being edited, else a short number/boolean argument) - no args body and no result body.
+- **Batch (`-p`) and pipe (`--io-format json`) modes ignore these settings** - batch output is the product, pipe mode emits machine JSON.
+- Changing a setting never re-renders widgets already in the chat. `/rebuild`, `/load` and `/new_session` mount widgets afresh, so they follow the current setting.
+
+Pins live in `~/.agent13/pins.toml` (one section per setting, keyed by resolved
+absolute project path) - the same store `/sandbox pin` and `/devel pin` use.
+
+| Command                    | Effect                                                   |
+| -------------------------- | -------------------------------------------------------- |
+| `/reasoning hide` / `show` | fold / expand new widgets for this session               |
+| `/reasoning pin` / `unpin` | keep the current setting for this project / drop the pin |
+| `/reasoning`               | status: effective value, pin, config default             |
+| `/toolview ...`            | the same verbs for tool call/result widgets              |
+
+`/status` shows both effective values under Settings.
 
 ### Bell Configuration
 
@@ -608,7 +680,7 @@ OPENAI_API_KEY=sk-project-key
 | `read_file`     | Read file contents - skim (symbols), raw (lines), or offset/limit                                               |
 | `write_file`    | Write content to files (fails if exists unless `overwrite=True`)                                                |
 | `edit_file`     | Line-based editing (replace, append, prepend, delete, rollback) and AST-based edits                             |
-| `skill`         | Load a specialized skill by name (available with `--skills`, or after you invoke a skill)                        |
+| `skill`         | Load a specialized skill by name (available with `--skills`, or after you invoke a skill)                       |
 | `square_number` | Demo/example tool (used for testing)                                                                            |
 | `tui_viewer`    | TUI testing tools: launch, screenshot, type, press, wait, quit (devel group - wont load unless you use --devel) |
 | `self_update`   | Check for updates, apply upgrade, or copy install command to clipboard                                          |
@@ -685,8 +757,7 @@ Agent13 ships with these skills (copied to `~/.agent13/skills/` on first run):
 | --------------- | ------------------------------------------- |
 | `manage-skills` | Create and manage skills                    |
 | `get-new-skill` | Find and adapt skills from external sources |
-| `humanizer`     | Remove AI writing patterns from text        |
-| `context7`      | Context lookup for libraries and APIs       |
+| `humaniser2`    | Make AI-generated text read as human        |
 
 ### Managing Skills
 
@@ -816,26 +887,30 @@ Auto-context acts automatically when the context nears the model's limit - you d
 threshold = 220000              # tokens to act at (0 = disabled)
 action = "report_and_compact"   # what happens at the threshold
 chain = 3                       # turn restarts after a compact (0 = none)
+nudge_cap = 2                   # consecutive degenerate outputs before the guard stops the turn (0 = off)
 ```
 
 **Actions:**
 
-| Action               | At the threshold                                                        | Afterwards                                          |
-| -------------------- | ----------------------------------------------------------------------- | --------------------------------------------------- |
-| `compact`            | Full compact                                                            | Idle                                                |
-| `report_and_compact` | The agent pauses once to update the project documentation and write a progress report, then compacts | Idle, or the turn continues (with `chain > 0`)      |
-| `none`               | Nothing - context untouched                                             | **Paused**: `/model` to a larger-context model, `/compact`, or `/journal all`, then `/resume` |
+| Action               | At the threshold                                                                                     | Afterwards                                                                                    |
+| -------------------- | ---------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------- |
+| `compact`            | Full compact                                                                                         | Idle                                                                                          |
+| `report_and_compact` | The agent pauses once to update the project documentation and write a progress report, then compacts | Idle, or the turn continues (with `chain > 0`)                                                |
+| `none`               | Nothing - context untouched                                                                          | **Paused**: `/model` to a larger-context model, `/compact`, or `/journal all`, then `/resume` |
 
 **Chain semantics:** `chain` counts restarts *after* a compact, per user turn (it resets every turn). `chain = N` allows at most N restarts, so the action can fire up to N+1 times in one turn (e.g. `chain = 3`: report → compact → continue, up to four cycles). A failed compact never restarts - the agent idles with an error notice. `chain` is ignored when `action = "none"`.
 
 With the defaults (`report_and_compact`, `chain = 3`) a long heavy turn will report and compact several times before handing back to you. To get "compact and hand back immediately", set `action = "compact"` and `chain = 0`.
 
+**Degeneration guard:** when the model's output is cut off at its length cap (or degenerates into a whitespace-only wall), the guard nudges it once to continue, and stops the turn at `nudge_cap` consecutive degenerate ends - the partial output is saved to a `<save>_degenerate_N.ctx` snapshot and the turn is marked incomplete, so `/resume` retries it. Over the context threshold the guard stands down (auto-context owns recovery). The session-lifetime nudge count appears in `/status` (`nudges`).
+
 **CLI overrides** (this run only, beat the config - see [Command-Line Options](#command-line-options)):
 
 ```bash
-agent13 local --auto-context-threshold 150000   # lower the threshold
-agent13 local --report-and-compact              # force the report action
+agent13 local --auto-context-threshold 150k     # lower the threshold (k suffix ok)
+agent13 local --auto-context-action report_and_compact  # force the report action
 agent13 local --auto-context-chain 2            # restart budget per turn
+agent13 local --auto-context-nudge-cap 3        # degeneration guard cap
 ```
 
 **Runtime overrides** (TUI and REPL; mutate the live session only, never written to config):
@@ -843,8 +918,9 @@ agent13 local --auto-context-chain 2            # restart budget per turn
 - `/auto_context_threshold [N|0]` - no arg prints the current threshold, action, and chain
 - `/auto_context_action [compact|report_and_compact|none]` - no arg prints the current action
 - `/auto_context_chain [N]` - no arg prints the current chain
+- `/auto_context_nudge_cap [N]` - no arg prints the current guard cap
 
-The current live values also appear in `/status` under Settings (`auto-context`, `auto-action`, `auto-chain`).
+The current live values also appear in `/status` under Settings (`auto-context`, `auto-action`, `auto-chain`, `nudges`).
 
 ## MCP Integration
 
@@ -861,6 +937,12 @@ agent13 local --mcp -p "Use the web_research tool to summarize <topic>"
 
 In batch mode (`-p`), MCP servers connect at startup and disconnect
 automatically when the run finishes - ideal for scripted one-shots.
+
+While a connect/reconnect cycle is in flight, a dim "MCP servers connecting..."
+line appears in the chat and the agent holds off on starting new turns -
+queued prompts stay in the queue (visible, deletable) until the connect
+finishes, because a turn started against a partial tool list would have to be
+re-prompted in full once it completes.
 
 MCP tools appear with the `mcp://` prefix:
 
@@ -906,7 +988,12 @@ Use `/snippet` in the TUI to see available snippets and insert one. `/snippet li
 
 Agent13 can include or exclude reasoning tokens (chain-of-thought) in message history:
 
-- `--remove-reasoning` - Strip reasoning tokens between turns. Reduces context size and focuses on final answers. Recommended for most use cases.
+- `--remove-api-reasoning` - Strip reasoning tokens between turns. Reduces context size and focuses on final answers. Recommended for most use cases.
+- `/remove-api-reasoning on|off` - the same switch at runtime (bare command toggles).
+
+This controls what the **API receives**. What you **see** is a separate axis - the
+`/reasoning` and `/toolview` commands and the `[ui]` keys in
+[Chat Display Configuration](#chat-display-configuration).
 
 Toggle reasoning visibility in the TUI with `Ctrl+O` to collapse/expand reasoning content.
 
@@ -949,12 +1036,24 @@ Deleted messages are removed from the context sent to the model. This is useful 
 
 ## Updates
 
-Agent13 checks GitHub releases for new versions on startup (once per day by default). When an update is available, you'll see a notification like:
+Agent13 checks GitHub releases for new versions on interactive startup (once per day by default). Batch runs (`-p`) are never notified. When an update is available, you'll see a "What's new" summary - the changelog sections for releases newer than yours, fetched from GitHub - followed by the offer and, in a terminal, an interactive prompt:
 
 ```
-⬆ Update available: v0.1.9 (you have 0.1.8). Type /upgrade to apply. Or run: uv tool install --force <wheel-url>
-Disable these notifications: set check_enabled = false in [updates] section of ~/.agent13/config.toml
+  What's new since 0.1.8:
+
+  v0.1.9  2026-05-01
+    - feature one
+    - feature two
+
+>> Update available: v0.1.9 (you have 0.1.8)
+
+  From TUI use:  /upgrade
+  Or run:        agent13 --upgrade
+  ...
+  Apply update now? [y/N]
 ```
+
+If the changelog can't be fetched, the offer appears without the notes. Disable the whole check: set `check_enabled = false` in `[updates]` section of `~/.agent13/config.toml`.
 
 ### Applying Updates
 

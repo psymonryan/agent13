@@ -339,3 +339,222 @@ class TestContinueIncompleteRunningState:
         assert running_states == [True], (
             f"_running should be True inside _llm_turn, got {running_states}"
         )
+
+
+class TestMarkerPop:
+    """continue_incomplete_turn() drops a trailing [Interrupted] marker.
+
+    The marker exists only to keep an in-process history API-valid after an
+    ESC. On resume the turn must continue from the REAL last message (tool
+    result or user message) — an assistant message at the tail is an invalid
+    last role for the next LLM call.
+    """
+
+    def _make_agent_with_marker_tail(self, tail_before_marker: list[dict]) -> Agent:
+        client = MockClient()
+        agent = Agent(client=client, model="test-model")
+        agent.messages = tail_before_marker + [
+            {"role": "assistant", "content": "[Interrupted]", "interrupt": True}
+        ]
+        agent.mark_incomplete_turn(True)
+        return agent
+
+    @pytest.mark.asyncio
+    async def test_marker_popped_tool_tail(self, tmp_path, monkeypatch):
+        """[user, assistant+tc, tool, marker] -> LLM sees [user, assistant+tc, tool]."""
+        monkeypatch.setenv("AGENT13_CONFIG_DIR", str(tmp_path))
+        agent = self._make_agent_with_marker_tail(
+            [
+                {"role": "user", "content": "please run the thing"},
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": "call_1",
+                            "type": "function",
+                            "name": "noop",
+                            "arguments": json.dumps({}),
+                        }
+                    ],
+                },
+                {"role": "tool", "tool_call_id": "call_1", "content": "ok"},
+            ]
+        )
+        agent._running = True
+
+        seen = []
+
+        async def fake_llm_turn(_polite_acquired=False):
+            seen.append([dict(m) for m in agent.messages])
+
+        with patch.object(agent, "_llm_turn", side_effect=fake_llm_turn):
+            started = await agent.continue_incomplete_turn()
+
+        assert started is True
+        assert seen, "_llm_turn should have been called"
+        msgs = seen[0]
+        assert not any(m.get("interrupt") for m in msgs), (
+            f"marker must be popped before the LLM call: {msgs[-1]!r}"
+        )
+        assert msgs[-1]["role"] == "tool", (
+            f"turn should continue from the real last message, got {msgs[-1]!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_marker_popped_user_tail(self, tmp_path, monkeypatch):
+        """[user, marker] (quit/ESC while streaming) -> LLM sees [user]."""
+        monkeypatch.setenv("AGENT13_CONFIG_DIR", str(tmp_path))
+        agent = self._make_agent_with_marker_tail(
+            [
+                {"role": "user", "content": "hi"},
+            ]
+        )
+        agent._running = True
+
+        seen = []
+
+        async def fake_llm_turn(_polite_acquired=False):
+            seen.append([dict(m) for m in agent.messages])
+
+        with patch.object(agent, "_llm_turn", side_effect=fake_llm_turn):
+            started = await agent.continue_incomplete_turn()
+
+        assert started is True
+        assert seen, "_llm_turn should have been called"
+        assert seen[0] == [{"role": "user", "content": "hi"}]
+
+    @pytest.mark.asyncio
+    async def test_history_without_marker_untouched(self, tmp_path, monkeypatch):
+        """No marker at the tail: nothing is popped (normal /resume path)."""
+        monkeypatch.setenv("AGENT13_CONFIG_DIR", str(tmp_path))
+        client = MockClient()
+        agent = Agent(client=client, model="test-model")
+        agent.messages = [
+            {"role": "user", "content": "please run the thing"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "name": "noop",
+                        "arguments": json.dumps({}),
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call_1", "content": "ok"},
+        ]
+        agent.mark_incomplete_turn(True)
+        agent._running = True
+
+        seen = []
+
+        async def fake_llm_turn(_polite_acquired=False):
+            seen.append([dict(m) for m in agent.messages])
+
+        with patch.object(agent, "_llm_turn", side_effect=fake_llm_turn):
+            started = await agent.continue_incomplete_turn()
+
+        assert started is True
+        assert seen, "_llm_turn should have been called"
+        assert len(seen[0]) == 3, "no message may be dropped without a marker"
+        assert seen[0][-1]["role"] == "tool"
+
+
+class TestContinueIncompleteJournalReflection:
+    """continue_incomplete_turn() runs the post-turn journal reflection.
+
+    The resume path has no queue item, so _process_item's Stage 12
+    (journal.maybe_reflect_after_turn) never runs for a resumed turn.
+    Without the equivalent call here, a resumed turn's tool work stays
+    un-compacted and the NEXT turn's retrospective_compact fires the
+    reflection before the user's new message is processed (10-06 edmac
+    incident: 163k-token prefill, 10-min delay on a simple question).
+    The call is unconditional — maybe_reflect_after_turn's internal
+    guards (journal mode, tool calls, interrupt) make it a no-op when
+    not applicable.
+    """
+
+    @pytest.mark.asyncio
+    async def test_tool_branch_reflects_after_llm_turn(self, tmp_path, monkeypatch):
+        """Case 1 (pending tools): reflection runs after _llm_turn, not before."""
+        monkeypatch.setenv("AGENT13_CONFIG_DIR", str(tmp_path))
+        agent = _make_agent_with_pending_tools()
+        agent._running = True
+
+        order = []
+        reflect = AsyncMock()
+
+        async def fake_llm_turn(_polite_acquired=False):
+            order.append("llm_turn")
+
+        async def fake_execute_tool(name, args):
+            return "ok"
+
+        with (
+            patch.object(agent, "_llm_turn", side_effect=fake_llm_turn),
+            patch.object(agent, "_execute_tool_async", side_effect=fake_execute_tool),
+            patch.object(
+                agent.journal, "maybe_reflect_after_turn", side_effect=reflect
+            ),
+        ):
+            started = await agent.continue_incomplete_turn()
+
+        assert started is True
+        reflect.assert_awaited_once()
+        order.append("reflect")
+        assert order == ["llm_turn", "reflect"], (
+            f"reflection must run after the resumed turn completes, got {order}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_tool_result_branch_reflects_after_llm_turn(self, tmp_path, monkeypatch):
+        """Case 2 (tool result tail): reflection runs after _llm_turn."""
+        monkeypatch.setenv("AGENT13_CONFIG_DIR", str(tmp_path))
+        agent = _make_agent_with_tool_result()
+        agent._running = True
+
+        order = []
+        reflect = AsyncMock()
+
+        async def fake_llm_turn(_polite_acquired=False):
+            order.append("llm_turn")
+
+        with (
+            patch.object(agent, "_llm_turn", side_effect=fake_llm_turn),
+            patch.object(
+                agent.journal, "maybe_reflect_after_turn", side_effect=reflect
+            ),
+        ):
+            started = await agent.continue_incomplete_turn()
+
+        assert started is True
+        reflect.assert_awaited_once()
+        order.append("reflect")
+        assert order == ["llm_turn", "reflect"], (
+            f"reflection must run after the resumed turn completes, got {order}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_no_reflection_when_nothing_to_continue(self, tmp_path, monkeypatch):
+        """No incomplete turn: returns False and never reflects."""
+        monkeypatch.setenv("AGENT13_CONFIG_DIR", str(tmp_path))
+        client = MockClient()
+        agent = Agent(client=client, model="test-model")
+        agent.messages = [
+            {"role": "user", "content": "hello"},
+            {"role": "assistant", "content": "hi"},
+        ]
+        agent.mark_incomplete_turn(False)
+        agent._running = True
+
+        reflect = AsyncMock()
+        with patch.object(
+            agent.journal, "maybe_reflect_after_turn", side_effect=reflect
+        ):
+            started = await agent.continue_incomplete_turn()
+
+        assert started is False
+        reflect.assert_not_awaited()

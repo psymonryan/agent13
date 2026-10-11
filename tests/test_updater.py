@@ -264,6 +264,11 @@ class TestPerformUpdate:
             patch("agent13.updater.__version__", "0.1.8"),
             patch("agent13.updater.httpx.stream", _mock_stream_factory()),
             patch("agent13.updater.subprocess.run") as mock_run,
+            # Isolate the install logic from the Windows Scripts-dir rename +
+            # detached-helper path (covered in TestPerformUpdateWindowsDirRename);
+            # otherwise on Windows this renames the real venv dir and spawns a
+            # real detached updater process.
+            patch("agent13.updater._find_scripts_dir", return_value=None),
         ):
             mock_fetch.return_value = {
                 "tag_name": "0.1.9", "html_url": "",
@@ -306,6 +311,11 @@ class TestPerformUpdate:
             patch("agent13.updater.__version__", "0.1.8"),
             patch("agent13.updater.httpx.stream", _mock_stream_factory()),
             patch("agent13.updater.subprocess.run") as mock_run,
+            # Isolate the install logic from the Windows Scripts-dir rename +
+            # detached-helper path (covered in TestPerformUpdateWindowsDirRename);
+            # otherwise on Windows this renames the real venv dir and spawns a
+            # real detached updater process.
+            patch("agent13.updater._find_scripts_dir", return_value=None),
         ):
             mock_fetch.return_value = {
                 "tag_name": "0.1.9", "html_url": "",
@@ -328,6 +338,11 @@ class TestPerformUpdate:
             patch("agent13.updater.__version__", "0.1.8"),
             patch("agent13.updater.httpx.stream", _mock_stream_factory()),
             patch("agent13.updater.subprocess.run") as mock_run,
+            # Isolate the install logic from the Windows Scripts-dir rename +
+            # detached-helper path (covered in TestPerformUpdateWindowsDirRename);
+            # otherwise on Windows this renames the real venv dir and spawns a
+            # real detached updater process.
+            patch("agent13.updater._find_scripts_dir", return_value=None),
         ):
             mock_fetch.return_value = {
                 "tag_name": "0.1.9", "html_url": "",

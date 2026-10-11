@@ -17,6 +17,7 @@ async def run_batch(
     agent: Agent,
     prompt: str,
     read_files: list[str] | None = None,
+    preprocess_msg: str | None = None,
     *,
     on_token: Optional[Callable[[str], Awaitable[None]]] = None,
     on_reasoning: Optional[Callable[[str], Awaitable[None]]] = None,
@@ -34,6 +35,8 @@ async def run_batch(
     Args:
         agent: Configured Agent instance
         prompt: The prompt to send
+        preprocess_msg: Optional first-turn message (the --focus records
+            preprocess) - run and completed BEFORE the prompt turn
         on_token: Called for each response token
         on_reasoning: Called for reasoning tokens
         on_tool_call: Called when a tool is invoked (name, arguments)
@@ -117,6 +120,18 @@ async def run_batch(
     try:
         # Wait for agent to start
         await asyncio.sleep(0.1)
+
+        # Focus records preprocess (--focus startup): run the records turn
+        # FIRST and wait for it, so the prompt turn starts on a warm
+        # context. Same wait pattern as the read acknowledgement below -
+        # enqueueing before agent.run() would desynchronize the
+        # processing_done waits (the records turn would consume the first
+        # wait and the prompt turn would be killed at cleanup).
+        if preprocess_msg:
+            await agent.add_message(preprocess_msg)
+            await processing_done.wait()
+            processing_done.clear()
+            work_started = False
 
         # If read_files provided, send file injection message first
         if read_files:

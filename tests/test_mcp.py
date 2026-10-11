@@ -352,6 +352,144 @@ class TestMCPManagerAsync:
 
         assert manager._shutting_down is True  # Set by cleanup
 
+    async def test_connecting_flag_during_connect_all(self, http_config):
+        """connecting is True while connect_all runs, False after it returns."""
+        manager = MCPManager([http_config])
+        assert manager.connecting is False
+
+        async def fake_connect(name):
+            await asyncio.sleep(0.05)
+            return True
+
+        manager.connect_server_if_needed = fake_connect
+
+        task = asyncio.create_task(manager.connect_all())
+        await asyncio.sleep(0.02)
+        assert manager.connecting is True
+        await task
+        assert manager.connecting is False
+
+    async def test_connecting_flag_cleared_on_server_error(self, http_config):
+        """connecting is cleared even when a server's connect raises."""
+        manager = MCPManager([http_config])
+
+        async def boom(name):
+            raise RuntimeError("server died")
+
+        manager.connect_server_if_needed = boom
+        # connect_all swallows per-server errors — the flag must still clear
+        await manager.connect_all()
+        assert manager.connecting is False
+
+    async def test_connecting_flag_cleared_on_cancel(self, http_config):
+        """connecting is cleared when connect_all is cancelled."""
+        manager = MCPManager([http_config])
+
+        async def slow_connect(name):
+            await asyncio.sleep(5)
+            return True
+
+        manager.connect_server_if_needed = slow_connect
+        task = asyncio.create_task(manager.connect_all())
+        await asyncio.sleep(0.02)
+        assert manager.connecting is True
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert manager.connecting is False
+
+    async def test_connecting_flag_covers_reload_teardown(self, http_config):
+        """connecting stays True through reload's disconnect phase too."""
+        from agent13.mcp import ServerInfo
+
+        manager = MCPManager([http_config])
+        # A "connected" server so disconnect() has something to tear down
+        manager.servers[http_config.name] = ServerInfo(
+            config=http_config, status="connected"
+        )
+
+        teardown_started = asyncio.Event()
+
+        async def slow_teardown(name):
+            teardown_started.set()
+            await asyncio.sleep(0.05)
+
+        manager._teardown_server = slow_teardown
+
+        async def fake_connect(name):
+            return True
+
+        manager.connect_server_if_needed = fake_connect
+
+        task = asyncio.create_task(manager.reload())
+        # Wait until we're inside the teardown phase (before connect_all)
+        await teardown_started.wait()
+        assert manager.connecting is True
+        await task
+        assert manager.connecting is False
+
+    async def test_plain_disconnect_does_not_set_connecting(self, http_config):
+        """A user-initiated /mcp disconnect leaves connecting False — the
+        empty tool list is intentional there, not an in-flight connect."""
+        manager = MCPManager([http_config])
+        await manager.disconnect()
+        assert manager.connecting is False
+
+    async def test_connect_all_emits_mcp_connecting(self, http_config):
+        """connect_all emits MCP_CONNECTING exactly once per cycle."""
+        manager = MCPManager([http_config])
+        events = []
+
+        async def capture(event, data):
+            events.append(event)
+
+        manager.set_event_callback(capture)
+
+        async def fake_connect(name):
+            await asyncio.sleep(0.01)
+            return True
+
+        manager.connect_server_if_needed = fake_connect
+        await manager.connect_all()
+
+        assert events.count(AgentEvent.MCP_CONNECTING) == 1
+
+    async def test_mcp_connecting_emitted_before_server_connect(self, http_config):
+        """MCP_CONNECTING is captured before any per-server connect starts."""
+        manager = MCPManager([http_config])
+        events = []
+
+        async def capture(event, data):
+            events.append(event)
+
+        manager.set_event_callback(capture)
+
+        async def fake_connect(name):
+            # By the time any server connect begins, the cycle event must
+            # already be in the captured stream.
+            assert AgentEvent.MCP_CONNECTING in events
+
+        manager.connect_server_if_needed = fake_connect
+        await manager.connect_all()
+
+    async def test_reload_emits_mcp_connecting_once(self, http_config):
+        """reload delegates to connect_all — one MCP_CONNECTING, not two."""
+        manager = MCPManager([http_config])
+        events = []
+
+        async def capture(event, data):
+            events.append(event)
+
+        manager.set_event_callback(capture)
+
+        async def fake_connect(name):
+            return True
+
+        manager.connect_server_if_needed = fake_connect
+        await manager.reload()
+
+        assert events.count(AgentEvent.MCP_CONNECTING) == 1
+
 
 class TestMCPConfigIntegration:
     """Tests for MCP config parsing integration."""

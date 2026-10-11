@@ -5,46 +5,81 @@ streaming. We surface that early so the TUI can show a dimmed name-only
 widget immediately instead of waiting for the full argument stream.
 
 Covers:
-- AgentTUI._tool_call_markup (pending vs complete vs no-args)
+- ToolWidget headers + format_tool_args (pending vs complete vs no-args)
 - Core emits TOOL_CALL_STARTED before TOOL_CALL, once per tool-call id
 """
 
 import pytest
 
 from agent13 import Agent, AgentEvent
-from ui.tui import AgentTUI
+from ui.tui import ToolWidget, format_tool_args
 
 
 # =============================================================================
-# _tool_call_markup
+# ToolWidget header + format_tool_args
 # =============================================================================
 
 
 class TestToolCallMarkup:
-    """The markup builder shared by the pending and complete widgets."""
+    """The header markup and args body behind a tool widget."""
 
     def test_pending_is_dimmed_name_only(self):
-        markup = AgentTUI._tool_call_markup("write_file", {}, pending=True)
-        assert "write_file" in markup
-        assert "dim" in markup
-        assert "…" in markup
-        # No args line when pending
-        assert "filepath" not in markup
+        widget = ToolWidget("write_file", pending=True)
+        header = widget._title_markup()
+        assert "write_file" in header
+        assert "dim" in header
+        assert "…" in header
+        # No args body when pending
+        assert widget._content == ""
 
     def test_complete_includes_truncated_args(self):
         args = {"filepath": "test.py", "content": "x" * 500}
-        markup = AgentTUI._tool_call_markup("write_file", args, pending=False)
-        assert "write_file" in markup
-        assert "test.py" in markup
+        widget = ToolWidget("write_file")
+        widget.set_call("write_file", args)
+        header = widget._title_markup()
+        # Not dimmed (bright name), no pending ellipsis
+        assert "bold yellow" in header
+        assert "write_file" in header
+        assert "…" not in header
+        body = widget._content
+        assert "test.py" in body
         # Truncated to 200 chars + ellipsis
-        assert "..." in markup
-        # Not dimmed (bright name)
-        assert "bold yellow" in markup
+        assert "..." in body
 
     def test_complete_no_args_is_name_only(self):
-        markup = AgentTUI._tool_call_markup("command", {}, pending=False)
-        assert "command" in markup
-        assert "…" not in markup
+        widget = ToolWidget("command")
+        header = widget._title_markup()
+        assert "command" in header
+        assert "…" not in header
+        assert widget._content == ""
+
+    def test_complete_with_seq_numbers_the_header(self):
+        widget = ToolWidget("command")
+        widget.set_call("command", {"command": "ls -la"}, seq=1)
+        assert "⚙ command 1[/]: ls -la" in widget._title_markup()
+
+    def test_complete_without_seq_is_unnumbered(self):
+        widget = ToolWidget("command")
+        widget.set_call("command", {"command": "ls -la"})
+        assert "⚙ command[/]: ls -la" in widget._title_markup()
+
+    def test_result_with_seq_carries_the_call_number(self):
+        widget = ToolWidget("command", kind="result")
+        widget.set_result("total 8", seq=2)
+        assert widget._title_markup() == "[dim]✓ Result 2 (command):[/]"
+
+    def test_result_without_seq_is_unnumbered(self):
+        widget = ToolWidget("command", kind="result")
+        widget.set_result("total 8")
+        assert widget._title_markup() == "[dim]✓ Result (command):[/]"
+
+    def test_format_tool_args_empty_is_blank(self):
+        assert format_tool_args({}) == ""
+
+    def test_format_tool_args_truncates_long_values(self):
+        body = format_tool_args({"content": "y" * 400})
+        assert "..." in body
+        assert len(body) < 400
 
 
 # =============================================================================
@@ -122,6 +157,114 @@ class TestToolCallStartedEmission:
         assert result, "TOOL_RESULT was not emitted"
         assert started[0] < complete[0], "started must precede complete"
         assert complete[0] < result[0], "complete must precede result"
+
+    @pytest.mark.asyncio
+    async def test_call_and_result_carry_per_turn_seq(self):
+        """A batch of N calls gets seq 1..N on both TOOL_CALL and TOOL_RESULT.
+
+        seq is the call's 1-based number within the user turn. A fresh agent
+        starts its counter at 0, so a turn's first batch numbers 1..N. The
+        UIs pair a result with its call by this number: a batch's pending
+        call widgets mount during the stream, so its results render after all
+        of its calls - the number is what keeps them associated.
+        """
+        agent = _make_agent()
+        call_seqs, result_seqs = [], []
+
+        @agent.on_event
+        async def record(event):
+            if event.event == AgentEvent.TOOL_CALL:
+                call_seqs.append(event.data.get("seq"))
+            elif event.event == AgentEvent.TOOL_RESULT:
+                result_seqs.append(event.data.get("seq"))
+
+        agent._stream_and_emit = self._stateful_stream([
+            ("tool_calls_complete", {
+                "tool_calls": [
+                    {"id": "tc_1", "name": "write_file", "arguments": "{}"},
+                    {"id": "tc_2", "name": "write_file", "arguments": "{}"},
+                ]
+            }),
+        ])
+        await agent._llm_turn()
+
+        assert call_seqs == [1, 2], f"TOOL_CALL seqs: {call_seqs}"
+        assert result_seqs == [1, 2], f"TOOL_RESULT seqs: {result_seqs}"
+
+    @pytest.mark.asyncio
+    async def test_seq_continues_across_iterations_in_one_turn(self):
+        """Within one user turn, later LLM iterations keep counting.
+
+        _process_item calls _llm_turn repeatedly for a single turn and
+        resets the counter once, at the top. So the second iteration's call
+        must continue where the first left off - [1] then [2], not [1] then
+        [1] (the per-batch behaviour this replaces).
+        """
+        agent = _make_agent()
+        call_seqs = []
+
+        @agent.on_event
+        async def record(event):
+            if event.event == AgentEvent.TOOL_CALL:
+                call_seqs.append(event.data.get("seq"))
+
+        # Iteration 1: one tool call, then the terminal content stream.
+        agent._stream_and_emit = self._stateful_stream([
+            ("tool_calls_complete", {
+                "tool_calls": [
+                    {"id": "tc_1", "name": "write_file", "arguments": "{}"},
+                ]
+            }),
+        ])
+        await agent._llm_turn()
+
+        # Iteration 2: a fresh _llm_turn in the same turn (no reset), one
+        # tool call, then the terminal content stream.
+        agent._stream_and_emit = self._stateful_stream([
+            ("tool_calls_complete", {
+                "tool_calls": [
+                    {"id": "tc_2", "name": "write_file", "arguments": "{}"},
+                ]
+            }),
+        ])
+        await agent._llm_turn()
+
+        assert call_seqs == [1, 2], (
+            f"TOOL_CALL seqs across iterations in one turn: {call_seqs}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_process_item_resets_the_turn_counter(self):
+        """Each user turn (queue item) restarts numbering from 1.
+
+        Simulate a counter left mid-turn by a previous item, then process a
+        fresh item: _process_item must zero _turn_tool_seq at its top so the
+        new turn's first call numbers 1, not 2.
+        """
+        from unittest.mock import AsyncMock, patch
+
+        agent = _make_agent()
+        agent.messages = []  # no history - keeps the journal a no-op
+        agent._turn_tool_seq = 5  # stale counter from a prior turn
+
+        item = type(
+            "Item",
+            (),
+            {
+                "text": "Q",
+                "id": 1,
+                "priority": False,
+                "interrupt": False,
+                "kind": "prompt",
+            },
+        )()
+        with patch.object(agent, "_llm_turn", new_callable=AsyncMock):
+            await agent._process_item(item)
+
+        assert agent._turn_tool_seq == 0, (
+            f"_process_item must reset the turn counter, got "
+            f"{agent._turn_tool_seq}"
+        )
 
     @pytest.mark.asyncio
     async def test_started_emitted_once_per_tool_call_id(self):

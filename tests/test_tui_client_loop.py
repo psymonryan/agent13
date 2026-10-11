@@ -26,6 +26,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from agent13.config import create_client
+from agent13.durable_records import DurableRecords
 
 
 def _make_app(client, provider_args=None):
@@ -42,6 +43,7 @@ def _make_app(client, provider_args=None):
         )
 
     agent = MagicMock()
+    agent.durable_records = DurableRecords()
     agent.set_client = MagicMock()
     agent.add_message = AsyncMock()
     agent.set_system_prompt = MagicMock()

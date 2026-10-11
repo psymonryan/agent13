@@ -75,7 +75,7 @@ report_and_compact: |
      Anything already documented is a CONFIRMATION with a section reference,
      not a discovery.
 
-  2. CURRENT TRUTH - rewrite docs_archive/{project}_current_truth.md (<= 150
+  2. CURRENT TRUTH - rewrite docs_archive/{focus}_current_truth.md (<= 150
      lines; create if absent). The ONLY file you may rewrite. Durable facts
      only: what is true about this system regardless of which session you
      are. Not where we are in the work - that is the journal's job. Delete
@@ -86,7 +86,7 @@ report_and_compact: |
      ("[observed 2026-09-23]") are fine; dates as novelty labels are not.
      Exact format - a single title, no opening paragraph, then sections. Omit
      any section that would be empty; add sub-headings for detail:
-       # {project} - current truth (updated YYYY-MM-DD HH:MM)
+       # {focus} - current truth (updated YYYY-MM-DD HH:MM)
        ## 1. Environment & access   (where it runs, how to reach it, credentials,
             standing constraints: never modify X)
        - <statement>   [source ref, provenance]
@@ -110,14 +110,15 @@ report_and_compact: |
      Rewrite every ticket, every time: ranked most-blocking first, capped
      at 10 - an 11th forces one out: CLOSE it (resolved), KILL it (ruled
      out), or PARK it (set aside), with the reason recorded in the journal.
-     Keep each FIRST SEEN exactly as first written, to the minute - never
-     coarsen it to date-only.
+     FIRST SEEN: for every ticket that survives this rewrite, copy its
+     stamp verbatim from the truths file you read in RECONCILE - not
+     from memory, and never coarsened to date-only.
      The TOP UNBLOCKED ticket becomes this entry's "b. NEXT SESSION, FIRST
      ACTION"; if you cannot work it, mark it BLOCKED and name what unblocks
      it - a block is a state, not a failure. NEEDS USER tickets wait for
      the user; never answer them yourself.
 
-  3. APPEND the journal entry to docs_archive/{project}_journal.md (append
+  3. APPEND the journal entry to docs_archive/{focus}_journal.md (append
      only; create if absent.
      Format: one dated heading (## YYYY-MM-DD HH:MM - {sub-task} - {terse
      outcome}; one line, <= 15 words after the date - the skim view of
@@ -155,10 +156,11 @@ report_and_compact: |
         every later PARKED move lands here too, with the reason.
         No delta: write "- none" and nothing else.
 
-  Name the journal after the PROJECT, not this session's sub-task; put the
-  sub-task in the entry header. The project name: if the user named the
-  project in any message, use that name for {project} (both files and the
-  truth title); only with no name given, fall back to the directory name.
+  Name the journal after the FOCUS (the work target), not this session's
+  sub-task; put the sub-task in the entry header. The focus name: if the
+  user named the focus in any message, use that name for {focus} (both
+  files and the truth title); only with no name given, fall back to the
+  directory name.
   No cumulative version history. No prose
   restatement of prior entries. Keep it tight - a cold reader must be able to
   act on it.
@@ -170,10 +172,10 @@ compaction: |
   Preserve:
   - All key decisions, their rationale, and current status
   - Important code, file paths, and technical details
-  - The project's durable record — the journal and current-truth files
-    under docs_archive/ (e.g. <project>_current_truth.md). Always name them,
+  - The focus's durable record — the journal and current-truth files
+    under docs_archive/ (e.g. <focus>_current_truth.md). Always name them,
     even if untouched this session, with a cue on when to read them.
-    If the user named the project, carry that name - it determines the
+    If the user named the focus, carry that name - it determines the
     file names when the wrap-up creates them.
     Mid-session journal appends (user-requested, or to make a hard-won
     finding survive a crash) are fine: same dated heading with terse

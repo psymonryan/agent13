@@ -4,7 +4,7 @@ import asyncio
 import sys
 import os
 import pytest
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch
 from agent13.bell import BellManager
 
 

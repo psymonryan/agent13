@@ -26,6 +26,7 @@ from textual.message import Message
 from textual.events import Click, MouseUp
 from textual.widget import MountError, Widget
 from ui.chat_input import ChatTextArea
+from ui.summary import budget_for, first_line, tool_what, truncate_line
 import time
 import argparse
 from datetime import datetime
@@ -76,6 +77,8 @@ from agent13 import (
     SkillManager,
     skill_manager_ctx,
 )
+from agent13.durable_records import startup_focus
+from agent13.status import parse_token_count
 from agent13.persistence import (
     load_context,
     find_latest_auto_save,
@@ -195,10 +198,13 @@ class TokenMessage(Message):
 class ToolCallMessage(Message):
     """Message sent when a tool is called."""
 
-    def __init__(self, name: str, arguments: dict) -> None:
+    def __init__(self, name: str, arguments: dict, seq: int | None = None) -> None:
         super().__init__()
         self.name = name
         self.arguments = arguments
+        # 1-based number of this call within the user turn - pairs the result
+        # with its call. None when the emitter didn't provide one.
+        self.seq = seq
 
 
 class ToolCallStartedMessage(Message):
@@ -231,10 +237,12 @@ class ToolCallPendingMessage(Message):
 class ToolResultMessage(Message):
     """Message sent when a tool result is received."""
 
-    def __init__(self, name: str, result: str) -> None:
+    def __init__(self, name: str, result: str, seq: int | None = None) -> None:
         super().__init__()
         self.name = name
         self.result = result
+        # Per-turn 1-based index of the call this result belongs to.
+        self.seq = seq
 
 
 class StatusMessage(Message):
@@ -312,33 +320,104 @@ class StreamingMessage(Static):
             self._stream = None
 
 
-class ReasoningMessage(Static):
-    """A message widget for reasoning/thinking content.
+class CollapsibleMessage(Static):
+    """A chat widget with a clickable header that folds its body.
 
-    Supports incremental streaming and renders as dim/italic markdown.
-    Can be collapsed/expanded via click or Ctrl+O.
+    The header (title + a ▶/▼ indicator) is always visible; the body is a
+    child widget hidden while collapsed. Clicking the header toggles.
+    Subclasses set the header text via ``_title_markup()`` and the body
+    widget type via ``_make_body()``.
+
+    Content is buffered in ``_content``: text appended while folded is not
+    written to the body, so expanding re-renders the whole body. Content set
+    before mount is applied in ``compose()``.
     """
 
-    def __init__(self, title: str = "Thinking", collapsed: bool = False):
+    def __init__(self, title: str = "", collapsed: bool = False):
         super().__init__()
         self._title = title
         self._content = ""
         self.collapsed = collapsed
-        self._markdown: Markdown | None = None
+        self._body: Static | None = None
         self._stream: MarkdownStream | None = None
         self._header: Static | None = None
 
-    def compose(self) -> ComposeResult:
-        # Header row with title and collapse indicator
+    # -- header -----------------------------------------------------------
+
+    def _header_class(self) -> str:
+        """CSS classes for the header row."""
+        return "reasoning-header"
+
+    def _title_markup(self) -> str:
+        """Rich markup for the header title (the indicator is appended)."""
+        return f"[dim]{escape_markup(self._title)}[/]"
+
+    def _header_markup(self) -> str:
         indicator = "▶" if self.collapsed else "▼"
-        self._header = Static(
-            f"[dim]{self._title}[/] {indicator}", classes="reasoning-header"
-        )
+        return f"{self._title_markup()} {indicator}"
+
+    def _refresh_header(self) -> None:
+        if self._header:
+            self._header.update(self._header_markup())
+
+    def _header_width(self) -> int:
+        """Columns available to the header text (0 before first layout)."""
+        if self._header is None:
+            return 0
+        size = getattr(self._header, "size", None)
+        width = getattr(size, "width", 0) if size is not None else 0
+        try:
+            return int(width)
+        except (TypeError, ValueError):
+            return 0
+
+    def on_resize(self, event) -> None:
+        """The header is width-relative; re-emit it so it stays one line."""
+        self._refresh_header()
+
+    def set_title(self, title: str) -> None:
+        """Update the header title (re-renders the indicator)."""
+        self._title = title
+        self._refresh_header()
+
+    # -- body -------------------------------------------------------------
+
+    def _make_body(self) -> Static:
+        """The foldable body widget. Markdown (streamable) by default."""
+        return Markdown("")
+
+    def compose(self) -> ComposeResult:
+        self._header = Static(self._header_markup(), classes=self._header_class())
         yield self._header
-        # Markdown content (hidden when collapsed)
-        self._markdown = Markdown("")
-        self._markdown.display = not self.collapsed
-        yield self._markdown
+        self._body = self._make_body()
+        if self._content:
+            self._body.update(self._content)
+        self._body.display = not self.collapsed
+        yield self._body
+
+    def set_body(self, text: str) -> None:
+        """Set the whole body in one shot (safe before or after mounting)."""
+        self._content = text
+        if self._body is not None and not self.collapsed:
+            self._body.update(text)
+
+    async def append(self, text: str) -> None:
+        """Append text to the body, streaming it while expanded."""
+        if not text:
+            return
+        self._content += text
+        if self._body is not None and not self.collapsed:
+            if self._stream is None:
+                self._stream = Markdown.get_stream(self._body)
+            await self._stream.write(text)
+
+    async def finalize(self) -> None:
+        """Stop the stream when done."""
+        if self._stream:
+            await self._stream.stop()
+            self._stream = None
+
+    # -- folding ----------------------------------------------------------
 
     async def on_click(self, event: Click) -> None:
         """Toggle collapsed state only when clicking the header."""
@@ -348,41 +427,162 @@ class ReasoningMessage(Static):
     async def set_collapsed(self, collapsed: bool) -> None:
         """Set collapsed state and update display."""
         self.collapsed = collapsed
-        # Update indicator
-        indicator = "▶" if collapsed else "▼"
-        if self._header:
-            self._header.update(f"[dim]{self._title}[/] {indicator}")
-        # Show/hide content
-        if self._markdown:
-            self._markdown.display = not collapsed
-            # If expanding and we have content, re-render it
-            if not collapsed and self._content:
-                self._markdown.update(self._content)
-
-    async def append(self, text: str) -> None:
-        """Append text to the reasoning message."""
-        if not text:
+        self._refresh_header()
+        if self._body is None:
             return
-        self._content += text
-        # Only write to stream if not collapsed
-        if self._markdown and not self.collapsed:
-            if self._stream is None:
-                self._stream = Markdown.get_stream(self._markdown)
-            await self._stream.write(text)
+        self._body.display = not collapsed
+        if not collapsed and self._content:
+            # Re-render: content buffered while folded was never written.
+            self._body.update(self._content)
+
+
+class ReasoningMessage(CollapsibleMessage):
+    """A message widget for reasoning/thinking content.
+
+    Supports incremental streaming and renders as dim/italic markdown.
+    Can be collapsed/expanded via click.
+    """
+
+    #: In-progress title -> the title a finished block carries.
+    _COMPLETED_TITLES = {"Thinking": "Thoughts", "Reflecting": "Reflection"}
+
+    def __init__(self, title: str = "Thinking", collapsed: bool = False):
+        super().__init__(title=title, collapsed=collapsed)
+        # The "what it's thinking about" hint is only meaningful once the
+        # block is finished, so it is revealed at finalize() - not streamed.
+        self._completed = False
+
+    def _title_markup(self) -> str:
+        """Header: the title, plus the first line of the thought once done.
+
+        While streaming it is just the in-progress title ("Thinking"); at
+        completion it gains a width-relative hint of what it was thinking.
+        """
+        title = escape_markup(self._title)
+        hint = ""
+        if self._completed:
+            hint = truncate_line(
+                first_line(self._content),
+                budget_for(f"{self._title}: ", self._header_width()),
+            )
+        if hint:
+            return f"[dim]{title}: {escape_markup(hint)}[/]"
+        return f"[dim]{title}[/]"
 
     async def finalize(self) -> None:
-        """Stop the stream when done."""
-        if self._stream:
-            await self._stream.stop()
-            self._stream = None
+        """Stop the stream and put the header in its completed tense.
 
-    def set_title(self, title: str) -> None:
-        """Update the widget title."""
-        self._title = title
-        # Update header if it exists
-        if self._header:
-            indicator = "▶" if self.collapsed else "▼"
-            self._header.update(f"[dim]{self._title}[/] {indicator}")
+        A finished block reads "Thoughts" / "Reflection", not "Thinking" /
+        "Reflecting". Renaming here - rather than in the streaming caller -
+        is what makes the live path and the rebuild path (which mounts and
+        finalizes in one step, from history that only ever holds completed
+        blocks) label the same block identically. Also reveals the first-line
+        hint, which the rebuild path gets for free the same way.
+        """
+        completed = self._COMPLETED_TITLES.get(self._title)
+        if completed:
+            self.set_title(completed)
+        self._completed = True
+        self._refresh_header()
+        await super().finalize()
+
+
+def format_tool_args(arguments: dict, limit: int = 200) -> str:
+    """Dim Rich markup for a tool call's arguments, truncated to `limit`."""
+    if not arguments:
+        return ""
+    try:
+        args_str = json.dumps(arguments, indent=2)
+        if len(args_str) > limit:
+            args_str = args_str[:limit] + "..."
+    except Exception:
+        args_str = str(arguments)[:limit]
+    return f"[dim]{escape_markup(args_str)}[/]"
+
+
+def format_tool_result(result: str, limit: int = 300) -> str:
+    """Dim Rich markup for a tool result, truncated to `limit` chars."""
+    text = result[:limit] + "..." if len(result) > limit else result
+    return f"[dim]{escape_markup(text)}[/]"
+
+
+class ToolWidget(CollapsibleMessage):
+    """A tool call or tool result, folded to a one-line header by default.
+
+    The header (``⚙ name`` / ``✓ Result (name)``) is always visible so the
+    transcript keeps its "what is it doing right now" signal; the args and
+    result body fold away until the header is clicked.
+    """
+
+    def __init__(
+        self,
+        name: str,
+        collapsed: bool = False,
+        kind: str = "call",
+        pending: bool = False,
+        pending_unknown: bool = False,
+    ):
+        super().__init__(title=name, collapsed=collapsed)
+        self.kind = kind  # "call" | "result"
+        self.pending = pending
+        # Name not known yet (provider buffering the tool call)
+        self.pending_unknown = pending_unknown
+        # The call's arguments - the source of the folded one-line "what".
+        self._arguments: dict = {}
+        # 1-based number of this call within the user turn (set by set_call /
+        # set_result) - lets a result be paired with its call.
+        self._seq: int | None = None
+
+    def _header_class(self) -> str:
+        return "tool-header"
+
+    def _make_body(self) -> Static:
+        # Tool bodies are escaped Rich markup (JSON / raw output), not markdown.
+        return Static("", markup=True)
+
+    def _seq_suffix(self) -> str:
+        """The header's number part: ' 1' when this widget carries a seq."""
+        return f" {self._seq}" if self._seq else ""
+
+    def _title_markup(self) -> str:
+        name = escape_markup(self._title)
+        seq = self._seq_suffix()
+        if self.pending:
+            if self.pending_unknown or not name:
+                return "[dim]⚙ …[/]"
+            return f"[dim]⚙ {name} …[/]"
+        if self.kind == "result":
+            return f"[dim]✓ Result{seq} ({name}):[/]"
+        # A completed call carries a width-relative "what" - the command
+        # running, the file being edited - so one line says what it's doing.
+        what = truncate_line(
+            tool_what(self._title, self._arguments),
+            budget_for(f"⚙ {self._title}{seq}: ", self._header_width()),
+        )
+        if what:
+            return f"[bold yellow]⚙ {name}{seq}[/]: {escape_markup(what)}"
+        return f"[bold yellow]⚙ {name}{seq}[/]"
+
+    def set_pending_name(self, name: str) -> None:
+        """Fill in the name of a name-unknown placeholder (still pending)."""
+        self._title = name
+        self.pending_unknown = False
+        self._refresh_header()
+
+    def set_call(self, name: str, arguments: dict, seq: int | None = None) -> None:
+        """Complete a pending widget: set the name and the args body."""
+        self._title = name
+        self.pending = False
+        self.pending_unknown = False
+        self._arguments = arguments
+        self._seq = seq
+        self.set_body(format_tool_args(arguments))
+        self._refresh_header()
+
+    def set_result(self, result: str, seq: int | None = None) -> None:
+        """Set the result body."""
+        self._seq = seq
+        self.set_body(format_tool_result(result))
 
 
 class InterruptMessage(Static):
@@ -443,6 +643,10 @@ class AgentTUI(App):
         margin-bottom: 0;
     }
 
+    .tool-header {
+        margin-bottom: 0;
+    }
+
     .assistant-message {
         color: magenta;
         margin-top: 0;
@@ -486,7 +690,7 @@ class AgentTUI(App):
 
     .notification-panel {
         background: $panel;
-        border: solid blue;
+        border: solid dodgerblue;
         color: white;
         margin: 1;
         padding: 1;
@@ -612,6 +816,7 @@ class AgentTUI(App):
         "/exit",
         "/clear",
         "/rebuild",
+        "/new_session",
         "/history",
         "/delete",
         "/model",
@@ -631,7 +836,12 @@ class AgentTUI(App):
         "/skills",
         "/journal",
         "/compact",
-        "/remove-reasoning",
+        "/wrapup",
+        "/focus",
+        "/chain",
+        "/remove-api-reasoning",
+        "/reasoning",
+        "/toolview",
         "/save",
         "/load",
         "/devel",
@@ -647,6 +857,7 @@ class AgentTUI(App):
         "/auto_context_threshold",
         "/auto_context_action",
         "/auto_context_chain",
+        "/auto_context_nudge_cap",
     ]
     # Class-level attribute for type checking (instance copy created in __init__)
     SLASH_COMMANDS = _BUILTIN_SLASH_COMMANDS
@@ -660,7 +871,6 @@ class AgentTUI(App):
         "model": "_get_model_completions",  # Method to get model names
         "mcp": ["connect", "disconnect", "reload"],  # MCP subcommands
         "sandbox": None,  # Will use _get_sandbox_completions method
-        "clear": ["all"],
         "pretty": ["on", "off"],
         "tool-response": ["raw", "json"],
         "provider": "_get_provider_completions",  # Method to get provider names
@@ -669,7 +879,9 @@ class AgentTUI(App):
         "delete": "_get_delete_completions",  # Delete from history, queue, or saves
         "journal": ["on", "off", "last", "all", "status"],
         "auto_context_action": ["compact", "report_and_compact", "none"],
-        "remove-reasoning": ["on", "off"],
+        "remove-api-reasoning": ["on", "off"],
+        "reasoning": ["hide", "show", "pin", "unpin"],
+        "toolview": ["hide", "show", "pin", "unpin"],
         "save": "_get_save_completions",  # Method to list save files
         "load": "_get_load_completions",  # Includes auto-saves
         "devel": ["on", "off", "status", "pin", "unpin"],
@@ -741,15 +953,19 @@ class AgentTUI(App):
         spinner_speed: str = "fast",
         clipboard_method: str = "osc52",
         read_files: list[str] | None = None,
+        focus_name: str | None = None,
         polite_interval: float | None = None,
         bell_threshold: float | str | None = None,
         bell_enabled: bool = True,
         bell_command: str = "",
         priming_enabled: bool = False,
         cursor_blink: bool = False,
+        reasoning_collapsed: bool = True,
+        toolview_collapsed: bool = True,
         auto_context_threshold: int = 220000,
         auto_context_action: str = "report_and_compact",
         auto_context_chain: int = 3,
+        auto_context_nudge_cap: int = 2,
         report_and_compact_prompt: str = "",
     ):
         """Initialize the TUI.
@@ -788,10 +1004,16 @@ class AgentTUI(App):
                 Validated on startup; invalid commands warn and fall back.
             cursor_blink: Whether the input cursor blinks. Default False
                 (no periodic terminal output, tmux-friendly).
+            reasoning_collapsed: Reasoning widgets (Thoughts/Reflection) start
+                folded to a one-line header. Default True.
+            toolview_collapsed: Tool call/result widgets start folded to a
+                one-line header. Default True.
             auto_context_threshold: Token threshold for the auto-context check.
             auto_context_action: What to do at the threshold - "compact",
                 "report_and_compact", or "none".
             auto_context_chain: Turn restarts after a compact per turn (0 = none).
+            auto_context_nudge_cap: Consecutive degenerate outputs before the
+                guard stops the turn (0 = guard off).
             report_and_compact_prompt: Prompt text for the wrap-up turn. Empty
                 string = resolve from prompts.yaml / built-in default.
         """
@@ -805,6 +1027,7 @@ class AgentTUI(App):
         self.tool_response_format = tool_response_format
         self._connect_mcp = connect_mcp
         self.read_files = read_files
+        self.focus_name = focus_name
 
         # Initialize prompt manager
         self.prompt_manager = prompt_manager or PromptManager()
@@ -882,6 +1105,7 @@ class AgentTUI(App):
             auto_context_threshold=auto_context_threshold,
             auto_context_action=auto_context_action,
             auto_context_chain=auto_context_chain,
+            auto_context_nudge_cap=auto_context_nudge_cap,
             report_and_compact_prompt=report_and_compact_prompt
             or resolve_report_and_compact_prompt(self.prompt_manager),
         )
@@ -906,6 +1130,10 @@ class AgentTUI(App):
 
         # Clipboard method (osc52 or system)
         self._clipboard_method = clipboard_method
+
+        # Widget folding (display only): which widget families start folded.
+        self._reasoning_collapsed = reasoning_collapsed
+        self._toolview_collapsed = toolview_collapsed
 
         # Bell: BellManager encapsulates threshold timer, command validation,
         # and ringing. TUI passes self.bell as the fallback (terminal bell).
@@ -1833,7 +2061,8 @@ class AgentTUI(App):
                 return
             name = event.data.get("name", "")
             arguments = event.data.get("arguments", {})
-            self.post_message(ToolCallMessage(name, arguments))
+            seq = event.data.get("seq")
+            self.post_message(ToolCallMessage(name, arguments, seq))
 
         @self.agent.on_event
         async def on_tool_result(event: AgentEventData):
@@ -1841,8 +2070,9 @@ class AgentTUI(App):
                 return
             name = event.data.get("name", "")
             result = event.data.get("result", "")
+            seq = event.data.get("seq")
             # Post through message queue to preserve ordering with tool calls
-            self.post_message(ToolResultMessage(name, result))
+            self.post_message(ToolResultMessage(name, result, seq))
 
         @self.agent.on_event
         async def on_error(event: AgentEventData):
@@ -1971,15 +2201,28 @@ class AgentTUI(App):
         async def on_chat_clear(event: AgentEventData):
             if event.event != AgentEvent.CHAT_CLEAR:
                 return
-            # A chain restart just compacted the history. Rebuild keeping the
-            # last turn - the compacted session summary pair - so the new
-            # chain visibly starts from it. Deferred (create_task) rather than
-            # mutating the widget inline - same reason /clear defers below.
-            asyncio.create_task(
-                self._clear_and_show_last_n(
-                    1, system_line="Context compacted — showing session summary"
-                )
-            )
+            # Clear the chat display immediately - the user should see the
+            # cleared state as soon as the history is cleared, not after a
+            # deferred task. Matches the MESSAGES_CLEARED pattern below.
+            if self._chat_ready():
+                await self._chat.remove_children()
+
+        @self.agent.on_event
+        async def on_chat_rebuild(event: AgentEventData):
+            if event.event != AgentEvent.CHAT_REBUILD:
+                return
+            # Rebuild the chat from the current message history. Emitted
+            # after chain-restart records are injected, so the user sees
+            # the new content. Deferred (heavier widget-tree operation),
+            # but self.agent.messages is already populated by this point.
+            system_line = event.data.get("system_line")
+
+            async def _do_rebuild():
+                await self._rebuild_chat()
+                if system_line:
+                    await self._write_system(system_line)
+
+            asyncio.create_task(_do_rebuild())
 
         @self.agent.on_event
         async def on_context_loaded(event: AgentEventData):
@@ -2010,6 +2253,31 @@ class AgentTUI(App):
                 asyncio.create_task(self._replay_loaded_messages())
             else:
                 self._update_info_content(f"[red]{message}[/]")
+
+        @self.agent.on_event
+        async def on_mcp_connecting(event: AgentEventData):
+            if event.event != AgentEvent.MCP_CONNECTING:
+                return
+            asyncio.create_task(
+                self._write_system(
+                    "[dim]MCP servers connecting…[/]",
+                    escape_text=False,
+                )
+            )
+
+        @self.agent.on_event
+        async def on_degenerate_nudge(event: AgentEventData):
+            if event.event != AgentEvent.DEGENERATE_NUDGE:
+                return
+            message = event.data.get("message", "")
+            level = event.data.get("level", "info")
+            style = "yellow" if level == "warning" else "dim"
+            asyncio.create_task(
+                self._write_system(
+                    f"[{style}]{message}[/]",
+                    escape_text=False,
+                )
+            )
 
         @self.agent.on_event
         async def on_mcp_started(event: AgentEventData):
@@ -2158,8 +2426,66 @@ class AgentTUI(App):
             yield Static(id="status-spacer")
             yield Static("", id="status-right")
 
+    def _install_screen_event_guard(self) -> None:
+        """Contain Textual's mouse-selection race inside the screen.
+
+        Screen._forward_event's selection branch dereferences the widget
+        under the cursor. If that widget is unmounted in the same instant
+        as the click (a race with the streaming/collapse re-render), the
+        lookup returns a detached widget and the branch crashes on
+        ``container.region`` (parent is None). The exception would
+        propagate into the App's message loop; Textual's default
+        _handle_exception then exits the whole app. Wrapping the method
+        at the instance level contains the failure where it happens, so
+        the TUI keeps running. If Textual ever renames the internal we
+        fall through to the _handle_exception backstop.
+        """
+        screen = self.screen
+        original = getattr(screen, "_forward_event", None)
+        if original is None:
+            return
+
+        def guarded(event):
+            try:
+                return original(event)
+            except Exception as error:
+                self._log_ui_event_error(error)
+
+        screen._forward_event = guarded
+
+    def _log_ui_event_error(self, error: BaseException) -> None:
+        """Log a contained UI event error, note it in the chat, keep going."""
+        try:
+            from agent13.debug_log import log_error
+
+            log_error(error, {"context": "textual_event"})
+        except Exception:
+            pass
+        self.bell()
+        asyncio.create_task(
+            self._write_system("[dim]⚠ UI event error ignored[/]", escape_text=False)
+        )
+
+    def _handle_exception(self, error: BaseException) -> None:
+        """Backstop: keep the process alive through runtime Textual exceptions.
+
+        Textual's default (App._handle_exception) always exits on an
+        unhandled event exception. The known crash (a MouseDown on a chat
+        widget unmounted in the same instant) is contained earlier, in
+        _install_screen_event_guard, so the screen stays interactive. This
+        backstop covers any other exception that still leaks out: the app
+        process and the agent survive; a forced quit (Ctrl+C) saves as
+        usual. Before mount we defer to Textual so startup failures still
+        fail loudly.
+        """
+        if not self.is_mounted:
+            super()._handle_exception(error)
+            return
+        self._log_ui_event_error(error)
+
     async def on_mount(self) -> None:
         """Set up the TUI after mounting."""
+        self._install_screen_event_guard()
         # Create the LLM client in THIS event loop. The client passed at
         # construction was used in the setup loop (model fetch), so its
         # pooled connections are bound to that now-closed loop; reusing
@@ -2223,9 +2549,36 @@ class AgentTUI(App):
             read_msg = build_read_message(self.read_files)
             await self.agent.add_message(read_msg)
 
+        # Focus name from --focus flag: authoritative state; on a fresh session
+        # the records become the session's first turn (the --read pattern).
+        # After the auto-save load, so a resumed history is never
+        # double-seeded. One wiring for all four UIs - see
+        # agent13.durable_records.startup_focus.
+        await self._apply_focus_startup()
+
         # Connect to MCP servers if requested
         if self._connect_mcp and self.agent._mcp_server_configs:
             self._mcp_connect_task = asyncio.create_task(self._connect_mcp_on_startup())
+
+    async def _apply_focus_startup(self) -> None:
+        """Apply the ``--focus`` startup flag: set the authoritative name
+        and, on a fresh session, enqueue the focus's durable records as the
+        session's FIRST TURN - the model reads them and replies a minimal
+        ack while the user types their first prompt (the --read pattern).
+        A dim system line says what is happening before the ack lands."""
+        message, _level, enqueue_msg = startup_focus(
+            self.agent.durable_records, self.focus_name, self.agent.messages
+        )
+        if enqueue_msg:
+            # Say what is happening BEFORE the ack lands - the user can
+            # start typing their first prompt immediately.
+            await self._write_system(
+                f"Preprocessing records for focus {escape_markup(self.focus_name)}…",
+                escape_text=False,
+            )
+            await self.agent.add_message(enqueue_msg, kind="prompt")
+        if message:
+            self._update_info_content(f"[dim]{escape_markup(message)}[/]")
 
     async def _connect_mcp_on_startup(self) -> None:
         """Connect to MCP servers on startup."""
@@ -2242,6 +2595,10 @@ class AgentTUI(App):
                     await self._write_system("[dim]MCP: No servers connected[/]")
         except Exception as e:
             await self._write_system(f"[red]MCP connection error: {e}[/]")
+        finally:
+            # Refresh the status bar ("mcp: on" right side) — connect runs in
+            # the background, so no other event will update it for us.
+            self.update_status()
 
     def on_click(self, event) -> None:
         """Handle click events - ensure input stays focused."""
@@ -2469,61 +2826,34 @@ class AgentTUI(App):
         if await self._safe_mount(msg):
             await self._scroll_if_at_bottom(was_at_bottom)
 
-    @staticmethod
-    def _tool_call_markup(name: str, arguments: dict, pending: bool = False) -> str:
-        """Build the Rich markup for a tool-call widget.
-
-        pending=True renders a dimmed name-only variant shown while the model is
-        still generating the tool's arguments (the args line isn't available yet).
-        pending=False renders the full variant with the args (truncated to 200 chars).
-        """
-        if pending:
-            if not name:
-                # Name unknown yet (provider buffering the tool call)
-                return "[dim]⚙ …[/]"
-            return f"[dim]⚙ {escape_markup(name)} …[/]"
-        if arguments:
-            try:
-                args_str = json.dumps(arguments, indent=2)
-                # Truncate if too long
-                if len(args_str) > 200:
-                    args_str = args_str[:200] + "..."
-            except Exception:
-                args_str = str(arguments)[:200]
-        else:
-            args_str = ""
-        lines = [f"[bold yellow]⚙ {escape_markup(name)}[/]"]
-        if args_str:
-            lines.append(f"[dim]{escape_markup(args_str)}[/]")
-        return "\n".join(lines)
-
-    async def _write_tool_call(self, name: str, arguments: dict) -> None:
-        """Write a tool call message with formatted panel."""
+    async def _write_tool_call(
+        self, name: str, arguments: dict, seq: int | None = None
+    ) -> None:
+        """Write a tool-call widget (folded per the toolview setting)."""
         if not self._chat_ready():
             return
         was_at_bottom = self._is_at_bottom()
-        msg = Static(
-            self._tool_call_markup(name, arguments, pending=False),
-            classes="tool-call",
-            markup=True,
+        msg = ToolWidget(
+            name, collapsed=self._toolview_collapsed, kind="call"
         )
+        msg.set_call(name, arguments, seq)
+        msg.add_class("tool-call")
         if await self._safe_mount(msg):
             await self._scroll_if_at_bottom(was_at_bottom)
 
-    async def _write_tool_result(self, name: str, result: str) -> None:
-        """Write a tool result message with formatted panel."""
+    async def _write_tool_result(
+        self, name: str, result: str, seq: int | None = None
+    ) -> None:
+        """Write a tool-result widget (folded per the toolview setting)."""
         if not self._chat_ready():
             return
         was_at_bottom = self._is_at_bottom()
 
-        # Format result nicely
-        result_str = result[:300] + "..." if len(result) > 300 else result
-
-        # Create formatted result panel
-        lines = [f"[dim]✓ Result ({escape_markup(name)}):[/]"]
-        lines.append(f"[dim]{escape_markup(result_str)}[/]")
-
-        msg = Static("\n".join(lines), classes="tool-result", markup=True)
+        msg = ToolWidget(
+            name, collapsed=self._toolview_collapsed, kind="result"
+        )
+        msg.set_result(result, seq)
+        msg.add_class("tool-result")
         if await self._safe_mount(msg):
             await self._scroll_if_at_bottom(was_at_bottom)
 
@@ -2626,11 +2956,15 @@ class AgentTUI(App):
 
         Shared by _replay_loaded_messages and _rebuild_chat.
         Renders user messages, assistant content (StreamingMessage with
-        markdown), reasoning blocks (ReasoningMessage, collapsed by default),
-        and tool call/result pairs.
+        markdown), reasoning blocks (ReasoningMessage, folded per the
+        /reasoning setting), and tool call/result pairs (ToolWidget, folded
+        per the /toolview setting).
         """
         # Track tool calls so we can pair them with results
         pending_tool_calls = {}  # tool_call_id -> (name, arguments)
+        # Per-user-turn seq, mirroring the live path: resets on each user
+        # message, increments per tool call across the turn's LLM iterations.
+        turn_seq = 0
 
         for msg in messages:
             role = msg.get("role", "")
@@ -2648,6 +2982,9 @@ class AgentTUI(App):
                 # "[Image from tool: X]" trace.
                 if msg.get("injected") and isinstance(msg.get("content"), str):
                     continue
+                # A real user message starts a new turn: its tool calls
+                # number from 1 (injected nudges don't - the turn continues).
+                turn_seq = 0
                 # Display user message
                 if content:
                     await self._write_user(content)
@@ -2657,7 +2994,12 @@ class AgentTUI(App):
                 reasoning = msg.get("reasoning_content")
                 if reasoning and reasoning.strip():
                     was_at_bottom = self._is_at_bottom()
-                    r_widget = ReasoningMessage(title="Thinking", collapsed=True)
+                    # History only holds completed blocks; finalize() puts
+                    # the in-progress title in its completed tense, so this
+                    # mounts as "Thoughts" exactly like the live path.
+                    r_widget = ReasoningMessage(
+                        title="Thinking", collapsed=self._reasoning_collapsed
+                    )
                     r_widget.add_class("assistant-message")
                     if await self._safe_mount(r_widget):
                         await r_widget.append(reasoning)
@@ -2674,19 +3016,25 @@ class AgentTUI(App):
                     if await self._safe_mount(msg_widget):
                         await self._scroll_if_at_bottom(was_at_bottom)
 
-                # Track tool calls for pairing with results
+                # Track tool calls for pairing with results. The per-turn seq
+                # mirrors the live path: a running counter that resets on each
+                # user message, so rebuilt headers number like the ones that
+                # streamed (calls continue 1, 2, ... across the turn's
+                # assistant messages).
                 for tc in tool_calls:
+                    turn_seq += 1
+                    seq = turn_seq
                     tc_id = tc.get("id")
                     tc_func = tc.get("function", {})
                     tc_name = tc_func.get("name", "unknown")
                     tc_args = tc_func.get("arguments", "{}")
                     if tc_id:
-                        pending_tool_calls[tc_id] = (tc_name, tc_args)
+                        pending_tool_calls[tc_id] = (tc_name, tc_args, seq)
 
             elif role == "tool":
                 # Tool result - pair with the tool call
                 if tool_call_id and tool_call_id in pending_tool_calls:
-                    tc_name, tc_args_str = pending_tool_calls.pop(tool_call_id)
+                    tc_name, tc_args_str, seq = pending_tool_calls.pop(tool_call_id)
                     # Parse arguments from JSON string to dict
                     try:
                         tc_args_dict = (
@@ -2697,12 +3045,12 @@ class AgentTUI(App):
                     except json.JSONDecodeError:
                         tc_args_dict = {"raw": tc_args_str}
                     # Display tool call with its result
-                    await self._write_tool_call(tc_name, tc_args_dict)
+                    await self._write_tool_call(tc_name, tc_args_dict, seq)
                     # Truncate long tool results for display
                     display_result = content
                     if len(display_result) > 500:
                         display_result = display_result[:500] + "...[truncated]"
-                    await self._write_tool_result(tc_name, display_result)
+                    await self._write_tool_result(tc_name, display_result, seq)
                 else:
                     # Orphan tool result (shouldn't happen often)
                     was_at_bottom = self._is_at_bottom()
@@ -2741,7 +3089,12 @@ class AgentTUI(App):
             color = "red"
         else:  # info
             icon = "ℹ"  # Information sign
-            color = "blue"
+            # "blue" (#0000ff, SGR 34) is unreadable on the dark panel.
+            # NOTE: Textual's Content.from_markup SILENTLY DROPS style names
+            # it does not know (e.g. "bright_blue" renders as plain text), so
+            # this must be a Textual-palette name: dodgerblue = #1e90ff,
+            # SGR 94 (bright blue) on 16-color terminals.
+            color = "dodgerblue"
 
         # Create notification panel
         notification_text = f"[{color}]{icon} {message}[/]"
@@ -2999,6 +3352,11 @@ class AgentTUI(App):
                 self._elapsed_start_time = None
         elif status == "paused":
             self.processing = False
+            # Clear the polite-waiting overlay — covers a /pause that took
+            # effect DURING a lock wait (the agent went PAUSED without
+            # acquiring, so no POLITE_ACQUIRED/IDLE event will clear it).
+            if self._polite_wait_elapsed is not None:
+                self._polite_wait_elapsed = None
             # Bell: cancel the pending timer and clear _armed so the
             # momentary IDLE emitted on resume (before the agent re-enters
             # processing) doesn't ring. When the turn actually resumes and
@@ -3198,7 +3556,10 @@ class AgentTUI(App):
         model_display = (
             f"{self.provider}/{compressed_model}" if self.provider else compressed_model
         )
-        left_side = f"{spinner} {status_text} | {model_display}{queue_info}".strip()
+        # Focus name (session identity; hidden when unset)
+        focus_name = self.agent._session_focus_name
+        focus_info = f" | focus: {focus_name}" if focus_name else ""
+        left_side = f"{spinner} {status_text} | {model_display}{focus_info}{queue_info}".strip()
         self._status_left.update(left_side)
 
         # Update right side (duration, context, mcp, tools, tps)
@@ -3218,13 +3579,15 @@ class AgentTUI(App):
         # Context (always shown, positioned after duration)
         ctx_str = f"Ctx: {total_str}"
 
-        # Turn count (hidden when zero); chain restarts prepended as "c:" when > 0
+        # Turn count: "trn: total:turn:turns" - session-lifetime compaction
+        # total (persists across saves), chain restarts THIS turn (resets per
+        # turn), turns in history. Hidden while both are zero (brand-new
+        # session), shown from the first turn/chain onward.
         turn_count = sum(1 for m in self.agent.messages if is_turn_start(m))
         chain_used = getattr(self.agent, "auto_context_chain_used", 0)
-        if chain_used > 0:
-            trn_str = f" | trn: {chain_used}:{turn_count}"
-        elif turn_count > 0:
-            trn_str = f" | trn: {turn_count}"
+        chain_total = getattr(self.agent, "chain_count", 0)
+        if chain_used > 0 or turn_count > 0:
+            trn_str = f" | trn: {chain_total}:{chain_used}:{turn_count}"
         else:
             trn_str = ""
         # MCP connection status (only show when connected)
@@ -3355,8 +3718,14 @@ class AgentTUI(App):
                 priority = False
                 message_text = text
 
-            # If message will be queued (agent busy), show queue pane
-            is_queued = self.processing or self.agent.queue.pending_count > 0
+            # If message will be queued (agent busy, or an MCP connect is in
+            # flight — the agent defers starting turns until it finishes),
+            # show queue pane so the user sees their message queued
+            is_queued = (
+                self.processing
+                or self.agent.queue.pending_count > 0
+                or (self.agent.mcp is not None and self.agent.mcp.connecting)
+            )
             if is_queued:
                 self.call_later(self._handle_queue_command)
 
@@ -3447,15 +3816,40 @@ class AgentTUI(App):
         elif command == "clear":
             arg = args.strip().lower()
             if arg == "all":
-                asyncio.create_task(self.agent.request_clear(mode="all"))
+                asyncio.create_task(
+                    self._write_system(
+                        "/clear all has moved: use /new_session "
+                        "(wipe history + display, start a new session)"
+                    )
+                )
             elif arg.isdigit():
-                keep = int(arg)
-                asyncio.create_task(self._clear_and_show_last_n(keep))
+                asyncio.create_task(
+                    self._write_system(
+                        f"/clear N has moved: use /rebuild {arg} "
+                        "(re-render the chat showing the last N turns)"
+                    )
+                )
             else:
                 # /clear with no args — pure UI operation, history untouched
                 asyncio.create_task(self._clear_chat_display())
         elif command == "rebuild":
-            asyncio.create_task(self._rebuild_chat())
+            arg = args.strip()
+            if arg.isdigit():
+                # Scoped re-render: clear display, show last N turns
+                asyncio.create_task(
+                    self._clear_and_show_last_n(int(arg))
+                )
+            elif arg:
+                asyncio.create_task(
+                    self._write_system("Usage: /rebuild [N] — N = turns to show")
+                )
+            else:
+                asyncio.create_task(self._rebuild_chat())
+        elif command == "new_session":
+            # Destructive: wipe history + display. The deferred clear
+            # dispatch (mode="all") also resets the session identity
+            # (compaction total + start time).
+            asyncio.create_task(self.agent.request_clear(mode="all"))
         elif command == "prompt":
             self._handle_prompt_command(args)
         elif command == "pretty":
@@ -3490,8 +3884,18 @@ class AgentTUI(App):
             self._handle_journal_command(args)
         elif command == "compact":
             self._handle_compact_command(args)
-        elif command == "remove-reasoning":
+        elif command == "wrapup":
+            self._handle_wrapup_command(args)
+        elif command == "focus":
+            self._handle_focus_command(args)
+        elif command == "chain":
+            self._handle_chain_command(args)
+        elif command == "remove-api-reasoning":
             self._handle_remove_reasoning_command(args)
+        elif command == "reasoning":
+            self._handle_collapse_command("reasoning", args)
+        elif command == "toolview":
+            self._handle_collapse_command("toolview", args)
         elif command == "devel":
             self._handle_devel_command(args)
         elif command == "save":
@@ -3518,6 +3922,8 @@ class AgentTUI(App):
             self._handle_auto_context_action_command(args)
         elif command == "auto_context_chain":
             self._handle_auto_context_chain_command(args)
+        elif command == "auto_context_nudge_cap":
+            self._handle_auto_context_nudge_cap_command(args)
         elif command in ("quit", "exit"):
             self.agent.stop(StopReason.QUIT)
             self.exit()
@@ -3536,6 +3942,9 @@ class AgentTUI(App):
                             self.agent.set_skills_mode(True)
                         if args:
                             content = f"{content}\n\n{args}"
+                        # Track for chain-restart re-injection (the content
+                        # as sent, user args included).
+                        self.agent.note_skill_loaded(command, content)
                         asyncio.create_task(self._send_message(content))
                     else:
                         self._update_info_content(
@@ -3715,9 +4124,9 @@ class AgentTUI(App):
             "  [yellow]/delete q N[/] - Delete queue item N\n"
             "  [yellow]/delete s NAME[/] - Delete saved context\n"
             "  [yellow]/clear[/] - Clear chat window (history preserved)\n"
-            "  [yellow]/clear N[/] - Clear chat window, show last N turns (history preserved)\n"
-            "  [yellow]/clear all[/] - Clear chat window AND wipe message history\n"
             "  [yellow]/rebuild[/] - Rebuild chat window from full message history\n"
+            "  [yellow]/rebuild N[/] - Rebuild chat window showing last N turns\n"
+            "  [yellow]/new_session[/] - Wipe message history + chat window, start a new session\n"
             "  [yellow]/prompt [name][/] - Switch system prompt (tab to list)\n"
             "  [yellow]/pretty [on|off][/] - Toggle markdown rendering\n"
             "  [yellow]/tool-response [raw|json][/] - Set tool response format\n"
@@ -3742,8 +4151,13 @@ class AgentTUI(App):
             "  [yellow]/journal [on|off|last|all|status][/] - Context compaction via reflection\n"
             "  [yellow]/compact [next-task focus][/] - Compact history, steered toward your next task\n"
             "  [yellow]/compact --prompt <name>[/] - Compact using a named prompt\n"
+            "  [yellow]/wrapup [name][/] - Update journal + current-truth files now, then idle (no compact); optional name = focus name\\n"
+            "  [yellow]/focus [name][/] - Set the focus name (no args shows current; on an empty history loads its records)\\n"
+            "  [yellow]/chain[/] - Restart the loop: wrap-up (if stale) → clear → inject records\\n"
             "\n[bold]Reasoning:[/]\n"
-            "  [yellow]/remove-reasoning [on|off][/] - Strip reasoning tokens between turns\n"
+            "  [yellow]/remove-api-reasoning [on|off][/] - Strip reasoning tokens between turns (API context)\n"
+            "  [yellow]/reasoning [hide|show|pin|unpin][/] - Fold the Thoughts/Reflection widgets (display)\n"
+            "  [yellow]/toolview [hide|show|pin|unpin][/] - Fold the tool call/result widgets (display)\n"
             "\n[bold]Spinner:[/]\n"
             "  [yellow]/spinner [fast|slow|off|status][/] - Spinner style and speed\n"
             "\n[bold]Updates:[/]\n"
@@ -3770,6 +4184,8 @@ class AgentTUI(App):
             "  [yellow]/auto_context_action[/] - Show current value\n"
             "  [yellow]/auto_context_chain N[/] - Restart the turn up to N times per turn after a compact\n"
             "  [yellow]/auto_context_chain[/] - Show current value\n"
+            "  [yellow]/auto_context_nudge_cap N[/] - Degeneration guard: stop after N consecutive cut-off/empty outputs (0 = off)\n"
+            "  [yellow]/auto_context_nudge_cap[/] - Show current value\n"
             "\n[bold]Keyboard shortcuts:[/]\n"
             "  [yellow]ESC[/] - Cancel request (use /resume to continue)\n"
             "  [yellow]Ctrl+C[/] - Clear input or quit\n"
@@ -3899,6 +4315,26 @@ class AgentTUI(App):
 
         # ── Build output (Rich markup) ──
         tools_str = f"{sd.tool_successes}/{sd.tool_calls}" if sd.tool_calls > 0 else "0"
+        focus_str = (
+            f"  focus: [yellow]{escape_markup(sd.focus_name)}[/]\n"
+            if sd.focus_name
+            else ""
+        )
+        # Session age: original start (persisted in saves, survives resume)
+        # + lifetime compaction total. Both reset only on /new_session.
+        session_age_str = ""
+        if sd.session_started_at:
+            try:
+                start_dt = datetime.fromisoformat(sd.session_started_at)
+                age = format_duration(time.time() - start_dt.timestamp())
+                session_age_str = (
+                    "  session started: "
+                    f"[yellow]{start_dt.strftime('%Y-%m-%d %H:%M')}[/]"
+                    f" ({age} ago)\n"
+                )
+            except (ValueError, OSError):
+                pass
+        chains_str = f"  total chains: [yellow]{sd.chain_count}[/]\n"
         sandbox_suffix = (
             f" (pinned: {sd.sandbox_pinned})" if sd.sandbox_pinned is not None else ""
         )
@@ -3912,7 +4348,10 @@ class AgentTUI(App):
             f"[bold]Session[/]\n"
             f"  status: [yellow]{sd.agent_status}[/]\n"
             f"  run time: [yellow]{sd.run_time}[/]\n"
+            f"{session_age_str}"
+            f"{chains_str}"
             f"  cwd: [yellow]{escape_markup(sd.cwd)}[/]\n"
+            f"{focus_str}"
             f"{last_turn_str}"
             f"{resumed_str}"
             f"{saves_str}"
@@ -3929,6 +4368,7 @@ class AgentTUI(App):
             f"  mcp: [yellow]{sd.mcp_status}[/]\n"
             f"\n[bold]Tools[/]\n"
             f"  success/calls: [yellow]{tools_str}[/]\n"
+            f"  bounded: [yellow]{sd.bounded_count}[/]\n"
             f"\n[bold]Settings[/]\n"
             f"  sandbox: [yellow]{escape_markup(sd.sandbox_mode + sandbox_suffix)}[/]\n"
             f"  pretty: [yellow]{'on' if self.pretty else 'off'}[/]\n"
@@ -3937,7 +4377,9 @@ class AgentTUI(App):
             f"  clipboard: [yellow]{self._clipboard_method}[/]\n"
             f"  bell: [yellow]{self._bell.status_text()}[/]\n"
             f"  bell-cmd: [yellow]{escape_markup(self._bell.command) if self._bell.command else '(terminal bell)'}[/]\n"
-            f"  remove-reasoning: [yellow]{'on' if sd.remove_reasoning else 'off'}[/]\n"
+            f"  remove-api-reasoning: [yellow]{'on' if sd.remove_reasoning else 'off'}[/]\n"
+            f"  reasoning widgets: [yellow]{'collapsed' if self._reasoning_collapsed else 'expanded'}[/]\n"
+            f"  tool widgets: [yellow]{'collapsed' if self._toolview_collapsed else 'expanded'}[/]\n"
             f"  devel: [yellow]{'on' if sd.devel_mode else 'off'}{devel_suffix}[/]\n"
             f"  skill tool: [yellow]{'on' if sd.skills_mode else 'off'}[/]\n"
             f"  journal: [yellow]{'on' if sd.journal_mode else 'off'}[/]\n"
@@ -3946,7 +4388,8 @@ class AgentTUI(App):
             f"[/]\n"
             f"  auto-action: [yellow]{sd.auto_context_action}[/]\n"
             f"  auto-chain: [yellow]{sd.auto_context_chain}[/]\n"
-            f"  chains: [yellow]{sd.auto_context_chain_used}/{sd.auto_context_chain}[/]"
+            f"  chains: [yellow]{sd.auto_context_chain_used}/{sd.auto_context_chain}[/]\n"
+            f"  nudges: [yellow]{sd.nudges}[/]"
         )
         self._info_pane_mode = "status"
 
@@ -3995,6 +4438,7 @@ class AgentTUI(App):
 
         name = args.strip()
         if self.prompt_manager.set_active(name):
+            self.agent.reload_agents_md()
             self.agent.set_system_prompt(self.prompt_manager.get_prompt())
             self._update_info_content(
                 f"[green]Switched to prompt: {escape_markup(name)}[/]"
@@ -4248,14 +4692,14 @@ class AgentTUI(App):
     def _handle_pause_command(self) -> None:
         """Handle /pause command - pause agent processing.
 
-        When the agent is actively processing (in the middle of tool calls),
-        this requests a pause at the next safe point and shows 'Pausing' status.
-        When the pause takes effect, status changes to 'paused'.
-
-        During polite wait (waiting for multi-agent lock), the agent is idle —
-        nothing is running — so we pause immediately via the same cancel-and-
-        restart path used by ESC-during-polite-wait. The queue item stays
-        pending so /resume re-enters the polite wait.
+        When the agent is actively processing (in the middle of tool calls,
+        including a polite multi-agent lock wait), this requests a pause at
+        the next safe point and shows 'Pausing' status. A lock wait IS a safe
+        point: acquire() notices the pause flag on its next poll tick and
+        backs off (PolitePauseRequested), so the agent goes PAUSED without
+        interrupting the turn — the queue item and history are untouched, and
+        /resume re-enters the lock wait. When the pause takes effect, status
+        changes to 'paused'.
         """
         if self.agent.is_paused:
             self._update_info_content("[yellow]Already paused[/]")
@@ -4265,13 +4709,10 @@ class AgentTUI(App):
             self._update_info_content("[yellow]Already pausing[/]")
             return
 
-        # Polite wait: nothing is running, so pause immediately.
-        if self._polite_wait_elapsed is not None:
-            asyncio.create_task(self._pause_during_polite_wait())
-            return
-
         if self.processing:
-            # Agent is actively processing - request pause at next safe point
+            # Agent is actively processing (turn in flight, or waiting on the
+            # polite lock - both report WAITING status) - request pause at
+            # the next safe point.
             self.agent.pause()
             self.update_status()  # Update status to show "pausing"
             self._update_info_content("[yellow]Pausing at next safe point...[/]")
@@ -4279,36 +4720,6 @@ class AgentTUI(App):
             # Agent is idle - pause immediately
             self.agent.stop()
             self._update_info_content("[yellow]Agent paused[/]")
-
-    async def _pause_during_polite_wait(self) -> None:
-        """Pause immediately while waiting for the polite lock.
-
-        Cancels the blocked acquire(), clears the polite overlay, and restarts
-        run() in PAUSING state so it blocks at the top-of-loop
-        _wait_if_paused(). The queue item stays pending (never pulled as
-        current) so /resume re-enters the polite wait.
-        """
-        if self._agent_task and not self._agent_task.done():
-            self._agent_task.cancel()
-            try:
-                await self._agent_task
-            except asyncio.CancelledError:
-                pass  # Expected
-
-        # Clear polite overlay
-        self._polite_wait_elapsed = None
-
-        # Restart the loop in paused state — item stays in queue.
-        self.agent._pause_on_start = True
-        self._agent_task = asyncio.create_task(self.agent.run())
-
-        self.update_status()
-        self._update_info_content(
-            "[yellow]Agent paused[/]\n"
-            "Queue item retained.\n"
-            "[green]/resume[/] to continue, "
-            "[red]/delete q N[/] to remove."
-        )
 
     def _handle_resume_command(self) -> None:
         """Handle /resume command - resume agent processing.
@@ -4576,10 +4987,15 @@ class AgentTUI(App):
                 return
 
             async def do_reload():
-                servers = await self.agent.mcp.reload()
-                self._update_info_content(
-                    f"[dim]MCP reconnected: {list(servers.keys())}[/]"
-                )
+                try:
+                    servers = await self.agent.mcp.reload()
+                    self._update_info_content(
+                        f"[dim]MCP reconnected: {list(servers.keys())}[/]"
+                    )
+                except Exception as e:
+                    self.post_message(ErrorMessage(f"MCP reload error: {e}", "mcp"))
+                finally:
+                    self.update_status()
 
             asyncio.create_task(do_reload())
 
@@ -4599,6 +5015,8 @@ class AgentTUI(App):
                         )
                 except Exception as e:
                     self.post_message(ErrorMessage(f"MCP connect error: {e}", "mcp"))
+                finally:
+                    self.update_status()
 
             asyncio.create_task(do_connect())
 
@@ -4830,38 +5248,125 @@ class AgentTUI(App):
             self.agent.add_message(
                 display,
                 kind="compact",
-                data={"compact_prompt": compact_prompt_text},
+                data={
+                    "compact_prompt": compact_prompt_text,
+                    "user_specified_prompt": bool(arg),
+                },
             )
         )
 
+    def _handle_wrapup_command(self, args: str = "") -> None:
+        """Handle /wrapup - run the wrap-up turn (journal + current-truth
+        files), then idle. No compaction; history stays intact.
+
+        Optional argument: the focus name (rest of line, may contain
+        spaces), which becomes the authoritative focus name for the
+        {focus} files even if it was never named in the conversation."""
+        arg = args.strip()
+        if arg:
+            asyncio.create_task(
+                self.agent.add_message(
+                    f"/wrapup {arg}",
+                    kind="wrapup",
+                    data={"focus_name": arg},
+                )
+            )
+        else:
+            asyncio.create_task(self.agent.add_message("/wrapup", kind="wrapup"))
+
+    def _handle_focus_command(self, args: str = "") -> None:
+        """Handle /focus - set the authoritative focus name immediately
+        (rest of line, may contain spaces). Not queued: the name must
+        land before a threshold-triggered wrap-up builds its prompt,
+        so record targeting follows a mid-turn /focus. On an empty
+        message history the focus's durable records are seeded into
+        the history; mid-session it is set-only. No arg: report the
+        current name. The result goes to the info pane (like the other
+        state-reporting commands), not a transient toast."""
+
+        async def _apply():
+            message, level = await self.agent.apply_focus_name(args.strip())
+            color = "green" if level == "info" else "yellow"
+            self._update_info_content(f"[{color}]{message}[/]")
+            # No status transition happens on this path (it is not a
+            # queue item), so refresh the status bar's focus segment
+            # explicitly - the periodic timer only runs during a session.
+            self.update_status()
+
+        asyncio.create_task(_apply())
+
+    def _handle_chain_command(self, args: str = "") -> None:
+        """Handle /chain - manual chain restart: wrap-up (if stale) →
+        clear history → inject records. No AI calls when the wrap-up is
+        already current.
+
+        Args:
+            args: "no-skills" (also accepted as --no-skills / no_skills)
+                drops manually-loaded skills from this restart AND forgets
+                them; they are one /skillname away if still needed.
+        """
+        no_skills = (
+            args.strip().lower().lstrip("-").replace("-", "").replace("_", "")
+            == "noskills"
+        )
+        data = {"no_skills": True} if no_skills else {}
+        asyncio.create_task(
+            self.agent.add_message("/chain", kind="chain", data=data)
+        )
+
     def _handle_remove_reasoning_command(self, args: str) -> None:
-        """Handle /remove-reasoning command - control reasoning token stripping."""
+        """Handle /remove-api-reasoning - strip reasoning from API context."""
         args = args.strip().lower()
         if args == "on":
             self.agent.remove_reasoning = True
             self._update_info_content(
-                "[green]Remove reasoning enabled[/]\n"
+                "[green]Remove API reasoning enabled[/]\n"
                 "Reasoning tokens will be stripped between turns to save context."
             )
         elif args == "off":
             self.agent.remove_reasoning = False
             self._update_info_content(
-                "[yellow]Remove reasoning disabled[/]\n"
+                "[yellow]Remove API reasoning disabled[/]\n"
                 "Reasoning tokens will be preserved between turns."
             )
         elif not args:
             # Toggle
             self.agent.remove_reasoning = not self.agent.remove_reasoning
             status = "on" if self.agent.remove_reasoning else "off"
-            self._update_info_content(f"Remove reasoning: {status}")
+            self._update_info_content(f"Remove API reasoning: {status}")
         else:
             status = "on" if self.agent.remove_reasoning else "off"
             self._update_info_content(
-                f"[red]Usage: /remove-reasoning [on|off][/]\n"
-                f"  [yellow]/remove-reasoning on[/] - Strip reasoning between turns\n"
-                f"  [yellow]/remove-reasoning off[/] - Preserve reasoning between turns\n"
+                f"[red]Usage: /remove-api-reasoning [on|off][/]\n"
+                f"  [yellow]/remove-api-reasoning on[/] - Strip reasoning "
+                f"between turns (API context)\n"
+                f"  [yellow]/remove-api-reasoning off[/] - Preserve reasoning "
+                f"between turns\n"
+                f"  To fold the widgets in the chat, use /reasoning hide\n"
                 f"  Current: {status}"
             )
+
+    def _handle_collapse_command(self, kind: str, args: str) -> None:
+        """Handle /reasoning and /toolview - fold a widget family (display)."""
+        from agent13.commands import execute_collapse
+
+        current = (
+            self._reasoning_collapsed
+            if kind == "reasoning"
+            else self._toolview_collapsed
+        )
+
+        def _set(value: bool) -> None:
+            if kind == "reasoning":
+                self._reasoning_collapsed = value
+            else:
+                self._toolview_collapsed = value
+
+        result = execute_collapse(kind, args, current, _set)
+        # Plain text from the shared command; escape it for the info pane.
+        message = escape_markup(result.message)
+        color = "green" if result.success else "red"
+        self._update_info_content(f"[{color}]{message}[/]")
 
     def _handle_devel_command(self, args: str) -> None:
         """Handle /devel command - toggle devel mode (show/hide devel-group tools)."""
@@ -5180,13 +5685,7 @@ class AgentTUI(App):
             return
 
         try:
-            val = args.lower()
-            if val.endswith("k"):
-                threshold = int(val[:-1]) * 1000
-            else:
-                threshold = int(val)
-            if threshold < 0:
-                raise ValueError("negative")
+            threshold = parse_token_count(args)
             self.agent.auto_context_threshold = threshold
             if threshold == 0:
                 self._update_info_content("[yellow]Auto-context: off[/]")
@@ -5227,6 +5726,47 @@ class AgentTUI(App):
                 "[red]Usage: /auto_context_chain N[/]\n"
                 "  [yellow]/auto_context_chain 2[/] - Restart the turn up to 2 times per turn\n"
                 "  [yellow]/auto_context_chain[/] - Show current value"
+            )
+
+    def _handle_auto_context_nudge_cap_command(self, args: str) -> None:
+        """Handle /auto_context_nudge_cap - set or show the degeneration guard cap.
+
+        /auto_context_nudge_cap N   - Set the cap to N (minimum 0; 0 = guard off)
+        /auto_context_nudge_cap     - Show current value
+        """
+        args = args.strip()
+        if not args:
+            cap = self.agent.auto_context_nudge_cap
+            if cap > 0:
+                self._update_info_content(
+                    f"[green]Degeneration guard: on (cap {cap})[/] "
+                    f"[dim](nudges: {self.agent.degenerate_nudges})[/]"
+                )
+            else:
+                self._update_info_content(
+                    "[green]Degeneration guard: off (nudge cap 0)[/]"
+                )
+            return
+
+        try:
+            nudge_cap = int(args)
+            if nudge_cap < 0:
+                raise ValueError("must be >= 0")
+            self.agent.auto_context_nudge_cap = nudge_cap
+            if nudge_cap == 0:
+                self._update_info_content(
+                    "[green]Degeneration guard: off (nudge cap 0)[/]"
+                )
+            else:
+                self._update_info_content(
+                    f"[green]Degeneration guard cap: {nudge_cap}[/]"
+                )
+        except ValueError:
+            self._update_info_content(
+                "[red]Usage: /auto_context_nudge_cap N[/]\n"
+                "  [yellow]/auto_context_nudge_cap 2[/] - Stop after 2 consecutive degenerate ends\n"
+                "  [yellow]/auto_context_nudge_cap 0[/] - Disable the guard\n"
+                "  [yellow]/auto_context_nudge_cap[/] - Show current value"
             )
 
     def _handle_auto_context_action_command(self, args: str) -> None:
@@ -5553,12 +6093,10 @@ class AgentTUI(App):
         # FIFO match: started events and complete events arrive in the same order.
         if self._pending_tool_widgets:
             widget = self._pending_tool_widgets.pop(0)
-            widget.update(
-                self._tool_call_markup(message.name, message.arguments, pending=False)
-            )
+            widget.set_call(message.name, message.arguments, message.seq)
             return
 
-        await self._write_tool_call(message.name, message.arguments)
+        await self._write_tool_call(message.name, message.arguments, message.seq)
 
     async def _handle_tool_call_started(self, message: ToolCallStartedMessage) -> None:
         """Process a tool-call-started message: show the tool name immediately.
@@ -5585,17 +6123,18 @@ class AgentTUI(App):
         # (parallel tool calls) must not be overwritten - mount a new one.
         if self._pending_tool_widgets:
             last = self._pending_tool_widgets[-1]
-            if getattr(last, "_pending_unknown", False):
-                last._pending_unknown = False
-                last.update(self._tool_call_markup(message.name, {}, pending=True))
+            if last.pending_unknown:
+                last.set_pending_name(message.name)
                 return
 
         was_at_bottom = self._is_at_bottom()
-        widget = Static(
-            self._tool_call_markup(message.name, {}, pending=True),
-            classes="tool-call",
-            markup=True,
+        widget = ToolWidget(
+            message.name,
+            collapsed=self._toolview_collapsed,
+            kind="call",
+            pending=True,
         )
+        widget.add_class("tool-call")
         if await self._safe_mount(widget):
             self._pending_tool_widgets.append(widget)
             await self._scroll_if_at_bottom(was_at_bottom)
@@ -5615,13 +6154,14 @@ class AgentTUI(App):
             return
 
         was_at_bottom = self._is_at_bottom()
-        widget = Static(
-            self._tool_call_markup("", {}, pending=True),
-            classes="tool-call",
-            markup=True,
+        widget = ToolWidget(
+            "",
+            collapsed=self._toolview_collapsed,
+            kind="call",
+            pending=True,
+            pending_unknown=True,
         )
-        # Mark as name-unknown so TOOL_CALL_STARTED upgrades it in place
-        widget._pending_unknown = True
+        widget.add_class("tool-call")
         if await self._safe_mount(widget):
             self._pending_tool_widgets.append(widget)
             await self._scroll_if_at_bottom(was_at_bottom)
@@ -5654,7 +6194,7 @@ class AgentTUI(App):
                     "token_count": self.tracker._token_count,
                 },
             )
-        await self._write_tool_result(message.name, message.result)
+        await self._write_tool_result(message.name, message.result, message.seq)
 
     async def _start_reasoning_stream(
         self, was_at_bottom: bool, first_token: str, title: str = "Thinking"
@@ -5669,7 +6209,7 @@ class AgentTUI(App):
             return
         # Widget is created with title pre-rendered
         self._streaming_reasoning_widget = ReasoningMessage(
-            title, collapsed=(title == "Reflecting")
+            title, collapsed=self._reasoning_collapsed
         )
         self._streaming_reasoning_widget.add_class("reasoning-message")
         if not await self._safe_mount(self._streaming_reasoning_widget):
@@ -5686,7 +6226,7 @@ class AgentTUI(App):
             # First meaningful token - create the widget with title pre-set
             was_at_bottom = self._is_at_bottom()
             self._streaming_reasoning_widget = ReasoningMessage(
-                title, collapsed=(title == "Reflecting")
+                title, collapsed=self._reasoning_collapsed
             )
             self._streaming_reasoning_widget.add_class("reasoning-message")
             if not await self._safe_mount(self._streaming_reasoning_widget):
@@ -5706,11 +6246,8 @@ class AgentTUI(App):
     async def _finalize_reasoning(self) -> None:
         """Finalize reasoning widget."""
         if self._streaming_reasoning_widget:
-            # Change "Reflecting" to "Reflection", "Thinking" to "Thoughts" when done
-            if self._streaming_reasoning_widget._title == "Reflecting":
-                self._streaming_reasoning_widget.set_title("Reflection")
-            elif self._streaming_reasoning_widget._title == "Thinking":
-                self._streaming_reasoning_widget.set_title("Thoughts")
+            # finalize() renames the header to its completed tense
+            # ("Thinking" -> "Thoughts", "Reflecting" -> "Reflection")
             await self._streaming_reasoning_widget.finalize()
             # Remove widget if it has no meaningful content (title is pre-rendered)
             content = getattr(self._streaming_reasoning_widget, "_content", "")

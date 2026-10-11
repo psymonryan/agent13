@@ -29,6 +29,16 @@ from ui.tui import (
 )
 
 
+def widget_text(widget) -> str:
+    """The widget's visible text: header markup plus the buffered body.
+
+    A ToolWidget is a CollapsibleMessage - the header and the body are child
+    widgets, so the container's own ``content`` is always empty.
+    """
+    header = widget._header.content if widget._header is not None else ""
+    return f"{header}\n{widget._content}"
+
+
 # =============================================================================
 # LLM layer: buffered provider stream
 # =============================================================================
@@ -187,25 +197,27 @@ class TestTUIPlaceholderWidget:
             # 1. Buffered tool call detected (name unknown) -> "⚙ …" placeholder
             tui.post_message(ToolCallPendingMessage())
             await _wait_for(pilot, lambda: len(tool_call_widgets()) == 1)
-            assert tool_call_widgets()[0].content == "[dim]⚙ …[/]"
+            assert tool_call_widgets()[0]._header.content == "[dim]⚙ …[/] ▶", (
+                "tool widgets mount folded by default (▶ = click to open)"
+            )
 
             # 2. Name becomes known -> SAME widget updated in place
             tui.post_message(ToolCallStartedMessage("write_file"))
             await _wait_for(
-                pilot, lambda: "write_file" in tool_call_widgets()[0].content
+                pilot, lambda: "write_file" in widget_text(tool_call_widgets()[0])
             )
             assert len(tool_call_widgets()) == 1, (
                 "upgrade must not duplicate the widget"
             )
-            assert "…" in tool_call_widgets()[0].content
+            assert "…" in widget_text(tool_call_widgets()[0])
 
             # 3. Args complete -> SAME widget finalized with args
             tui.post_message(ToolCallMessage("write_file", {"path": "big.txt"}))
-            await _wait_for(pilot, lambda: "big.txt" in tool_call_widgets()[0].content)
+            await _wait_for(pilot, lambda: "big.txt" in widget_text(tool_call_widgets()[0]))
             assert len(tool_call_widgets()) == 1, (
                 "finalize must not duplicate the widget"
             )
-            assert "…" not in tool_call_widgets()[0].content
+            assert "…" not in widget_text(tool_call_widgets()[0])
 
     @pytest.mark.asyncio
     async def test_placeholder_discarded_when_content_arrives(self, tui):
@@ -270,17 +282,17 @@ class TestTUIPlaceholderWidget:
             # 2. First tool name -> upgrades the placeholder in place
             tui.post_message(ToolCallStartedMessage("write_file"))
             await _wait_for(
-                pilot, lambda: "write_file" in tool_call_widgets()[0].content
+                pilot, lambda: "write_file" in widget_text(tool_call_widgets()[0])
             )
             assert len(tool_call_widgets()) == 1
 
             # 3. Second tool name (parallel call) -> NEW widget, first intact
             tui.post_message(ToolCallStartedMessage("read_file"))
             await _wait_for(pilot, lambda: len(tool_call_widgets()) == 2)
-            assert "write_file" in tool_call_widgets()[0].content, (
+            assert "write_file" in widget_text(tool_call_widgets()[0]), (
                 "first named widget must not be overwritten by the second call"
             )
-            assert "read_file" in tool_call_widgets()[1].content
+            assert "read_file" in widget_text(tool_call_widgets()[1])
 
             # 4. Both complete -> each finalized in FIFO order, no duplicates
             tui.post_message(ToolCallMessage("write_file", {"path": "a.txt"}))
@@ -289,8 +301,8 @@ class TestTUIPlaceholderWidget:
                 pilot,
                 lambda: (
                     len(tool_call_widgets()) == 2
-                    and "a.txt" in tool_call_widgets()[0].content
-                    and "b.txt" in tool_call_widgets()[1].content
+                    and "a.txt" in widget_text(tool_call_widgets()[0])
+                    and "b.txt" in widget_text(tool_call_widgets()[1])
                 ),
             )
 
@@ -323,15 +335,17 @@ class TestTUIPlaceholderWidget:
             # 3. Second silence (tool call buffering) -> placeholder AGAIN
             tui.post_message(ToolCallPendingMessage())
             await _wait_for(pilot, lambda: len(tool_call_widgets()) == 1)
-            assert tool_call_widgets()[0].content == "[dim]⚙ …[/]"
+            assert tool_call_widgets()[0]._header.content == "[dim]⚙ …[/] ▶", (
+                "tool widgets mount folded by default (▶ = click to open)"
+            )
 
             # 4. Tool call lands -> finalizes the second placeholder in place
             tui.post_message(ToolCallMessage("write_file", {"path": "essay.txt"}))
             await _wait_for(
                 pilot,
                 lambda: (
-                    "essay.txt" in tool_call_widgets()[0].content
-                    and "…" not in tool_call_widgets()[0].content
+                    "essay.txt" in widget_text(tool_call_widgets()[0])
+                    and "…" not in widget_text(tool_call_widgets()[0])
                 ),
             )
             assert len(tool_call_widgets()) == 1

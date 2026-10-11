@@ -22,9 +22,11 @@ import datetime
 import io
 import re
 import sys
+import time
 from contextlib import ExitStack
 from unittest.mock import patch, MagicMock
 
+from agent13.durable_records import DurableRecords
 from agent13.queue import AgentQueue
 
 
@@ -109,6 +111,9 @@ class MockAgent:
         self._calls = []
         self.available_models = []
         self.model = kwargs.get("model", "test-model")
+        # Opt-in: flip PROCESSING -> IDLE this many seconds after add_message
+        # (for testing EOF-during-busy-turn drain behaviour).
+        self._idle_after = kwargs.get("idle_after")
         self.session_date = datetime.date.today().isoformat()
         # Provide pause_state and status like real Agent
         from agent13.core import PauseState, AgentStatus
@@ -122,9 +127,18 @@ class MockAgent:
         self.tool_stats = type(
             "ToolStats",
             (),
-            {"total_successes": 0, "total_calls": 0, "calls": {}, "successes": {}},
+            {
+                "total_successes": 0,
+                "total_calls": 0,
+                "calls": {},
+                "successes": {},
+                "bounded": 0,
+            },
         )()
         self._incomplete_turn_loaded = False
+        # The REAL record object (not a hand-mirror): /status and the
+        # persistence path read focus state through it.
+        self.durable_records = DurableRecords()
         self.journal_mode = False
         self.devel_mode = False
         self.skills_mode = False
@@ -134,6 +148,13 @@ class MockAgent:
         self.auto_context_chain = 3
         self.auto_context_chain_used = 0
         self._mcp_server_configs = {}
+
+    def set_focus_name(self, name):
+        self.durable_records.set_focus_name(name)
+
+    @property
+    def _session_focus_name(self):
+        return self.durable_records.name
 
     @property
     def has_incomplete_turn(self) -> bool:
@@ -175,12 +196,20 @@ class MockAgent:
         from agent13.core import AgentStatus
 
         self.status = AgentStatus.PROCESSING
+        if self._idle_after is not None:
+            asyncio.get_running_loop().call_later(
+                self._idle_after,
+                lambda: setattr(self, "status", AgentStatus.IDLE),
+            )
 
     def clear_messages(self):
         self._calls.append(("clear_messages",))
         count = len(self.messages)
         self.messages.clear()
         return count
+
+    def reset_session_counters(self):
+        self._calls.append(("reset_session_counters",))
 
     async def request_clear(self, mode="all", keep_turns=0):
         self._calls.append(("request_clear", mode, keep_turns))
@@ -266,10 +295,12 @@ async def run_scenario(inputs, prompt_manager=None, agent_config=None):
     """
     feeder = InputFeeder(inputs)
     created_agents = []
+    stdin_close_mock = MagicMock(name="stdin_close")
 
     def capture_agent(*args, **kwargs):
         agent = MockAgent()
         created_agents.append(agent)
+        agent.stdin_close = stdin_close_mock
         if agent_config is not None:
             agent_config(agent)
         return agent
@@ -291,6 +322,10 @@ async def run_scenario(inputs, prompt_manager=None, agent_config=None):
         stack.enter_context(
             patch.object(sys.stdin, "readline", side_effect=feeder.do_stdin_readline)
         )
+        # run_repl closes sys.stdin at teardown (unblocks a parked stdin
+        # worker so executor shutdown can't hang exit) — mock it so the
+        # test process's real stdin is left alone.
+        stack.enter_context(patch.object(sys.stdin, "close", stdin_close_mock))
         stack.enter_context(patch("sys.stdout", captured_stdout))
         stack.enter_context(patch("readline.read_history_file"))
         stack.enter_context(patch("readline.set_history_length"))
@@ -667,7 +702,60 @@ class TestEOF:
         assert "Traceback" not in output
 
 
-# ── Feature: /clear command ────────────────────────────────────────
+# ── Feature: EOF during a busy turn (drain, don't cancel) ────────────────────
+
+
+class TestEOFDuringBusyTurn:
+    """stdin EOF must not cancel a running turn — finish it, then exit.
+
+    Windows regression: a (spurious or real) EOF seen by the streaming-mode
+    stdin worker used to map straight to /quit -> agent_task.cancel(),
+    killing the in-flight turn. See docs_archive burn-scar notes.
+    """
+
+    async def test_eof_streaming_drains_busy_turn(self):
+        """EOF in streaming mode while the agent is busy — drain, then exit."""
+        t0 = time.monotonic()
+        output, agent = await run_scenario(
+            ["hello", EOF],
+            agent_config=lambda a: a.__setattr__("_idle_after", 0.4),
+        )
+        elapsed = time.monotonic() - t0
+
+        assert "waiting for the current turn to finish" in output
+        assert "Goodbye!" in output
+        assert "Traceback" not in output
+        # The drain actually waited for the turn (idle_after=0.4s).
+        assert elapsed >= 0.3, f"drain returned too fast ({elapsed:.2f}s)"
+
+    async def test_eof_input_mode_drains_busy_turn(self):
+        """EOF via input() (EOFError path) while busy — drain, then exit."""
+        output, agent = await run_scenario(
+            ["hello", "", EOF],
+            agent_config=lambda a: a.__setattr__("_idle_after", 0.4),
+        )
+
+        assert "waiting for the current turn to finish" in output
+        assert "EOF — exiting" in output
+        assert "Goodbye!" in output
+        assert "Traceback" not in output
+
+    async def test_eof_idle_no_drain(self):
+        """EOF while idle — exits immediately, no drain notice."""
+        output, agent = await run_scenario([EOF])
+
+        assert "waiting for the current turn to finish" not in output
+        assert "Goodbye!" in output
+
+    async def test_exit_closes_stdin(self):
+        """Teardown closes sys.stdin — releases a parked stdin worker so
+        asyncio.run()'s executor-shutdown join can't hang the process."""
+        output, agent = await run_scenario(["/quit"])
+
+        assert agent.stdin_close.called
+
+
+# ── Feature: /clear command ───────────────────────────────────────────────────
 
 
 class TestClearCommand:
@@ -698,12 +786,21 @@ class TestClearCommand:
         assert "History preserved" in output
 
     async def test_clear_all(self):
-        """/clear all — clears history in REPL."""
+        """/clear all — moved: prints a hint pointing at /new_session."""
         output, agent = await run_scenario(["/clear all", "/quit"])
 
         call = find_call(agent, "clear_messages")
+        assert call is None
+        assert "has moved" in output
+
+    async def test_new_session_idle(self):
+        """/new_session when idle — wipes history + resets session counters."""
+        output, agent = await run_scenario(["/new_session", "/quit"])
+
+        call = find_call(agent, "clear_messages")
         assert call is not None
-        assert "Cleared 0" in output
+        assert find_call(agent, "reset_session_counters") is not None
+        assert "New session" in output
 
 
 # ── Feature: /history command ──────────────────────────────────────
@@ -964,11 +1061,38 @@ class TestStatusCommand:
 
         assert re.search(r"auto-context:\s+off", output)
 
+    async def test_threshold_accepts_k_suffix(self):
+        """/auto_context_threshold 150k sets 150000 (shared parser with CLI)."""
+        output, agent = await run_scenario(
+            ["/auto_context_threshold 150k", "/quit"]
+        )
+
+        assert agent.auto_context_threshold == 150000
+        assert "Auto-context: on (150,000 tokens)" in output
+
     async def test_status_shows_mcp(self):
         """/status shows MCP connectivity status."""
         output, agent = await run_scenario(["/status", "/quit"])
 
         assert "mcp:" in output
+
+    async def test_status_shows_focus_when_set(self):
+        """/status shows the focus name when the agent has a focus set."""
+
+        def set_focus(agent):
+            agent.set_focus_name("auto_context")
+
+        output, agent = await run_scenario(
+            ["/status", "/quit"], agent_config=set_focus
+        )
+
+        assert re.search(r"focus:\s+auto_context", output)
+
+    async def test_status_hides_focus_when_unset(self):
+        """/status omits the focus line when no focus is set."""
+        output, agent = await run_scenario(["/status", "/quit"])
+
+        assert "focus:" not in output
 
     async def test_status_shows_tokens(self):
         """/status shows token counts."""
@@ -1200,6 +1324,8 @@ async def run_scenario_persistence(inputs, tmp_path):
         stack.enter_context(
             patch.object(sys.stdin, "readline", side_effect=feeder.do_stdin_readline)
         )
+        stdin_close_mock = MagicMock(name="stdin_close")
+        stack.enter_context(patch.object(sys.stdin, "close", stdin_close_mock))
         stack.enter_context(patch("sys.stdout", captured_stdout))
         stack.enter_context(patch("readline.read_history_file"))
         stack.enter_context(patch("readline.set_history_length"))
@@ -1533,6 +1659,8 @@ async def run_scenario_with_models(inputs, model_names):
         stack.enter_context(
             patch.object(sys.stdin, "readline", side_effect=feeder.do_stdin_readline)
         )
+        stdin_close_mock = MagicMock(name="stdin_close")
+        stack.enter_context(patch.object(sys.stdin, "close", stdin_close_mock))
         stack.enter_context(patch("sys.stdout", captured_stdout))
         stack.enter_context(patch("readline.read_history_file"))
         stack.enter_context(patch("readline.set_history_length"))
@@ -1676,6 +1804,8 @@ async def run_scenario_with_provider_patches(inputs, provider_side_effect=None):
         stack.enter_context(
             patch.object(sys.stdin, "readline", side_effect=feeder.do_stdin_readline)
         )
+        stdin_close_mock = MagicMock(name="stdin_close")
+        stack.enter_context(patch.object(sys.stdin, "close", stdin_close_mock))
         stack.enter_context(patch("sys.stdout", captured_stdout))
         stack.enter_context(patch("readline.read_history_file"))
         stack.enter_context(patch("readline.set_history_length"))
@@ -1787,6 +1917,8 @@ class TestProviderCommand:
                     sys.stdin, "readline", side_effect=feeder.do_stdin_readline
                 )
             )
+            stdin_close_mock = MagicMock(name="stdin_close")
+            stack.enter_context(patch.object(sys.stdin, "close", stdin_close_mock))
             stack.enter_context(patch("sys.stdout", captured_stdout))
             stack.enter_context(patch("readline.read_history_file"))
             stack.enter_context(patch("readline.set_history_length"))
@@ -2091,6 +2223,8 @@ class TestMcpCommand:
                     sys.stdin, "readline", side_effect=feeder.do_stdin_readline
                 )
             )
+            stdin_close_mock = MagicMock(name="stdin_close")
+            stack.enter_context(patch.object(sys.stdin, "close", stdin_close_mock))
             stack.enter_context(patch("sys.stdout", captured_stdout))
             stack.enter_context(patch("readline.read_history_file"))
             stack.enter_context(patch("readline.set_history_length"))

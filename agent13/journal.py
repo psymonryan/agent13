@@ -388,9 +388,12 @@ class JournalManager:
                 source="reflection",
                 tool_choice="auto",
             ):
-                if event_type in ("tool_call", "tool_calls_complete"):
-                    continue
-                if data:
+                # Only text payloads become reasoning tokens. Control events
+                # ("finish" -> {"finish_reason": ...}, "keepalive" -> {})
+                # carry dict payloads; emitting one as ASSISTANT_REASONING
+                # "text" hands the UI a dict where it concatenates strings
+                # (TypeError: can only concatenate str (not "dict") to str).
+                if event_type in ("reasoning", "content") and data:
                     await self._emit(
                         AgentEvent.ASSISTANT_REASONING,
                         {

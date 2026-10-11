@@ -26,16 +26,21 @@ Transport cases:
         -EncodedCommand, so the ~3KB command-line cap on 5.1 does not
         apply. $LASTEXITCODE from native exes is propagated.
 
-Remote shell auto-detect (one probe per host, session-cached):
+Remote shell auto-detect (probed once per host, session-cached):
     ssh host uname
-    non-empty stdout => POSIX; empty/error => Windows (PowerShell).
+        succeeds => POSIX.
+    ssh host powershell -NoProfile -NonInteractive -Command exit 0
+        succeeds => Windows (PowerShell).
+    both fail => unknown: raise (unreachable host, ssh missing, auth) and
+        do NOT cache, so the next call retries. A failed probe is never
+        treated as a positive verdict for the other OS.
 """
 
 import asyncio
 import base64
 from typing import Optional
 
-from agent13.sandbox import _SUBPROCESS_ENCODING, _kill_process_tree
+from agent13.sandbox import _decode_output, _kill_process_tree
 
 # Session cache: host -> "posix" | "powershell"
 _remote_shell_cache: dict[str, str] = {}
@@ -98,9 +103,16 @@ def _validate_remote_shell(shell: Optional[str]) -> Optional[str]:
 async def detect_remote_shell(host: str) -> str:
     """Detect the remote shell: 'posix' or 'powershell'.
 
-    Probe: ``ssh host uname`` — non-empty stdout means a POSIX box;
-    empty/error means Windows (uname is not a command there).
-    Cached per host for the session.
+    Probes are positive-only — a failed probe never implies the other OS
+    (a busy host, a 15s timeout, or an auth hiccup on ``uname`` must not
+    be read as "this is Windows"):
+    - ``uname`` succeeds (non-empty stdout) => posix
+    - ``uname`` fails, but ``powershell -NoProfile -NonInteractive -Command
+      exit 0`` succeeds => powershell
+    - both fail => unknown: raise ValueError and do NOT cache, so a
+      transient failure self-heals on the next call.
+
+    Only confirmed verdicts are cached per host for the session.
     """
     if host in _remote_shell_cache:
         return _remote_shell_cache[host]
@@ -109,9 +121,39 @@ async def detect_remote_shell(host: str) -> str:
     if result["exit_code"] == 0 and result["stdout"].strip():
         shell = "posix"
     else:
-        shell = "powershell"
+        ps = await _run_ssh_probe(
+            host, "powershell -NoProfile -NonInteractive -Command exit 0",
+            timeout=15,
+        )
+        if ps["exit_code"] == 0:
+            shell = "powershell"
+        else:
+            raise ValueError(
+                f"Cannot detect the remote shell for {host}: both the uname "
+                f"and powershell probes failed "
+                f"({result['stderr'].strip() or 'no output'}; "
+                f"{ps['stderr'].strip() or 'no output'}). "
+                "If the host is reachable, pass remote_shell='posix' or "
+                "remote_shell='powershell' to skip auto-detect."
+            )
     _remote_shell_cache[host] = shell
     return shell
+
+
+async def resolve_remote_shell(
+    host: str, remote_shell: Optional[str] = None
+) -> str:
+    """Resolve the remote shell for a host.
+
+    An explicit override ('posix'/'powershell') wins without probing;
+    None/'auto' triggers auto-detect (probed once per host, session-cached).
+    Raises ValueError for an invalid override or when auto-detect cannot
+    decide.
+    """
+    forced = _validate_remote_shell(remote_shell)
+    if forced is not None:
+        return forced
+    return await detect_remote_shell(host)
 
 
 def build_remote_argv(
@@ -121,8 +163,9 @@ def build_remote_argv(
 
     The model's command is base64-encoded and shipped on ssh's stdin; the
     remote side decodes it and runs it through a fixed safe template
-    (``sh -s`` for POSIX, ``powershell -Command -`` for Windows). No layer
-    ever parses the payload — the base64 alphabet is inert to every shell.
+    (``sh -s`` for POSIX, a temp ``.ps1`` + ``powershell -File`` for
+    Windows). No layer ever parses the payload — the base64 alphabet is
+    inert to every shell.
 
     Args:
         host: ssh target (user@host or host)
@@ -154,25 +197,44 @@ def build_remote_argv(
         # block and hit the timeout, same as the local tool.
         remote_cmd = 'b64=$(cat); printf %s "$b64" | base64 -d | sh -s'
     else:
-        # PowerShell hop: decode base64 (UTF-8) on the remote side and
-        # pipe it into powershell -Command - (reads script from stdin).
-        # No temp file, no -EncodedCommand (so the ~3KB command-line
-        # cap on 5.1 does not apply). $LASTEXITCODE from native exes
-        # is propagated via the epilogue.
+        # PowerShell hop: decode base64 (UTF-8) on the remote side, write
+        # the script to a temp .ps1, and run it with `powershell -File`.
+        # No -EncodedCommand (so the ~3KB command-line cap on 5.1 does not
+        # apply). $LASTEXITCODE from native exes is propagated via the
+        # epilogue.
         #
-        #   [Console]::In.ReadToEnd() -> read all of stdin (base64)
-        #   [Convert]::FromBase64String -> bytes
-        #   [Text.Encoding]::UTF8.GetString -> script text
-        #   powershell -Command -     -> reads script from stdin
+        #   [Console]::In.ReadToEnd() -> read ALL of stdin (base64)
+        #   [Convert]::FromBase64String -> script bytes
+        #   [IO.File]::WriteAllBytes   -> temp .ps1 (unique GUID name)
+        #   powershell -File <temp>    -> runs the script from the FILE
+        #
+        # Why a temp file, not `powershell -Command -` (stdin pipe)? The
+        # stdin-pipe form is racy: the inner powershell reads its script
+        # from the pipe, and a child it spawns (e.g. csc.exe from Add-Type)
+        # inherits that same pipe and can steal bytes, truncating the
+        # script -> empty/partial stdout with exit 0 (intermittent, worse
+        # the longer the script). With -File the script is read from disk,
+        # and stdin is already drained to EOF by ReadToEnd() before the
+        # inner powershell starts, so no child can steal script bytes.
+        # Matches the detach (job) delivery path.
         #
         # The outer powershell is the fixed safe template; the inner
         # powershell runs the model's script. $LASTEXITCODE from the
         # inner process (native exes) is captured and propagated.
         remote_cmd = (
             "$b64 = [Console]::In.ReadToEnd().Trim(); "
-            "$text = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($b64)); "
-            "$rc = 0; $text | powershell -NoProfile -NonInteractive -Command -; "
+            "$bytes = [Convert]::FromBase64String($b64); "
+            "$dir = Join-Path $env:TEMP 'agent13-run'; "
+            "New-Item -ItemType Directory -Force -Path $dir | Out-Null; "
+            "Get-ChildItem -LiteralPath $dir -File -ErrorAction SilentlyContinue | "
+            "Where-Object { $_.LastWriteTime -lt (Get-Date).AddHours(-1) } | "
+            "Remove-Item -Force -ErrorAction SilentlyContinue; "
+            "$f = Join-Path $dir ([guid]::NewGuid().ToString('N') + '.ps1'); "
+            "[IO.File]::WriteAllBytes($f, $bytes); "
+            "$rc = 0; "
+            "powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"$f\"; "
             "$rc = $LASTEXITCODE; if ($null -eq $rc) { $rc = 0 }; "
+            "Remove-Item -LiteralPath $f -Force -ErrorAction SilentlyContinue; "
             "exit $rc"
         )
 
@@ -228,8 +290,8 @@ async def _run_ssh_probe(host: str, remote_cmd: str, timeout: float) -> dict:
     return {
         "success": process.returncode == 0,
         "exit_code": process.returncode,
-        "stdout": stdout_b.decode(_SUBPROCESS_ENCODING, errors="replace"),
-        "stderr": stderr_b.decode(_SUBPROCESS_ENCODING, errors="replace"),
+        "stdout": _decode_output(stdout_b),
+        "stderr": _decode_output(stderr_b),
     }
 
 
@@ -244,8 +306,8 @@ async def run_remote_command(
 
     The script is base64-encoded locally and shipped on ssh's stdin. The
     remote side (fixed safe template) decodes it and runs it with ``sh -s``
-    (POSIX) or ``powershell -Command -`` (Windows). Exit code, stdout and
-    stderr come back verbatim.
+    (POSIX) or a temp ``.ps1`` + ``powershell -File`` (Windows). Exit code,
+    stdout and stderr come back verbatim.
 
     Args:
         host: ssh target (user@host or host; no flags)
@@ -259,13 +321,8 @@ async def run_remote_command(
         remote (host), remote_shell (resolved).
     """
     host = _validate_host(host)
-    forced = _validate_remote_shell(remote_shell)
-
-    # Resolve the remote shell (probe once per host, session-cached)
-    if forced is not None:
-        shell = forced
-    else:
-        shell = await detect_remote_shell(host)
+    # Resolve the remote shell (override wins; else probe once, cached)
+    shell = await resolve_remote_shell(host, remote_shell)
 
     # Normalize line endings for Windows: PowerShell is CRLF-oriented, so
     # make the payload deterministic before encoding (spec item 3).
@@ -346,8 +403,8 @@ async def run_remote_command(
         except asyncio.TimeoutError:
             await _kill_process_tree(process)
 
-        stdout = b"".join(chunks_out).decode(_SUBPROCESS_ENCODING, errors="replace")
-        stderr = b"".join(chunks_err).decode(_SUBPROCESS_ENCODING, errors="replace")
+        stdout = _decode_output(b"".join(chunks_out))
+        stderr = _decode_output(b"".join(chunks_err))
 
         if timed_out:
             return _remote_timeout_result(

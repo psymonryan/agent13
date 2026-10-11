@@ -59,11 +59,33 @@ threshold = 180000
 # action = "none". Change at runtime with: /auto_context_chain N
 # chain = 3
 
+# Tool output bounding
+# Tool results are the dominant unbounded source of context growth. A result
+# whose text exceeds max_result_chars is spilled: the FULL text is written to
+# a file under the OS temp dir (agent13_tool_output/), and the model receives
+# the first 15,000 chars + a marker + the last 15,000 chars. The marker names
+# the spill file - read the middle back with read_file (line numbers map 1:1
+# onto read_file's offset/limit). A per-tool override can be declared on the
+# tool function (@tool(max_result_chars=...)) and wins over this global cap.
+# Set to 0 to disable bounding entirely.
+[tools]
+max_result_chars = 30000
+
 # UI settings
 # cursor_blink = false  → solid cursor, no periodic terminal output (default, tmux-friendly)
 # cursor_blink = true   → blinking cursor (causes periodic output, triggers tmux activity)
+# reasoning_collapsed = true → reasoning blocks (Thoughts / Reflection) start
+#   folded to a one-line header; click the header to expand.
+# toolview_collapsed = true  → tool call + result widgets start folded to a
+#   one-line header (⚙ name / ✓ name); click to expand args and result.
+# Both are DISPLAY settings - to stop reasoning tokens being sent to the API
+# at all, use --remove-api-reasoning / /remove-api-reasoning.
+# Change at runtime with: /reasoning hide|show|pin|unpin
+#                         /toolview hide|show|pin|unpin
 [ui]
 cursor_blink = false
+reasoning_collapsed = true
+toolview_collapsed = true
 
 # Vision support — lets the agent "see" images returned by tools.
 # Uncomment and configure to enable.

@@ -5,12 +5,14 @@ import time
 from enum import Enum
 from unittest import mock
 
+import pytest
 
 from agent13.status import (
     StatusData,
     format_duration,
     fmt_tokens,
     gather_status,
+    parse_token_count,
     toggle_enum,
     get_tool_stats_summary,
 )
@@ -22,9 +24,10 @@ from agent13.status import (
 class MockToolStats:
     """Minimal tool stats mock."""
 
-    def __init__(self, successes=0, calls=0):
+    def __init__(self, successes=0, calls=0, bounded=0):
         self.total_successes = successes
         self.total_calls = calls
+        self.bounded = bounded
 
 
 class MockMCP:
@@ -64,6 +67,11 @@ class MockAgent:
         )
         self.auto_context_chain = kwargs.get("auto_context_chain", 3)
         self.auto_context_chain_used = kwargs.get("auto_context_chain_used", 0)
+        self._focus = kwargs.get("focus_name", "")
+
+    @property
+    def _session_focus_name(self):
+        return self._focus
 
     @property
     def status(self):
@@ -145,6 +153,37 @@ class TestFmtTokens:
         assert fmt_tokens(1234567) == "1234.6k"
 
 
+# ── parse_token_count tests ──────────────────────────────────────────────────
+
+
+class TestParseTokenCount:
+    """Tests for parse_token_count() - the k-suffix inverse of fmt_tokens.
+
+    Shared by the --auto-context-threshold CLI flag and the
+    /auto_context_threshold slash command (TUI + REPL).
+    """
+
+    def test_plain_number(self):
+        assert parse_token_count("150000") == 150000
+
+    def test_k_suffix(self):
+        assert parse_token_count("150k") == 150000
+
+    def test_k_suffix_uppercase(self):
+        assert parse_token_count("150K") == 150000
+
+    def test_zero(self):
+        assert parse_token_count("0") == 0
+
+    def test_whitespace_tolerated(self):
+        assert parse_token_count(" 200k ") == 200000
+
+    @pytest.mark.parametrize("bad", ["", "k", "1.5k", "abc", "15kk", "-5"])
+    def test_invalid_raises(self, bad):
+        with pytest.raises(ValueError):
+            parse_token_count(bad)
+
+
 # ── gather_status tests ──
 
 
@@ -162,6 +201,11 @@ class TestGatherStatus:
         assert sd.model == "test-model"
         assert sd.message_count == 0
         assert sd.queue_count == 0
+
+    def test_bounded_count(self):
+        agent = self._make_agent(tool_stats=MockToolStats(bounded=3))
+        sd = gather_status(agent, "p", "m", time.time())
+        assert sd.bounded_count == 3
 
     def test_pausing_status(self):
         agent = self._make_agent(is_pausing=True)
@@ -195,6 +239,31 @@ class TestGatherStatus:
         agent = self._make_agent()
         sd = gather_status(agent, "p", "m", time.time())
         assert sd.cwd == os.getcwd()
+
+    def test_focus_name_gathered(self):
+        agent = self._make_agent(focus_name="auto_context")
+        sd = gather_status(agent, "p", "m", time.time())
+        assert sd.focus_name == "auto_context"
+
+    def test_focus_name_default_empty(self):
+        agent = self._make_agent()
+        sd = gather_status(agent, "p", "m", time.time())
+        assert sd.focus_name == ""
+
+    def test_chain_count_gathered(self):
+        agent = self._make_agent()
+        agent.chain_count = 20
+        agent.session_started_at = "2026-09-21T14:32:00"
+        sd = gather_status(agent, "p", "m", time.time())
+        assert sd.chain_count == 20
+        assert sd.session_started_at == "2026-09-21T14:32:00"
+
+    def test_chain_count_defaults_when_agent_lacks_attrs(self):
+        """Old-style/stub agents without the properties gather as 0/empty."""
+        agent = self._make_agent()
+        sd = gather_status(agent, "p", "m", time.time())
+        assert sd.chain_count == 0
+        assert sd.session_started_at == ""
 
     def test_tracker_tokens(self):
         tracker = MockTracker(prompt_tokens=5000, completion_tokens=3000)

@@ -26,8 +26,22 @@ PRIMING_RESPONSE = "ok"
 
 # Injected as a user message after an auto-context compact so the model resumes
 # the in-progress turn (finishing the original task) instead of stopping.
+# Fallback nudge: used when the turn carries no captured user instruction
+# (e.g. manual /chain while idle).
 AUTO_CONTEXT_CONTINUE_HINT = (
     "[Context was compacted to fit. Continue work on the outstanding items.]"
+)
+# Nudge used when the turn carries a captured user instruction: the turn-start
+# user message, re-injected VERBATIM at every mechanical restart of the turn.
+# The user's standing instruction is the intent source across chains - the
+# system no longer commands a default (the former "continue on the top
+# unblocked ticket" intro line is gone). A mid-turn question survives its
+# restart this way instead of being wiped by clear_messages().
+AUTO_CONTEXT_CARRY_HINT = (
+    "[Context was compacted mid-turn. Your standing instruction for this "
+    "run, verbatim:\n"
+    '"{instruction}"\n'
+    "Continue it.]"
 )
 # Appended by core._run_auto_context_post_turn when the wrap-up captured the
 # paths: the current-truth file (read-first cue; its section 6 open tickets
@@ -40,6 +54,48 @@ AUTO_CONTEXT_TRUTH_CUE = (
 AUTO_CONTEXT_JOURNAL_CUE = (
     " Session journal: {journal_path} - append to it at the next wrap-up."
 )
+# Degeneration guard nudge (core-internal, NOT yaml-exposed - same family as
+# the AUTO_CONTEXT_* cues). Appended as an injected user message when a
+# stream ends at the max-output cap (finish_reason == "length") or on a
+# whitespace wall. One universal text by design: the outcome (recovered vs
+# trips the stop cap) discriminates cut-off from degeneration, not a
+# classifier. docs_archive/degeneration_guard_plan.md.
+DEGENERATE_NUDGE_PROMPT = (
+    "Your last response was cut off before finishing. Continue exactly "
+    "where you stopped, concisely; if your output had become repetitive "
+    "or empty, give a concise concrete answer or a tool call instead."
+)
+# Pre-baked session intro injected after a mechanical chain restart
+# (auto-chain post-wrap-up, or /chain). Replaces the AI-generated bridge
+# summary: the durable records (truth + journal) carry all the detail,
+# so no model call is needed to orient the agent.
+CHAIN_RESTART_INTRO = (
+    "[Session restarted from durable records after context compaction.]\n"
+    "Truth: {truth_file} | Journal: {journal_file}\n"
+    "Read the records below."
+)
+# Appended MECHANICALLY to a verbose compact summary when the durable record
+# paths are known (captured from the wrap-up's own file writes). The summary
+# is the only carrier into the post-compact context, and the 09-29 games
+# incident showed the model-written pointer drops: the verbose summary named
+# no record files, the new 28k context carried no pointer, and the agent
+# re-struggled ~1 h re-discovering file-resident knowledge. A mechanical
+# append is deterministic - the paths are captured facts, not model memory.
+# Only the verbose DEFAULT_COMPACT_PROMPT gets the block: a user-specified
+# compact prompt wins clean, and the short bridge summary prompt already
+# instructs the model to name both files. Core-internal (like the nudge
+# cues) - not yaml-exposed.
+COMPACT_DURABLE_RECORD_HEADER = "Durable record (focus {focus}):\n"
+COMPACT_DURABLE_RECORD_HEADER_BARE = "Durable record:\n"
+COMPACT_DURABLE_RECORD_TRUTH_LINE = (
+    "- Current truth: {truth_path} - read it in full before starting new"
+    " work; its section 6 tickets are the work queue (top unblocked ticket"
+    " first).\n"
+)
+COMPACT_DURABLE_RECORD_JOURNAL_LINE = (
+    "- Session journal: {journal_path} - the LAST entry holds the state at"
+    " handoff; append to it at the next wrap-up."
+)
 
 # Injected as a user message when action = "report_and_compact" and the
 # auto-context threshold is reached. Instead of compacting immediately, the
@@ -51,11 +107,11 @@ AUTO_CONTEXT_JOURNAL_CUE = (
 # The wrap-up burns context on tool results, and reading large doc files was
 # the observed runaway (40-60k-char reads per call). So reads are bounded
 # (Reconcile, <= 5 calls) and exactly one small file is rewritable
-# ({project}_current_truth.md, <= 150 lines); the journal stays append-only.
+# ({focus}_current_truth.md, <= 150 lines); the journal stays append-only.
 # The current-truth file holds durable facts only (step 2 gives a suggested
 # heading set); position/handoff content belongs to the journal and the
 # compaction summary, so the file stays small and rarely needs rewriting.
-# The journal name (docs_archive/{project}_journal.md) is chosen by the model
+# The journal name (docs_archive/{focus}_journal.md) is chosen by the model
 # and carried across chain restarts in the continuation nudge.
 #
 # The current date and time is appended to the injected message at injection
@@ -85,7 +141,7 @@ DEFAULT_REPORT_AND_COMPACT_PROMPT = (
     "   Anything already documented is a CONFIRMATION with a section reference,\n"
     "   not a discovery.\n"
     "\n"
-    "2. CURRENT TRUTH - rewrite docs_archive/{project}_current_truth.md (<= 150\n"
+    "2. CURRENT TRUTH - rewrite docs_archive/{focus}_current_truth.md (<= 150\n"
     "   lines; create if absent). The ONLY file you may rewrite. Durable facts\n"
     "   only: what is true about this system regardless of which session you\n"
     "   are. Not where we are in the work - that is the journal's job. Delete\n"
@@ -96,7 +152,7 @@ DEFAULT_REPORT_AND_COMPACT_PROMPT = (
     '   ("[observed 2026-09-23]") are fine; dates as novelty labels are not.\n'
     "   Exact format - a single title, no opening paragraph, then sections. Omit\n"
     "   any section that would be empty; add sub-headings for detail:\n"
-    "     # {project} - current truth (updated YYYY-MM-DD HH:MM)\n"
+    "     # {focus} - current truth (updated YYYY-MM-DD HH:MM)\n"
     "     ## 1. Environment & access   (where it runs, how to reach it, credentials,\n"
     "          standing constraints: never modify X)\n"
     "     - <statement>   [source ref, provenance]\n"
@@ -120,14 +176,15 @@ DEFAULT_REPORT_AND_COMPACT_PROMPT = (
     "   Rewrite every ticket, every time: ranked most-blocking first, capped\n"
     "   at 10 - an 11th forces one out: CLOSE it (resolved), KILL it (ruled\n"
     "   out), or PARK it (set aside), with the reason recorded in the journal.\n"
-    "   Keep each FIRST SEEN exactly as first written, to the minute - never\n"
-    "   coarsen it to date-only.\n"
+    "   FIRST SEEN: for every ticket that survives this rewrite, copy its\n"
+    "   stamp verbatim from the truths file you read in RECONCILE - not\n"
+    "   from memory, and never coarsened to date-only.\n"
     "   The TOP UNBLOCKED ticket becomes this entry's \"b. NEXT SESSION, FIRST\n"
     '   ACTION"; if you cannot work it, mark it BLOCKED and name what unblocks\n'
     "   it - a block is a state, not a failure. NEEDS USER tickets wait for\n"
     "   the user; never answer them yourself.\n"
     "\n"
-    "3. APPEND the journal entry to docs_archive/{project}_journal.md (append\n"
+    "3. APPEND the journal entry to docs_archive/{focus}_journal.md (append\n"
     "   only; create if absent.\n"
     "   Format: one dated heading (## YYYY-MM-DD HH:MM - {sub-task} - {terse\n"
     "   outcome}; one line, <= 15 words after the date - the skim view of\n"
@@ -165,10 +222,11 @@ DEFAULT_REPORT_AND_COMPACT_PROMPT = (
     "      every later PARKED move lands here too, with the reason.\n"
     '      No delta: write "- none" and nothing else.\n'
     "\n"
-    "Name the journal after the PROJECT, not this session's sub-task; put the\n"
-    "sub-task in the entry header. The project name: if the user named the\n"
-    "project in any message, use that name for {project} (both files and the\n"
-    "truth title); only with no name given, fall back to the directory name.\n"
+    "Name the journal after the FOCUS (the work target), not this session's\n"
+    "sub-task; put the sub-task in the entry header. The focus name: if the\n"
+    "user named the focus in any message, use that name for {focus} (both\n"
+    "files and the truth title); only with no name given, fall back to the\n"
+    "directory name.\n"
     "No cumulative version history. No prose\n"
     "restatement of prior entries. Keep it tight - a cold reader must be able to\n"
     "act on it.\n"
@@ -208,10 +266,10 @@ DEFAULT_COMPACT_PROMPT = (
     "Preserve:\n"
     "- All key decisions, their rationale, and current status\n"
     "- Important code, file paths, and technical details\n"
-    "- The project's durable record \u2014 the journal and current-truth files\n"
-    "  under docs_archive/ (e.g. <project>_current_truth.md). Always name them,\n"
+    "- The focus's durable record \u2014 the journal and current-truth files\n"
+    "  under docs_archive/ (e.g. <focus>_current_truth.md). Always name them,\n"
     "  even if untouched this session, with a cue on when to read them.\n"
-    "  If the user named the project, carry that name - it determines the\n"
+    "  If the user named the focus, carry that name - it determines the\n"
     "  file names when the wrap-up creates them.\n"
     "  Mid-session journal appends (user-requested, or to make a hard-won\n"
     "  finding survive a crash) are fine: same dated heading with terse\n"
@@ -227,6 +285,30 @@ DEFAULT_COMPACT_PROMPT = (
     "Skip pleasantries and hedging. Write as a direct reference document\n"
     "that lets you continue the work seamlessly.\n"
     "If you'd have to re-discover it from scratch, it belongs in this summary."
+)
+
+# Short-form summary for the AUTO compact that follows a report-and-compact
+# wrap-up turn: the wrap-up just wrote the journal entry and rewrote the
+# current-truth file, so the summary only needs to bridge the next chain to
+# those files. The verbose DEFAULT_COMPACT_PROMPT remains in use for
+# action = "compact" and for /compact, where no wrap-up ran and the summary
+# is the ONLY carrier of session state. Core-internal constant (like the
+# nudge cues) - not yaml-exposed; overriding "compaction" in prompts.yaml
+# still controls /compact and action = "compact".
+DEFAULT_REPORT_AND_COMPACT_SUMMARY_PROMPT = (
+    "The session wrap-up just ran: it appended the journal entry and\n"
+    "rewrote the current-truth file. Write a SHORT bridge summary\n"
+    "(<= 300 words) - the files carry the details.\n"
+    "Cover ONLY:\n"
+    "- The two file paths as written this turn, each with its cue:\n"
+    "  current-truth file -> read in full before new work (its section 6\n"
+    "  open tickets are the work queue); journal -> append at the next\n"
+    "  wrap-up; the LAST entry holds the state at handoff.\n"
+    "- The TOP unblocked ticket from truth section 6 - one line.\n"
+    "- In-flight state the files might not show (processes left running,\n"
+    "  half-done edits) - only if real, one or two lines.\n"
+    "Do not restate file contents, decisions, or history - already\n"
+    "recorded. Do not use tools - write from this conversation alone."
 )
 
 # Appended to the base compaction prompt when /compact is given a focus

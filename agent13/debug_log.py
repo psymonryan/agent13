@@ -327,13 +327,30 @@ def log_stream_chunk(tokens_received: int) -> None:
     log_event("stream_chunk", {"tokens_received": tokens_received})
 
 
-def log_stream_end(total_tokens: int) -> None:
+def log_stream_end(total_tokens: int, finish_reason: str = None) -> None:
     """Log stream end event.
 
     Args:
         total_tokens: Total tokens received
+        finish_reason: Why the stream ended ("stop", "length", "tool_calls")
+                       - the degeneration guard's key signal. Logged for ALL
+                       streams so a backend that omits it is visible in the
+                       telemetry (absence = the guard cannot fire there).
     """
-    log_event("stream_end", {"total_tokens": total_tokens})
+    data = {"total_tokens": total_tokens}
+    if finish_reason:
+        data["finish_reason"] = finish_reason
+    log_event("stream_end", data)
+
+
+def log_degenerate_nudge(data: dict) -> None:
+    """Log a degeneration-guard nudge (cap-hit or whitespace-wall recovered)."""
+    log_event("degenerate_nudge", data)
+
+
+def log_degenerate_stop(data: dict) -> None:
+    """Log the degeneration guard giving up (streak reached the cap)."""
+    log_event("degenerate_stop", data)
 
 
 def log_queue_start(text: str, item_id: int) -> None:

@@ -49,6 +49,31 @@ def fmt_tokens(n: int) -> str:
     return str(n)
 
 
+def parse_token_count(s: str) -> int:
+    """Parse a token count that may carry a k suffix ("150k", "150K").
+
+    The inverse of fmt_tokens' display form: plain integers ("150000") and
+    k-suffixed values ("150k") both work. Raises ValueError for anything
+    else (empty string, bare "k", "1.5k", negatives) - callers show their
+    own usage message.
+
+    >>> parse_token_count("150k")
+    150000
+    >>> parse_token_count("150000")
+    150000
+    >>> parse_token_count("0")
+    0
+    """
+    val = s.strip().lower()
+    if val.endswith("k"):
+        count = int(val[:-1]) * 1000
+    else:
+        count = int(val)
+    if count < 0:
+        raise ValueError(f"negative token count: {s!r}")
+    return count
+
+
 @dataclass
 class StatusData:
     """Structured data for /status display.
@@ -61,6 +86,9 @@ class StatusData:
     agent_status: str  # idle, processing, queued, pausing, paused
     run_time: str  # "5m 32s"
     cwd: str
+    focus_name: str = ""  # effective focus (explicit or path-derived); "" = none
+    chain_count: int = 0  # session-lifetime compaction total (persists in saves)
+    session_started_at: str = ""  # ISO original session start (persists in saves)
     last_turn_duration: Optional[str] = None  # "3s"
     last_turn_ago: Optional[str] = None  # "30s ago"
     turn_count: int = 0
@@ -86,6 +114,7 @@ class StatusData:
     # ── Tools ──
     tool_successes: int = 0
     tool_calls: int = 0
+    bounded_count: int = 0  # results truncated by tool output bounding
 
     # ── Settings ──
     sandbox_mode: str = "unknown"
@@ -99,6 +128,7 @@ class StatusData:
     auto_context_action: str = ""
     auto_context_chain: int = 0
     auto_context_chain_used: int = 0
+    nudges: int = 0  # session-lifetime degenerate-nudge total (persists in saves)
 
     # ── TUI-only (Optional) ──
     # These fields are populated by the TUI for its richer status display.
@@ -216,6 +246,9 @@ def gather_status(
         agent_status=agent_status,
         run_time=run_time,
         cwd=str(Path.cwd()),
+        focus_name=getattr(agent, "_session_focus_name", ""),
+        chain_count=getattr(agent, "chain_count", 0),
+        session_started_at=getattr(agent, "session_started_at", ""),
         turn_count=turn_count,
         total_processing=total_processing,
         # Provider
@@ -235,6 +268,7 @@ def gather_status(
         # Tools
         tool_successes=stats.total_successes,
         tool_calls=stats.total_calls,
+        bounded_count=getattr(stats, "bounded", 0),
         # Settings
         sandbox_mode=sandbox_mode,
         sandbox_pinned=sandbox_pinned,
@@ -247,6 +281,7 @@ def gather_status(
         auto_context_action=agent.auto_context_action,
         auto_context_chain=agent.auto_context_chain,
         auto_context_chain_used=agent.auto_context_chain_used,
+        nudges=getattr(agent, "degenerate_nudges", 0),
     )
 
 

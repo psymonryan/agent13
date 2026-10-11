@@ -57,14 +57,19 @@ class AgentEvent(Enum):
 
     # Interrupt injection
     INTERRUPT_INJECTED = "interrupt_injected"  # Interrupt message injected mid-turn
+    DEGENERATE_NUDGE = "degenerate_nudge"  # Degeneration guard nudged or gave up
 
     # Display
     CHAT_CLEAR = "chat_clear"  # Chat display cleared at a chain restart (display only, never history)
+    CHAT_REBUILD = (
+        "chat_rebuild"  # Rebuild chat display from current history (post chain-restart injection)
+    )
 
     # Streaming
     STREAM_START = "stream_start"  # Emitted at start of each LLM stream
 
     # MCP events
+    MCP_CONNECTING = "mcp_connecting"  # A connect/reload cycle has started
     MCP_SERVER_STARTED = "mcp_server_started"  # Server is being connected
     MCP_SERVER_READY = "mcp_server_ready"  # Server connected, tools available
     MCP_SERVER_ERROR = "mcp_server_error"  # Server connection failed

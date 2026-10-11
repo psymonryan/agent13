@@ -5,7 +5,7 @@ auto-applies on every startup in that directory.  Each pin type lives in
 its own TOML section, keyed by the resolved absolute project path:
 
     # Per-project pins
-    # Managed by /sandbox pin|unpin and /devel pin|unpin
+    # Managed by /sandbox, /devel, /reasoning and /toolview pin|unpin
 
     [sandbox]
     "/abs/path" = "permissive-closed"
@@ -13,15 +13,20 @@ its own TOML section, keyed by the resolved absolute project path:
     [devel]
     "/abs/path" = true
 
-Currently two pin types exist:
+Currently four pin types exist:
 
 - ``sandbox`` - pinned sandbox mode, managed by ``/sandbox pin`` /
   ``/sandbox unpin`` (typed helpers in :mod:`agent13.sandbox`)
 - ``devel`` - pinned devel mode, managed by ``/devel pin`` /
   ``/devel unpin`` (typed helpers below; ``False`` is a valid pin value,
   meaning "devel pinned off")
+- ``reasoning`` - pinned default for the reasoning widgets (``true`` =
+  collapsed), managed by ``/reasoning pin`` / ``/reasoning unpin``
+- ``toolview`` - pinned default for the tool call/result widgets (``true`` =
+  collapsed), managed by ``/toolview pin`` / ``/toolview unpin``
 
-An explicit CLI flag (``--sandbox``, ``--devel``) always overrides a pin.
+An explicit CLI flag (``--sandbox``, ``--devel``, ``--reasoning``,
+``--toolview``) always overrides a pin.
 """
 
 import tomllib
@@ -30,6 +35,8 @@ from typing import Optional, Union
 
 SECTION_SANDBOX = "sandbox"
 SECTION_DEVEL = "devel"
+SECTION_REASONING = "reasoning"
+SECTION_TOOLVIEW = "toolview"
 
 _PinValue = Union[str, bool]
 
@@ -80,7 +87,7 @@ def save_pins(pins: dict[str, dict]) -> None:
 
     lines = [
         "# Per-project pins - persistent per-project settings",
-        "# Managed by /sandbox pin|unpin and /devel pin|unpin",
+        "# Managed by /sandbox, /devel, /reasoning and /toolview pin|unpin",
     ]
     for section in sorted(pins):
         values = pins[section]
@@ -164,9 +171,17 @@ def remove_pin(section: str, project_dir: Optional[Path] = None) -> bool:
     return True
 
 
-# ── Devel-mode pins (typed helpers) ──────────────────────────────────────────
+# ── Boolean pins (typed helpers) ─────────────────────────────────────────────
 # Sandbox pins keep their typed helpers in agent13.sandbox because the value
-# is the SandboxMode enum; devel is a plain bool so its helpers live here.
+# is the SandboxMode enum; every other pin type here is a plain bool.
+
+
+def _get_pinned_bool(
+    section: str, project_dir: Optional[Path] = None
+) -> Optional[bool]:
+    """Get a bool pin for a project directory (None = no pin, or non-bool value)."""
+    value = get_pinned(section, project_dir)
+    return value if isinstance(value, bool) else None
 
 
 def get_pinned_devel(project_dir: Optional[Path] = None) -> Optional[bool]:
@@ -178,8 +193,7 @@ def get_pinned_devel(project_dir: Optional[Path] = None) -> Optional[bool]:
     Returns:
         True/False if devel mode is pinned, None if no pin exists.
     """
-    value = get_pinned(SECTION_DEVEL, project_dir)
-    return value if isinstance(value, bool) else None
+    return _get_pinned_bool(SECTION_DEVEL, project_dir)
 
 
 def pin_devel(enabled: bool, project_dir: Optional[Path] = None) -> None:
@@ -202,3 +216,38 @@ def unpin_devel(project_dir: Optional[Path] = None) -> bool:
         True if a pin was removed, False if no pin existed.
     """
     return remove_pin(SECTION_DEVEL, project_dir)
+
+
+# ── UI display pins ──────────────────────────────────────────────────────────
+# The pinned bool means "collapsed": True = the widget family starts folded,
+# False = it starts expanded. See /reasoning and /toolview.
+
+
+def get_pinned_reasoning(project_dir: Optional[Path] = None) -> Optional[bool]:
+    """Get the pinned reasoning-widget default (True = collapsed)."""
+    return _get_pinned_bool(SECTION_REASONING, project_dir)
+
+
+def pin_reasoning(collapsed: bool, project_dir: Optional[Path] = None) -> None:
+    """Pin the reasoning-widget default for a project directory."""
+    set_pinned(SECTION_REASONING, collapsed, project_dir)
+
+
+def unpin_reasoning(project_dir: Optional[Path] = None) -> bool:
+    """Remove the reasoning pin. True if a pin was removed, False if none."""
+    return remove_pin(SECTION_REASONING, project_dir)
+
+
+def get_pinned_toolview(project_dir: Optional[Path] = None) -> Optional[bool]:
+    """Get the pinned tool-widget default (True = collapsed)."""
+    return _get_pinned_bool(SECTION_TOOLVIEW, project_dir)
+
+
+def pin_toolview(collapsed: bool, project_dir: Optional[Path] = None) -> None:
+    """Pin the tool-widget default for a project directory."""
+    set_pinned(SECTION_TOOLVIEW, collapsed, project_dir)
+
+
+def unpin_toolview(project_dir: Optional[Path] = None) -> bool:
+    """Remove the toolview pin. True if a pin was removed, False if none."""
+    return remove_pin(SECTION_TOOLVIEW, project_dir)

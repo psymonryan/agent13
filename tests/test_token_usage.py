@@ -27,15 +27,19 @@ class MockDelta:
 class MockChoice:
     """Mock choice object for streaming chunk."""
 
-    def __init__(self, delta):
+    def __init__(self, delta, finish_reason=None):
         self.delta = delta
+        # Real API chunks always carry finish_reason on choices (None until
+        # the terminal chunk); llm.py's degeneration-guard capture reads it
+        # on every choices-bearing chunk.
+        self.finish_reason = finish_reason
 
 
 class MockChunk:
     """Mock streaming chunk."""
 
-    def __init__(self, delta=None, usage=None):
-        self.choices = [MockChoice(delta)] if delta else []
+    def __init__(self, delta=None, usage=None, finish_reason=None):
+        self.choices = [MockChoice(delta, finish_reason)] if delta else []
         self.usage = usage
 
 

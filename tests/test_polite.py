@@ -6,6 +6,7 @@ integration test (two agents coordinating) lives in test_polite_integration.py.
 """
 
 import asyncio
+from unittest.mock import patch
 
 import pytest
 
@@ -594,3 +595,206 @@ def test_set_model_no_polite_no_crash(config_dir):
     assert agent.polite_lock is None
     agent.set_model("beta")  # should not raise
     assert agent.polite_lock is None
+
+
+# ---------------------------------------------------------------------------
+# Pause check — /pause during a lock wait backs off (PolitePauseRequested)
+# instead of being force-cancelled (which reads as an interrupt)
+# ---------------------------------------------------------------------------
+
+
+class TestPauseCheck:
+    """PoliteLock.acquire() honours pause_check.
+
+    A /pause during a lock wait must PAUSE the agent, not cancel its task:
+    a CancelledError mid-turn is indistinguishable from an ESC interrupt and
+    would repair the history with an [Interrupted] marker. acquire() instead
+    raises PolitePauseRequested and backs off holding nothing; the caller
+    (core._acquire_polite) goes PAUSED and re-enters on resume.
+    """
+
+    @pytest.mark.asyncio
+    async def test_free_lock_pause_already_set_raises(self, config_dir):
+        """Pause already requested -> back off even when the lock is free."""
+        from agent13.polite import PolitePauseRequested
+
+        lock = PoliteLock(provider="pause-free", interval=0.01, pause_check=lambda: True)
+        with pytest.raises(PolitePauseRequested):
+            await asyncio.wait_for(lock.acquire(), timeout=2.0)
+        assert not lock.is_held()
+
+    @pytest.mark.asyncio
+    async def test_busy_lock_pause_during_wait_raises(self, config_dir):
+        """Pause flips while waiting -> back off within a few poll ticks."""
+        from agent13.polite import PolitePauseRequested
+
+        holder = PoliteLock(provider="pause-busy", interval=0.01)
+        pause_flag = {"v": False}
+        waiter = PoliteLock(
+            provider="pause-busy",
+            interval=0.01,
+            pause_check=lambda: pause_flag["v"],
+        )
+
+        await holder.acquire()
+        try:
+            task = asyncio.create_task(waiter.acquire())
+            await asyncio.sleep(0.1)  # waiter is polling
+            assert not waiter.is_held()
+
+            pause_flag["v"] = True
+            t0 = asyncio.get_event_loop().time()
+            with pytest.raises(PolitePauseRequested):
+                await asyncio.wait_for(task, timeout=2.0)
+            # Checked at the top of the loop and pre-sleep: at most one poll
+            # interval of latency (0.01 s) — allow generous slack for CI.
+            assert asyncio.get_event_loop().time() - t0 < 0.5
+            assert not waiter.is_held()
+        finally:
+            holder.release()
+
+    @pytest.mark.asyncio
+    async def test_no_lock_held_after_backoff(self, config_dir):
+        """After backing off, the lock is immediately available to others."""
+        from agent13.polite import PolitePauseRequested
+
+        victim = PoliteLock(
+            provider="pause-hold", interval=0.01, pause_check=lambda: True
+        )
+        with pytest.raises(PolitePauseRequested):
+            await victim.acquire()
+        assert not victim.is_held()
+
+        third = PoliteLock(provider="pause-hold", interval=0.01)
+        await asyncio.wait_for(third.acquire(), timeout=1.0)
+        assert third.is_held()
+        third.release()
+
+    @pytest.mark.asyncio
+    async def test_legacy_no_pause_check_unchanged(self, config_dir):
+        """pause_check=None (legacy) keeps polling until it wins — no raise."""
+        holder = PoliteLock(provider="legacy", interval=0.01)
+        waiter = PoliteLock(provider="legacy", interval=0.01)
+
+        await holder.acquire()
+        task = asyncio.create_task(waiter.acquire())
+        await asyncio.sleep(0.1)
+        assert not waiter.is_held()  # still waiting, no spurious raise
+        holder.release()
+        await asyncio.wait_for(task, timeout=2.0)
+        assert waiter.is_held()
+        waiter.release()
+
+    @pytest.mark.asyncio
+    async def test_pause_check_false_keeps_waiting(self, config_dir):
+        """A pause_check that stays False does not change normal polling."""
+        holder = PoliteLock(provider="pause-false", interval=0.01)
+        waiter = PoliteLock(
+            provider="pause-false", interval=0.01, pause_check=lambda: False
+        )
+
+        await holder.acquire()
+        task = asyncio.create_task(waiter.acquire())
+        await asyncio.sleep(0.1)
+        assert not waiter.is_held()
+        holder.release()
+        await asyncio.wait_for(task, timeout=2.0)
+        assert waiter.is_held()
+        waiter.release()
+
+
+# ---------------------------------------------------------------------------
+# Agent._acquire_polite — pause-resume loop
+# ---------------------------------------------------------------------------
+
+
+class TestAcquirePolite:
+    """_acquire_polite() goes PAUSED on PolitePauseRequested, then re-acquires.
+
+    It is a loop, not a one-shot: a second pause during the re-wait is
+    honoured too. The queue item and turn state are never touched.
+    """
+
+    def _make_agent(self, config_dir):
+        from agent13.core import Agent
+
+        return Agent(client=_MockClient("http://x/v1"), model="mock-model")
+
+    @pytest.mark.asyncio
+    async def test_immediate_acquire_single_call(self, config_dir):
+        """Free lock: one acquire call, no pause involvement."""
+        from unittest.mock import AsyncMock, MagicMock
+
+        agent = self._make_agent(config_dir)
+        stub = MagicMock()
+        stub.acquire = AsyncMock(return_value=None)
+        agent.polite_lock = stub
+
+        async def fake_wait(resume_status=None):
+            pytest.fail("_wait_if_paused must not be called without a pause")
+
+        with patch.object(agent, "_wait_if_paused", new=fake_wait):
+            await agent._acquire_polite()
+
+        stub.acquire.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_pause_during_wait_loops_until_resume(self, config_dir):
+        """Raise -> PAUSED -> resume -> re-acquire (the incident's fix path)."""
+        from agent13.core import AgentStatus, PauseState
+        from agent13.polite import PolitePauseRequested
+        from unittest.mock import AsyncMock, MagicMock
+
+        agent = self._make_agent(config_dir)
+        stub = MagicMock()
+        stub.acquire = AsyncMock(side_effect=[PolitePauseRequested(), None])
+        agent.polite_lock = stub
+
+        agent.pause()
+        assert agent.pause_state == PauseState.PAUSING
+
+        wait_calls = []
+
+        async def fake_wait(resume_status=None):
+            wait_calls.append(resume_status)
+            agent.resume()  # user resumes while the wait is blocked
+
+        with patch.object(agent, "_wait_if_paused", new=fake_wait):
+            await agent._acquire_polite(resume_status=AgentStatus.WAITING)
+
+        assert stub.acquire.await_count == 2
+        assert wait_calls == [AgentStatus.WAITING]
+        assert agent.pause_state == PauseState.RUNNING
+
+    @pytest.mark.asyncio
+    async def test_repeated_pause_loops_each_time(self, config_dir):
+        """Pause again while re-waiting: the loop honours it every time."""
+        from agent13.core import PauseState
+        from agent13.polite import PolitePauseRequested
+        from unittest.mock import AsyncMock, MagicMock
+
+        agent = self._make_agent(config_dir)
+        stub = MagicMock()
+        stub.acquire = AsyncMock(
+            side_effect=[
+                PolitePauseRequested(),
+                PolitePauseRequested(),
+                None,
+            ]
+        )
+        agent.polite_lock = stub
+
+        agent.pause()  # first pause request
+
+        async def fake_wait(resume_status=None):
+            agent.resume()  # release this pause
+            agent.pause()  # user pauses again during the re-wait
+
+        with patch.object(agent, "_wait_if_paused", new=fake_wait):
+            await agent._acquire_polite()
+
+        assert stub.acquire.await_count == 3
+        # The trailing pause() in fake_wait is a NEW request made after the
+        # lock was won — _acquire_polite must not swallow it; the turn's next
+        # safe point honours it.
+        assert agent.pause_state == PauseState.PAUSING

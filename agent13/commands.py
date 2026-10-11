@@ -575,3 +575,113 @@ def list_save_names() -> list[str]:
     from agent13.persistence import list_all_saves
 
     return [s.stem for s in list_all_saves()]
+
+
+# ---------------------------------------------------------------------------
+# /reasoning and /toolview — widget folding (display only)
+# ---------------------------------------------------------------------------
+
+_COLLAPSE_LABELS = {
+    "reasoning": "Reasoning widgets (Thoughts / Reflection)",
+    "toolview": "Tool call / result widgets",
+}
+
+
+def _collapse_helpers(kind: str):
+    """(get_pinned, pin, unpin) for a collapse kind, from the pin store."""
+    from agent13 import pins
+
+    return {
+        "reasoning": (
+            pins.get_pinned_reasoning,
+            pins.pin_reasoning,
+            pins.unpin_reasoning,
+        ),
+        "toolview": (
+            pins.get_pinned_toolview,
+            pins.pin_toolview,
+            pins.unpin_toolview,
+        ),
+    }[kind]
+
+
+def execute_collapse(
+    kind: str, args: str, collapsed: bool, set_collapsed
+) -> CommandResult:
+    """Execute /reasoning and /toolview — fold or expand a chat widget family.
+
+    Forms:
+      /kind hide  - fold new widgets to a one-line header (session)
+      /kind show  - expand new widgets (session)
+      /kind pin   - pin the CURRENT setting for this project (startup default)
+      /kind unpin - remove the project pin
+      /kind       - show status (effective value, pin, config default)
+
+    Args:
+        kind: "reasoning" or "toolview".
+        args: Raw argument string.
+        collapsed: The current effective setting (True = folded).
+        set_collapsed: Callable applying a session change to the UI.
+
+    Widgets already in the chat are never re-rendered - the setting applies
+    to widgets created from now on (including a /rebuild, which creates them
+    afresh).
+
+    Returns CommandResult with data['collapsed'] when the value changed.
+    """
+    label = _COLLAPSE_LABELS[kind]
+    get_pinned, pin, unpin = _collapse_helpers(kind)
+    usage = (
+        f"Usage: /{kind} hide | show | pin | unpin\n"
+        f"  hide  - fold to a one-line header\n"
+        f"  show  - expand\n"
+        f"  pin   - keep the current setting for this project\n"
+        f"  unpin - remove the project pin\n"
+        f"  Current: {'collapsed' if collapsed else 'expanded'}"
+    )
+    args = args.strip().lower()
+
+    if args in ("hide", "show"):
+        want = args == "hide"
+        set_collapsed(want)
+        state = "collapsed" if want else "expanded"
+        return CommandResult(
+            True, f"{label}: {state} for this session", {"collapsed": want}
+        )
+
+    if args == "pin":
+        pin(collapsed)
+        state = "collapsed" if collapsed else "expanded"
+        return CommandResult(
+            True,
+            f"Pinned '{state}' for this project - applies on startup here",
+        )
+
+    if args == "unpin":
+        if unpin():
+            return CommandResult(True, f"Removed the {kind} pin for this project")
+        return CommandResult(False, f"No {kind} pin exists for this project")
+
+    if not args:
+        from agent13.config import get_config
+
+        state = "collapsed" if collapsed else "expanded"
+        pinned = get_pinned()
+        pinned_text = (
+            ("collapsed" if pinned else "expanded")
+            if pinned is not None
+            else "no"
+        )
+        cfg_default = getattr(get_config(), f"{kind}_collapsed", True)
+        lines = [
+            f"{label}: {state}",
+            f"  Pinned for this project: {pinned_text}",
+            f"  Config default: {'collapsed' if cfg_default else 'expanded'}",
+        ]
+        if kind == "reasoning":
+            lines.append(
+                "  [Display only - /remove-api-reasoning controls what the API gets]"
+            )
+        return CommandResult(True, "\n".join(lines))
+
+    return CommandResult(False, f"Unknown {kind} option: {args}\n{usage}")

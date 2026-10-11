@@ -8,7 +8,7 @@ tool-call generation.
 
 Covers:
 - llm.stream_response_with_tools yields ("keepalive", {}) for payload-less chunks
-- AgentTUI._tool_call_markup renders the name-unknown pending variant
+- ToolWidget._title_markup renders the name-unknown pending variant
 - Core emits TOOL_CALL_PENDING once when the stream goes silent past the
   threshold, and not when visible tokens keep flowing
 """
@@ -17,7 +17,7 @@ import pytest
 
 from agent13 import Agent, AgentEvent
 from agent13.llm import stream_response_with_tools
-from ui.tui import AgentTUI
+from ui.tui import ToolWidget
 
 
 # =============================================================================
@@ -213,19 +213,28 @@ class TestKeepaliveEvents:
 
 
 # =============================================================================
-# _tool_call_markup: name-unknown pending variant
+# ToolWidget._title_markup: name-unknown pending variant
 # =============================================================================
 
 
 class TestPendingMarkup:
     def test_pending_without_name_is_gear_ellipsis(self):
-        markup = AgentTUI._tool_call_markup("", {}, pending=True)
-        assert markup == "[dim]⚙ …[/]"
+        widget = ToolWidget("", pending=True, pending_unknown=True)
+        assert widget._title_markup() == "[dim]⚙ …[/]"
 
     def test_pending_with_name_keeps_name(self):
-        markup = AgentTUI._tool_call_markup("write_file", {}, pending=True)
+        widget = ToolWidget("write_file", pending=True)
+        markup = widget._title_markup()
         assert "write_file" in markup
         assert "…" in markup
+
+    def test_set_pending_name_upgrades_placeholder(self):
+        widget = ToolWidget("", pending=True, pending_unknown=True)
+        widget.set_pending_name("write_file")
+        markup = widget._title_markup()
+        assert "write_file" in markup
+        assert "…" in markup
+        assert widget.pending_unknown is False
 
 
 # =============================================================================

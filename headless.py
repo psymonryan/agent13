@@ -60,6 +60,7 @@ async def run_headless(
     skills_enabled: bool = False,
     continue_session: bool = False,
     priming_enabled: bool = False,
+    focus_name: str | None = None,
 ):
     """Run the agent in headless mode, reading commands from stdin.
 
@@ -117,6 +118,12 @@ async def run_headless(
         skills_mode=skills_enabled and bool(skill_manager.skills),
     )
 
+    # Focus name from --focus: authoritative state (the record seed happens
+    # after the --continue load, below, so a resumed history is never
+    # double-seeded).
+    if focus_name:
+        agent.set_focus_name(focus_name)
+
     # Load MCP server configs
     config = get_config()
     if config and config.mcp_servers:
@@ -135,6 +142,15 @@ async def run_headless(
                 print(f"CONTINUE_ERROR: {msg}", flush=True)
         else:
             print("CONTINUE: No auto-saved session found, starting fresh", flush=True)
+
+    # Seed an empty history from the focus's durable records so the session
+    # starts grounded.
+    if focus_name and not agent.seed_from_records():
+        print(
+            f"No records found for focus '{focus_name}' - name set",
+            file=sys.stderr,
+            flush=True,
+        )
 
     # Track status locally for display
     status = "initialising"
@@ -561,6 +577,16 @@ Commands: /pause, /resume, /status, /quit
         dest="continue_session",
         help="Continue from last auto-saved session"
     )
+    parser.add_argument(
+        "--focus",
+        type=str,
+        default=None,
+        metavar="NAME",
+        help=(
+            "Focus name: sets the authoritative focus name at startup and "
+            "preloads its durable records into an empty session"
+        )
+    )
 
     args = parser.parse_args()
 
@@ -619,6 +645,7 @@ Commands: /pause, /resume, /status, /quit
         skills_enabled=args.skills or bool(get_config().include_skills),
         continue_session=args.continue_session,
         priming_enabled=args.priming_prompt,
+        focus_name=args.focus,
     )
 
 

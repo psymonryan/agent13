@@ -48,6 +48,16 @@ from filelock import BaseFileLock, Timeout
 from agent13.config_paths import get_locks_dir
 
 
+class PolitePauseRequested(Exception):
+    """Raised by ``PoliteLock.acquire()`` when a pause is requested mid-wait.
+
+    A /pause during a lock wait must PAUSE the agent, not interrupt the turn:
+    the caller (core) transitions to PAUSED, blocks until resume, then re-enters
+    ``acquire()``. The queue item (pending or current) and the turn state are
+    untouched — no [Interrupted] marker, no item completion.
+    """
+
+
 def _sanitize_provider(provider: str) -> str:
     """Sanitize provider string for use in a lock filename.
 
@@ -81,9 +91,15 @@ class PoliteLock:
         interval: float,
         model: Optional[str] = None,
         emit: Optional[Callable[..., Coroutine[Any, Any, None]]] = None,
+        pause_check: Optional[Callable[[], bool]] = None,
     ) -> None:
         self._interval = max(0.0, float(interval))
         self._emit = emit
+        # Returns True when a pause is requested (PAUSING/PAUSED). acquire()
+        # checks it every polling tick and raises PolitePauseRequested so the
+        # caller can go PAUSED instead of being force-cancelled (which reads
+        # as an interrupt). None = pause-awareness disabled (tests, legacy).
+        self._pause_check = pause_check
         self._lock: Optional[BaseFileLock] = None
         self._provider = provider
         self._model = model
@@ -145,6 +161,14 @@ class PoliteLock:
 
         try:
             while True:
+                # Pause requested while waiting? Back off so the caller can
+                # go PAUSED (a task cancel here would read as an interrupt).
+                # Checked at the top of the loop and again before sleeping so
+                # a pause takes effect within one poll interval, never after
+                # a wasted sleep.
+                if self._pause_check is not None and self._pause_check():
+                    raise PolitePauseRequested()
+
                 # Non-blocking acquire attempt — instant, never hands
                 # priority to the OS scheduler.
                 try:
@@ -159,6 +183,8 @@ class PoliteLock:
                     elif now - last_emit >= self._WAIT_EVENT_INTERVAL:
                         last_emit = now
                         await self._emit_waiting(now - wait_start)
+                    if self._pause_check is not None and self._pause_check():
+                        raise PolitePauseRequested()
                     # asyncio.sleep(0) cooperatively yields without blocking —
                     # this is the N=0 "most aggressive" behaviour.
                     await asyncio.sleep(self._interval)

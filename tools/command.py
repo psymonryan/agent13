@@ -63,6 +63,17 @@ async def command(
     `;` chaining; add `-Encoding utf8` to Out-File/Set-Content (5.1 defaults
     to UTF-16). On macOS/Linux commands run in /bin/sh.
 
+    PowerShell traps (esp. remote — use remote_put instead of fighting
+    these): here-strings @'...'@ cannot nest — the first line that is just
+    '@ terminates the string; to create a script that itself contains one,
+    remote_put the .ps1 file, then run it. Inline base64 can arrive
+    corrupted in transit; to place binary or exact bytes on a remote host,
+    remote_put them (SHA-256 verified both ends). Interactive prompts fail
+    (stdin is a closed pipe, not a tty): e.g. schtasks /change prompts for
+    the run-as password — use the non-interactive form instead
+    (schtasks /delete /tn X /f, then schtasks /create ...; /create does
+    not prompt).
+
     Args:
         command: The command to run (plain script, no ssh wrapping)
         timeout: Timeout in seconds (default 120, max 600)
@@ -115,21 +126,27 @@ async def command(
             return _arg_error(
                 "mode='detach' requires command (the job script to run remotely)"
             )
-        return await detach_remote_job(
-            host=remote, command=command, remote_shell=remote_shell
-        )
+        try:
+            return await detach_remote_job(
+                host=remote, command=command, remote_shell=remote_shell
+            )
+        except ValueError as e:
+            return _arg_error(str(e))
     if not command:
         return _arg_error("Missing required argument: command")
 
     # Remote execution path
     if remote:
-        return await run_remote_command(
-            host=remote,
-            command=command,
-            remote_shell=remote_shell,
-            timeout=timeout,
-            max_output=100000,
-        )
+        try:
+            return await run_remote_command(
+                host=remote,
+                command=command,
+                remote_shell=remote_shell,
+                timeout=timeout,
+                max_output=100000,
+            )
+        except ValueError as e:
+            return _arg_error(str(e))
 
     # Local execution path
     # Get the current sandbox mode (user-controlled only)

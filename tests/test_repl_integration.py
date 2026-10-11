@@ -338,9 +338,9 @@ class TestSaveLoadExperience:
             proc.expect("Saved", timeout=5)
             wait_for_prompt(proc)
 
-            proc.sendline("/clear all")
+            proc.sendline("/new_session")
             time.sleep(1)
-            proc.expect("leared", timeout=5)
+            proc.expect("New session", timeout=5)
             wait_for_prompt(proc)
 
             proc.sendline("/load roundtrip")
@@ -412,9 +412,9 @@ class TestSaveLoadExperience:
             wait_for_prompt(proc)
 
             # Clear and load with explicit .ctx extension
-            proc.sendline("/clear all")
+            proc.sendline("/new_session")
             time.sleep(1)
-            proc.expect("leared", timeout=5)
+            proc.expect("New session", timeout=5)
             wait_for_prompt(proc)
 
             proc.sendline("/load ctxtest.ctx")
@@ -508,14 +508,14 @@ class TestMultiLineExperience:
             proc.close()
 
 
-# ─── Test: /clear ──────────────────────────────────────────────────
+# ─── Test: /new_session ──────────────────────────────────────────────────────
 
 
 class TestClearExperience:
-    """User clears conversation context."""
+    """User starts a new session (wipes conversation context)."""
 
     def test_clear_confirms_message_count(self, repl_env):
-        """User sends a message then /clear sees count of cleared messages."""
+        """User sends a message then /new_session sees cleared count."""
         proc = spawn_repl(repl_env)
 
         try:
@@ -524,11 +524,11 @@ class TestClearExperience:
             proc.expect("Hello! I'm a mock assistant", timeout=10)
             wait_for_prompt(proc)
 
-            proc.sendline("/clear all")
+            proc.sendline("/new_session")
             time.sleep(1)
 
-            # Should see "leared" (cleared/Cleared) with message count
-            proc.expect("leared", timeout=5)
+            # "New session (cleared N messages)" - count visible
+            proc.expect("New session", timeout=5)
 
             wait_for_prompt(proc)
         finally:

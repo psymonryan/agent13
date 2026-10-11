@@ -78,7 +78,10 @@ def spawn_repl(repl_env):
         maxread=4096,
     )
     proc.timeout = 30
-    proc.expect(">", timeout=15)
+    # 30s, matching the six sibling spawn_repl variants: on the Windows CI
+    # host (AV + uv/PowerShell cold starts) the initial prompt has arrived
+    # late enough to blow a tighter budget (see ci_remote.sh).
+    proc.expect(">", timeout=30)
     return proc
 
 

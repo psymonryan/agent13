@@ -22,8 +22,7 @@ from typing import Optional
 
 from agent13.remote_exec import (
     _validate_host,
-    _validate_remote_shell,
-    detect_remote_shell,
+    resolve_remote_shell,
     run_remote_command,
 )
 
@@ -210,7 +209,7 @@ async def detach_remote_job(
         remote, remote_shell, hint (or stderr on failure).
     """
     host = _validate_host(host)
-    shell = _validate_remote_shell(remote_shell) or await detect_remote_shell(host)
+    shell = await resolve_remote_shell(host, remote_shell)
     job_id = new_job_id()
     script = _build_detach_script(shell, job_id, command)
     result = await run_remote_command(
@@ -268,7 +267,7 @@ async def poll_remote_job(
     """
     host = _validate_host(host)
     job_id = validate_job_id(job_id)
-    shell = _validate_remote_shell(remote_shell) or await detect_remote_shell(host)
+    shell = await resolve_remote_shell(host, remote_shell)
     script = _build_poll_script(shell, job_id)
     result = await run_remote_command(
         host=host, command=script, remote_shell=shell, timeout=_POLL_TIMEOUT

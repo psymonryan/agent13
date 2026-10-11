@@ -11,16 +11,19 @@ from typing import Callable, Awaitable, Optional, TYPE_CHECKING
 
 from openai import AsyncOpenAI
 
+from agent13.context_gauge import ContextGauge
+from agent13.durable_records import DurableRecords
 from agent13.events import AgentEvent, AgentEventData, EventHandler
 from agent13.journal import JournalManager
-from agent13.polite import PoliteLock, _sanitize_provider
+from agent13.polite import PoliteLock, PolitePauseRequested, _sanitize_provider
 from agent13.message_history import MessageHistory, is_turn_start
 from agent13.prompts import (
     DEFAULT_PROMPT,
     AUTO_CONTEXT_CONTINUE_HINT,
-    AUTO_CONTEXT_TRUTH_CUE,
-    AUTO_CONTEXT_JOURNAL_CUE,
+    AUTO_CONTEXT_CARRY_HINT,
     DEFAULT_REPORT_AND_COMPACT_PROMPT,
+    DEFAULT_REPORT_AND_COMPACT_SUMMARY_PROMPT,
+    DEGENERATE_NUDGE_PROMPT,
 )
 from agent13.queue import AgentQueue, QueueItem
 from agent13.llm import (
@@ -28,6 +31,7 @@ from agent13.llm import (
     categorize_error,
     detect_tool_calls_in_reasoning,
     LLMError,
+    reload_agents_md,
 )
 from agent13.debug_log import (
     log_error,
@@ -40,6 +44,8 @@ from agent13.debug_log import (
     log_tool_result,
     log_journal_debug,
     log_compact_start,
+    log_degenerate_nudge,
+    log_degenerate_stop,
     # TPS debug logging
     is_debug_enabled,
     log_tps_event,
@@ -104,6 +110,28 @@ def _sanitize_json_args(tool_name: str, raw: str) -> str:
         return "{}"
 
 
+# Degeneration guard: the tail window and garbage threshold for the
+# keep-vs-drop decision. docs_archive/degeneration_guard_plan.md.
+_DEGENERATE_TAIL_CHARS = 6000
+_DEGENERATE_TAIL_MIN_NON_WS = 0.01  # <1% non-whitespace in the tail = garbage wall
+
+
+def _degenerate_tail_is_garbage(content: str, reasoning: str) -> bool:
+    """True when the tail of a degenerate partial output is whitespace-dominated.
+
+    The drop heuristic for the nudge path: a whitespace wall (the 09-10
+    incident - a huge run of newlines) carries no information and would
+    poison the context (prompt-too-long risk), so the partial is dropped
+    and preserved via snapshot instead. Coherent tails (legit cut-offs, or
+    the reasoning-loop deaths) keep the partial in history.
+    """
+    tail = (content + reasoning)[-_DEGENERATE_TAIL_CHARS:]
+    if not tail:
+        return False
+    non_ws = sum(1 for ch in tail if not ch.isspace())
+    return (non_ws / len(tail)) < _DEGENERATE_TAIL_MIN_NON_WS
+
+
 @dataclass
 class ToolStats:
     """Track tool usage statistics."""
@@ -117,6 +145,10 @@ class ToolStats:
     # Param combo tracking — sorted tuple of non-None argument names
     param_combos: dict[str, dict[str, int]] = field(default_factory=dict)
     param_combo_successes: dict[str, dict[str, int]] = field(default_factory=dict)
+    # Results bounded by tool output bounding (over-cap text spilled to a
+    # temp file; see agent13/tool_output_bound.py). A total, not per-tool -
+    # it answers "did truncation happen this session?" in /status.
+    bounded: int = 0
 
     def record(self, name: str, arguments: dict, result: str) -> None:
         """Record a tool call and its result."""
@@ -176,6 +208,7 @@ class ToolStats:
         self.mode_successes.clear()
         self.param_combos.clear()
         self.param_combo_successes.clear()
+        self.bounded = 0
 
     def summary(self) -> dict:
         """Get a summary for display."""
@@ -310,6 +343,7 @@ class Agent:
         auto_context_threshold: int = 220000,
         auto_context_action: str = "report_and_compact",
         auto_context_chain: int = 3,
+        auto_context_nudge_cap: int = 2,
         report_and_compact_prompt: str = "",
     ):
         """Initialize the agent.
@@ -351,15 +385,45 @@ class Agent:
         self.remove_reasoning = remove_reasoning
         self._devel_mode = devel_mode
         self._skills_mode = skills_mode
+        # Skills manually loaded this session (name -> loaded content, in
+        # load order). Tracked by note_skill_loaded (TUI /skillname); the
+        # content is re-injected by _mechanical_restart on chain restarts
+        # so a manual /skillname survives a /chain. Session state only.
+        self._active_skills: dict[str, str] = {}
         self.priming_enabled = priming_enabled
         self.auto_context_threshold = auto_context_threshold
         self._auto_context_failures = 0  # Circuit breaker counter
         self._auto_context_triggered = False  # Set when threshold hit mid-turn
         self._auto_context_chain_used = 0  # Chain restarts used this turn
+        # Degeneration guard (docs_archive/degeneration_guard_plan.md):
+        # cap = consecutive degenerate stream ends tolerated per turn before
+        # the guard gives up (0 = guard off). streak counts consecutive
+        # degenerate ends THIS turn (reset on a clean tool-calls round, a
+        # chain restart, or a new user turn). nudges_total is the
+        # session-lifetime nudge count for /status (persisted in saves).
+        self.auto_context_nudge_cap = auto_context_nudge_cap
+        self._degenerate_streak = 0
+        self._degenerate_nudges_total = 0
+        self._degenerate_snapshot_count = (
+            0  # Per-session monotonic (snapshot filenames)
+        )
+        self._degenerate_partial = None  # Held only while _save_degenerate_snapshot runs
+        # Session-lifetime compaction total (persisted in the .ctx save).
+        # Incremented on every FULL history replacement (compact_history,
+        # _mechanical_restart); journal-reflection compaction is excluded
+        # (per-turn housekeeping, not a context cycle). Reset only by
+        # /new_session (clear mode="all").
+        self._chain_count = 0
+        # Original session start (ISO). Persisted in the .ctx save - survives
+        # save/load so /status shows the session's true age across resumes.
+        self._session_started_at = datetime.datetime.now().isoformat()
+        self._in_flight_user_request = (
+            ""  # Turn-start user instruction, carried across chain restarts
+        )
         self._auto_context_snapshot_count = (
             0  # Per-session monotonic (snapshot filenames)
         )
-        # Auto-context action (--report-and-compact / [auto_context] action)
+        # Auto-context action (--auto-context-action / [auto_context] action)
         self.auto_context_action = auto_context_action
         self.auto_context_chain = auto_context_chain
         self.report_and_compact_prompt = (
@@ -369,18 +433,15 @@ class Agent:
         # Suppresses the auto-context threshold check while the wrap-up turn
         # runs, so the threshold can't re-fire mid-wrap-up and loop.
         self._suppress_auto_context = False
-        # Session journal path (docs_archive/*_journal.md) captured from the
-        # wrap-up's own append tool call; carried across chain restarts in
-        # the continuation nudge. Persists for the whole session.
-        self._session_journal_path = ""
-        # Current-truth path (docs_archive/*_current_truth.md), captured the
-        # same way; the nudge carries a read-first cue for it so the next
-        # chain orients from the durable facts before starting new work.
-        self._session_truth_path = ""
-        # Message count at the start of the most recent LLM stream. Used to
-        # estimate the true context size at the safe point (prompt_tokens is
-        # stale there - it predates the tool results just added).
-        self._msg_count_before_stream = 0
+        # Durable records: focus name + record paths + wrap-up capture +
+        # seeding + restart intro + the compact pointer block
+        # (agent13.durable_records). The _focus_name / _session_*_path
+        # attributes below are forwarding properties onto it.
+        self.durable_records = DurableRecords()
+        # Context gauge: single store for the grounded prompt-token value
+        # and the stream cursor (agent13.context_gauge). prompt_tokens and
+        # _msg_count_before_stream are forwarding properties onto it.
+        self._context_gauge = ContextGauge()
         self.execute_tool = execute_tool
         # Session date: stable for the lifetime of the session.
         # Used in the system prompt to prevent midnight date changes
@@ -397,13 +458,19 @@ class Agent:
         self._stop_event = asyncio.Event()
         self._cancel_requested = False  # Set by _process_item on CancelledError
         self._status = AgentStatus.INITIALISING
+        # 1-based tool-call number within the current user turn (reset at
+        # the top of _process_item). Carried in TOOL_CALL/TOOL_RESULT
+        # payloads so the UIs can pair a result with its call.
+        self._turn_tool_seq = 0
 
         # Pause/resume state (single source of truth — PauseState enum)
         self._pause_state = PauseState.RUNNING
         self._pause_event = asyncio.Event()
         self._pause_event.set()  # Not paused by default
         # When True, run() enters PAUSING state immediately after startup
-        # (used by ESC-during-polite-wait to pause instead of cancel).
+        # (used by ESC-during-polite-wait: the TUI cancels the blocked
+        # acquire and restarts run(), which then blocks at
+        # _wait_if_paused() on the very first iteration).
         self._pause_on_start = False
 
         # Token usage tracking
@@ -452,6 +519,29 @@ class Agent:
     @messages.setter
     def messages(self, value: list[dict]):
         self.history.messages = value
+
+    @property
+    def prompt_tokens(self) -> int:
+        """Grounded prompt-token value - the context size of the last LLM
+        call's request. Forwarded to the context gauge (the single store);
+        the attribute surface is kept so TUI, /status, journal, and tests
+        read and write it exactly as before."""
+        return self._context_gauge.grounded
+
+    @prompt_tokens.setter
+    def prompt_tokens(self, value: int):
+        self._context_gauge.record_usage(value)
+
+    @property
+    def _msg_count_before_stream(self) -> int:
+        """Stream cursor (messages covered by the grounded value).
+        Forwarded to the context gauge; kept as a property so the long-standing
+        private-attribute surface (persistence, tests) is unchanged."""
+        return self._context_gauge.cursor
+
+    @_msg_count_before_stream.setter
+    def _msg_count_before_stream(self, value: int):
+        self._context_gauge.record_stream_start(value)
 
     def on_event(self, handler: EventHandler) -> EventHandler:
         """Register an event handler.
@@ -646,6 +736,20 @@ class Agent:
                 if not self._running or self._stop_event.is_set():
                     break
 
+                # Don't start a turn while MCP is (re)connecting — the tool
+                # list is partial and a turn started now would need the whole
+                # history re-prompted once the connect finishes. Queued items
+                # stay in the queue (visible, deletable) until it returns.
+                while (
+                    self._running
+                    and not self._stop_event.is_set()
+                    and self._mcp is not None
+                    and self._mcp.connecting
+                ):
+                    await asyncio.sleep(0.25)
+                if not self._running or self._stop_event.is_set():
+                    break
+
                 # Continue an incomplete turn from a loaded context.
                 # Triggered by /resume (sets _incomplete_turn_pending via
                 # request_continue_incomplete). Runs inside run() so there's
@@ -674,7 +778,7 @@ class Agent:
                     # This makes ESC work and is_queued check pass during the polite wait.
                     await self._set_status(AgentStatus.WAITING)
                     try:
-                        await self.polite_lock.acquire()
+                        await self._acquire_polite()
                     except asyncio.CancelledError:
                         # ESC or task cancellation during polite wait.
                         # The item is still in the pending queue (not yet
@@ -883,7 +987,7 @@ class Agent:
         _polite_acquired = False
         if self.polite_lock is not None:
             try:
-                await self.polite_lock.acquire()
+                await self._acquire_polite(resume_status=AgentStatus.WAITING)
                 _polite_acquired = True
             except asyncio.CancelledError:
                 # ESC or task cancellation during the polite wait.
@@ -893,6 +997,20 @@ class Agent:
                 raise
 
         try:
+            # Drop a trailing [Interrupted] marker before dispatching: it
+            # exists only to keep an in-process history API-valid after an
+            # ESC. On resume the turn continues from the real last message
+            # (tool result or user message) — an assistant message at the
+            # tail would be an invalid last role for the next LLM call.
+            if self.history.messages and self.history.messages[-1].get("interrupt"):
+                self.history.messages.pop()
+
+            # Resume path: the restored history's last genuine user message
+            # is this turn's standing instruction (the else-branch capture
+            # is not on this path). Captured BEFORE _check_threshold_pre_turn
+            # below, which may restart (and clear) the history.
+            self._capture_in_flight_user_request()
+
             # Check the state of messages
             pending_tools = self.history.get_pending_tool_calls()
 
@@ -969,6 +1087,15 @@ class Agent:
 
                 # Now call LLM to continue
                 await self._llm_turn(_polite_acquired=_polite_acquired)
+                # Post-turn journal reflection (Stage 12 equivalent): the
+                # resume path has no queue item, so _process_item's Stage 12
+                # never runs for a resumed turn. Without this, the turn's
+                # tool work stays un-compacted and the NEXT turn's
+                # retrospective_compact fires the reflection before the
+                # user's new message is processed (10-06 edmac incident:
+                # 163k-token prefill, 10-min delay on a simple question).
+                # Internal guards make it a no-op when not applicable.
+                await self.journal.maybe_reflect_after_turn()
                 return True
 
             elif self.history.has_incomplete_turn():
@@ -976,6 +1103,8 @@ class Agent:
                 # Turn-start threshold check first (see case 1 above).
                 await self._check_threshold_pre_turn(_polite_acquired=_polite_acquired)
                 await self._llm_turn(_polite_acquired=_polite_acquired)
+                # Post-turn journal reflection — see case 1 above.
+                await self.journal.maybe_reflect_after_turn()
                 return True
 
             return False
@@ -1044,64 +1173,73 @@ class Agent:
                     await self._set_status(AgentStatus.IDLE)
                 await self.emit(AgentEvent.RESUMED, {})
 
-    @staticmethod
-    def _estimate_message_tokens(messages: list) -> int:
-        """Roughly estimate the token count of a list of messages.
+    async def _acquire_polite(self, resume_status: AgentStatus | None = None) -> None:
+        """Acquire the polite lock, honouring a pause request while waiting.
 
-        Uses a chars/4 heuristic (no tokenizer dependency). Adequate for a
-        threshold check given the headroom between the auto-context threshold
-        and the model's real context limit.
+        /pause during a lock wait must PAUSE, not interrupt: acquire() raises
+        PolitePauseRequested when the pause flag is set, so we go PAUSED and
+        block at _wait_if_paused(), then re-enter acquire() on resume. The
+        queue item (pending at the top of the loop, current mid-turn) and the
+        turn state are untouched — no [Interrupted] marker, no item
+        completion. Loop (not one-shot) because the user can pause again
+        while we wait for the lock after resuming.
 
-        Image content blocks are counted as a fixed 170 tokens (the actual
-        API cost for a medium-resolution image), not as the length of the
-        base64 data URI.
+        Pass resume_status=WAITING from mid-turn call sites (the turn
+        continues immediately after the wait); omit it at the top of the run
+        loop, where the queue decides the next state.
         """
-        IMAGE_BLOCK_TOKENS = 170  # ~token cost of one image block
-        total = 0
-        for m in messages:
-            content = m.get("content")
-            if isinstance(content, str):
-                total += len(content) // 4
-            elif isinstance(content, list):
-                for block in content:
-                    if isinstance(block, dict):
-                        btype = block.get("type")
-                        if btype == "text":
-                            total += len(block.get("text", "")) // 4
-                        elif btype == "image_url":
-                            total += IMAGE_BLOCK_TOKENS
-            for tc in m.get("tool_calls") or []:
-                fn = tc.get("function", {}) if isinstance(tc, dict) else {}
-                total += len(fn.get("arguments", "") or "") // 4
-        return total
+        while True:
+            try:
+                await self.polite_lock.acquire()
+                return
+            except PolitePauseRequested:
+                await self._wait_if_paused(resume_status=resume_status)
 
     def _estimate_current_context_tokens(self) -> int:
         """Estimate the true current context size at the safe point.
 
-        prompt_tokens reflects the LLM call that just completed (the context
-        before the tool results that were just added). Add the estimated
-        tokens of every message appended since that stream started.
+        Thin forward to the context gauge (agent13.context_gauge) — the
+        grounded value, the stream cursor, the stale-grounding (shrink)
+        guard, and the chars/4 fallback all live there now. Kept as a
+        method (not inlined at the two decision sites) so the auto-context
+        decision path stays greppable and mockable.
         """
-        added = self.messages[self._msg_count_before_stream :]
-        return self.prompt_tokens + self._estimate_message_tokens(added)
+        return self._context_gauge.estimate(self.messages, len(self.system_prompt))
+
+    def _invalidate_context_grounding(self) -> None:
+        """Re-ground the context gauge after a model swap.
+
+        Token counts are tokenizer-specific: identical content measured
+        10.2% apart on Swift vs DeepSeek (observed 2026-09-29). The
+        stale-grounding guard cannot detect a swap - the message count is
+        unchanged, so the old tokenizer's grounded count would be trusted
+        as-is. Re-ground to a fresh chars/4 estimate of the current
+        history (system + messages) - the same value the guard's shrink
+        fallback computes - and move the stream cursor to the end of the
+        history. The next pre-turn check decides on the estimate until the
+        next LLM call re-grounds with the new tokenizer's actual usage.
+        """
+        self._context_gauge.reground(self.messages, len(self.system_prompt))
 
     async def _estimate_post_compact_context(self) -> int:
-        """Estimate the context size the next LLM call will see post-compact.
+        """Re-ground the context gauge to the post-compact context size.
 
         System prompt + tools schema + current (compacted) messages, using
-        the same chars/4 heuristic as _estimate_message_tokens. The tools
-        schema is the largest unknown, so serialize the live tool list; on
-        failure fall back to system prompt + messages only.
+        the gauge's chars/4 heuristic. The tools schema is the largest
+        unknown, so serialize the live tool list; on failure fall back to
+        system prompt + messages only. Returns the new grounded value (for
+        CONTEXT_ESTIMATE emission) and moves the stream cursor to the end
+        of the (rewritten) history.
         """
-        base = len(self.system_prompt) // 4 + self._estimate_message_tokens(
-            self.messages
-        )
+        tools_len = None
         try:
             tools = await self.get_all_tools()
-            base += len(json.dumps(tools)) // 4
+            tools_len = len(json.dumps(tools)) // 4
         except Exception:
             pass
-        return base
+        return self._context_gauge.reground(
+            self.messages, len(self.system_prompt), tools_len
+        )
 
     def _save_auto_context_snapshot(self, n: int) -> None:
         """Save pre-compact history to a dated snapshot file.
@@ -1120,6 +1258,200 @@ class Agent:
         except Exception:
             # Snapshot is best-effort; a failure here must not kill the turn.
             pass
+
+    def _save_degenerate_snapshot(self, n: int) -> None:
+        """Save the history plus a degenerate partial to a snapshot file.
+
+        Sibling of ``_save_auto_context_snapshot``: same save_context call,
+        same dated location, ``_degenerate_N`` name, best-effort. Called
+        whenever the guard destroys or drops the partial output (the stop
+        path, and a nudge whose tail is a whitespace wall) — the snapshot
+        is the evidence the dropped output would otherwise leave behind.
+
+        The partial is temp-appended for the save and popped right after
+        (no await in between, so no interleaving). It is a PLAIN assistant
+        message, so the snapshot's ``incomplete_turn`` field reads False —
+        this file is a post-mortem artifact, not a resume point.
+        """
+        partial = None
+        if self._degenerate_partial is not None:
+            partial = self._degenerate_partial
+            self.messages.append(partial)
+        try:
+            from agent13.persistence import get_auto_save_path, save_context
+
+            base = get_auto_save_path(session_date=self.session_date)
+            path = base.parent / f"{base.stem}_degenerate_{n}.ctx"
+            save_context(self, path)
+        except Exception:
+            # Snapshot is best-effort; a failure here must not kill the turn.
+            pass
+        finally:
+            if partial is not None:
+                try:
+                    self.messages.remove(partial)
+                except ValueError:
+                    pass
+
+    def _classify_degenerate_end(
+        self, content: str, reasoning: str, finish_reason: str | None
+    ) -> str:
+        """Decide what to do with a no-tool-calls stream end.
+
+        Returns:
+            "none"  - normal end (caller appends the response and finishes)
+            "nudge" - auto-recover (caller applies the nudge, loop continues)
+            "stop"  - give up (caller snapshots, marks incomplete, breaks)
+
+        A degenerate end is a cap-hit (``finish_reason == "length"``) or a
+        whitespace-wall stop (visible content is all whitespace — the
+        empty-stream retry only covers zero-byte streams). The streak counts
+        CONSECUTIVE degenerate ends this turn and reaches the stop at
+        ``auto_context_nudge_cap`` (2: first end nudges, second stops).
+        Clean completions reset it: a tool-calls round, a chain restart,
+        a new user turn. Over the auto-context threshold the normal
+        wrap-up/compact/chain machinery owns the recovery (decision 2) —
+        the compact replaces the history anyway, so the partial never
+        poisons anything. cap <= 0 disables the guard.
+        """
+        if self.auto_context_nudge_cap <= 0:
+            return "none"
+        hit_cap = finish_reason == "length"
+        garbage_wall = finish_reason == "stop" and not content.strip()
+        if not (hit_cap or garbage_wall):
+            return "none"
+        # Priority rule: over threshold, skip the nudge and let the turn
+        # end - the threshold machinery (wrap-up/compact/chain) takes over.
+        estimated = self._estimate_current_context_tokens()
+        if self.auto_context_threshold > 0 and estimated >= self.auto_context_threshold:
+            return "none"
+        self._degenerate_streak += 1
+        if self._degenerate_streak >= self.auto_context_nudge_cap:
+            return "stop"
+        return "nudge"
+
+    def _build_degenerate_partial(
+        self, content: str, reasoning: str
+    ) -> dict:
+        """The partial output as a message dict (for snapshot preservation)."""
+        partial = {"role": "assistant", "content": content}
+        if reasoning:
+            partial["reasoning_content"] = reasoning
+        return partial
+
+    def _snapshot_degenerate_partial(self, content: str, reasoning: str) -> None:
+        """Snapshot the current history plus the degenerate partial.
+
+        Called whenever the partial is about to leave the history (a dropped
+        nudge, or the stop path) - the snapshot is the evidence the dropped
+        output would otherwise leave behind (the 09-16 user requirement:
+        "we are removing the degenerated turn it would be good to save it
+        for later inspection"). Best-effort.
+        """
+        self._degenerate_snapshot_count += 1
+        self._degenerate_partial = self._build_degenerate_partial(content, reasoning)
+        self._save_degenerate_snapshot(self._degenerate_snapshot_count)
+        self._degenerate_partial = None
+
+    async def _apply_degenerate_outcome(
+        self, decision: str, content: str, reasoning: str, finish_reason: str | None
+    ) -> bool:
+        """Act on a degenerate-end decision (mutates state; emits + logs).
+
+        Args:
+            decision: "nudge" or "stop" (from _classify_degenerate_end).
+            content: The partial visible output.
+            reasoning: The partial reasoning output.
+            finish_reason: The terminal chunk's finish_reason (for logs/notices).
+
+        Returns:
+            True when the caller should CONTINUE the turn loop (nudge);
+            False when it should break (stop - the turn is given up).
+        """
+        drop = _degenerate_tail_is_garbage(content, reasoning)
+        if decision == "nudge":
+            if drop:
+                # Whitespace wall: the partial carries no information and
+                # would poison the context - snapshot it, then drop it.
+                self._snapshot_degenerate_partial(content, reasoning)
+            else:
+                # Keep the partial: the model continues from its own last
+                # words ("continue exactly where you stopped").
+                append_assistant_message(self.messages, content, reasoning)
+                log_assistant_response(content, reasoning if reasoning else None)
+            self.messages.append(
+                {"role": "user", "content": DEGENERATE_NUDGE_PROMPT, "injected": True}
+            )
+            self._degenerate_nudges_total += 1
+            if is_debug_enabled():
+                log_degenerate_nudge(
+                    {
+                        "finish_reason": finish_reason,
+                        "content_length": len(content),
+                        "reasoning_length": len(reasoning),
+                        "kept": not drop,
+                        "streak": self._degenerate_streak,
+                        "cap": self.auto_context_nudge_cap,
+                        "nudges_total": self._degenerate_nudges_total,
+                    }
+                )
+            cause = (
+                "Model output was cut off (cap-hit)"
+                if finish_reason == "length"
+                else "Model output was empty/repetitive"
+            )
+            await self.emit(
+                AgentEvent.DEGENERATE_NUDGE,
+                {
+                    "message": (
+                        f"{cause} - nudged to continue "
+                        f"({self._degenerate_streak}/{self.auto_context_nudge_cap})"
+                    ),
+                    "level": "info",
+                    "action": "nudge",
+                },
+            )
+            return True
+
+        # Stop: the streak reached the cap. Snapshot the partial (it is
+        # about to leave the history), mark the turn incomplete (the
+        # empty-stream-exhaustion twin: /resume re-runs the turn from the
+        # pre-stream history tail), notify loudly.
+        self._degenerate_partial = {
+            "role": "assistant",
+            "content": content,
+        }
+        if reasoning:
+            self._degenerate_partial["reasoning_content"] = reasoning
+        self._degenerate_snapshot_count += 1
+        self._save_degenerate_snapshot(self._degenerate_snapshot_count)
+        self._degenerate_partial = None
+        self.mark_incomplete_turn(True)
+        if is_debug_enabled():
+            log_degenerate_stop(
+                {
+                    "finish_reason": finish_reason,
+                    "content_length": len(content),
+                    "reasoning_length": len(reasoning),
+                    "streak": self._degenerate_streak,
+                    "cap": self.auto_context_nudge_cap,
+                    "nudges_total": self._degenerate_nudges_total,
+                }
+            )
+        await self.emit(
+            AgentEvent.DEGENERATE_NUDGE,
+            {
+                "message": (
+                    "Model kept degenerating "
+                    f"({self._degenerate_streak}/{self.auto_context_nudge_cap} "
+                    "cut-off ends) - I stopped this turn. Snapshot saved; "
+                    "/resume retries it, or rephrase to start fresh."
+                ),
+                "level": "warning",
+                "action": "stop",
+            },
+        )
+        return False
 
     async def _check_threshold_pre_turn(self, _polite_acquired: bool = False) -> None:
         """Turn-start threshold check.
@@ -1195,38 +1527,72 @@ class Agent:
                 # per-session monotonic counter so snapshots never collide.
                 self._auto_context_snapshot_count += 1
                 self._save_auto_context_snapshot(self._auto_context_snapshot_count)
-                # Always a full compact (journal_mode no longer affects the auto
-                # path; per-turn reflection keeps running below the threshold).
-                success, msg = await self.compact_history("")
-                if not success:
-                    self._auto_context_failures += 1
-                    await self.emit(
-                        AgentEvent.NOTIFICATION,
-                        {
-                            "message": (f"Auto-context: compact failed — idle. {msg}"),
-                            "level": "error",
-                        },
-                    )
-                    break
-                self._auto_context_failures = 0
+
+                chat_cleared = False
+                # Chain budget spent: the persistent chat footer says so.
+                # The wipe + rebuild below would otherwise leave no trace
+                # in the window of why the turn stopped (the toast is
+                # transient).
+                exhaustion_line = (
+                    f"Auto-context: {self._auto_context_chain_used}/"
+                    f"{self.auto_context_chain} restarts used — turn "
+                    "stopped, context compacted. Send a message to "
+                    f"continue. (session total: {self._chain_count})"
+                    if restart
+                    and self._auto_context_chain_used
+                    >= self.auto_context_chain
+                    else None
+                )
+                if self.auto_context_action == "report_and_compact":
+                    # Wrap-up ran: mechanical restart (no AI call).
+                    chat_cleared = True
+                    await self._mechanical_restart(system_line=exhaustion_line)
+                    self._auto_context_failures = 0
+                else:
+                    # No wrap-up: the verbose compact summary is the only
+                    # carrier. Original AI-call path.
+                    success, msg = await self.compact_history("")
+                    if not success:
+                        self._auto_context_failures += 1
+                        if is_debug_enabled():
+                            log_tps_event(
+                                "auto_context_decision",
+                                {
+                                    "reason": "compact_failed",
+                                    "chain": self.auto_context_chain,
+                                    "chain_used": self._auto_context_chain_used,
+                                },
+                            )
+                        await self.emit(
+                            AgentEvent.NOTIFICATION,
+                            {
+                                "message": (
+                                    f"Auto-context: compact failed — idle. {msg}"
+                                ),
+                                "level": "error",
+                            },
+                        )
+                        break
+                    self._auto_context_failures = 0
                 if restart and self._auto_context_chain_used < self.auto_context_chain:
                     self._auto_context_chain_used += 1
-                    await self.emit(AgentEvent.CHAT_CLEAR, {})
-                    # Nudge the model to finish the original task. The paths
-                    # captured from the wrap-up's own writes are re-announced
-                    # so they survive into every chain restart: the truth file
-                    # with a read-first cue (orientation for the new chain -
-                    # the summary alone was shown not to reliably trigger the
-                    # read), the journal with its append-at-wrap-up cue.
-                    nudge = AUTO_CONTEXT_CONTINUE_HINT
-                    if self._session_truth_path:
-                        nudge += AUTO_CONTEXT_TRUTH_CUE.format(
-                            truth_path=self._session_truth_path
+                    if not chat_cleared:
+                        await self.emit(AgentEvent.CHAT_CLEAR, {})
+                    # Nudge the model to continue. The durable records
+                    # (mechanical path) or the compact summary's embedded
+                    # pointer block (compact-only path) carry the file
+                    # orientation — no redundant cues here. When the turn
+                    # carries a captured user instruction (set at turn
+                    # start), re-inject it VERBATIM: the user's standing
+                    # instruction is the intent source across chains (a
+                    # mid-turn question must not be wiped out by the
+                    # restart).
+                    if self._in_flight_user_request:
+                        nudge = AUTO_CONTEXT_CARRY_HINT.format(
+                            instruction=self._in_flight_user_request
                         )
-                    if self._session_journal_path:
-                        nudge += AUTO_CONTEXT_JOURNAL_CUE.format(
-                            journal_path=self._session_journal_path
-                        )
+                    else:
+                        nudge = AUTO_CONTEXT_CONTINUE_HINT
                     # "injected" keeps the nudge inside the turn it lands in
                     # (is_turn_start) and off the API wire (LOCAL_MSG_KEYS) -
                     # it carries no user intent. The TUI's chain-restart
@@ -1235,8 +1601,25 @@ class Agent:
                     self.messages.append(
                         {"role": "user", "content": nudge, "injected": True}
                     )
+                    if not chat_cleared:
+                        # Compact-only path: the mechanical restart already
+                        # emitted CHAT_REBUILD; this path needs its own so
+                        # the TUI renders the compact summary + nudge before
+                        # the continuation turn streams in.
+                        await self.emit(AgentEvent.CHAT_REBUILD, {})
                     await self._llm_turn(_polite_acquired=_polite_acquired)
                 else:
+                    if is_debug_enabled():
+                        log_tps_event(
+                            "auto_context_decision",
+                            {
+                                "reason": (
+                                    "continuing" if not restart else "chain_exhausted"
+                                ),
+                                "chain": self.auto_context_chain,
+                                "chain_used": self._auto_context_chain_used,
+                            },
+                        )
                     await self.emit(
                         AgentEvent.NOTIFICATION,
                         {
@@ -1265,6 +1648,11 @@ class Agent:
         afterwards the pending compact proceeds. Fires once per chain cycle —
         the per-turn chain counter (plus suppression) replaces the old
         once-per-session latch.
+
+        When an explicit focus name is set in state (/focus NAME,
+        /wrapup NAME, --focus NAME), it is injected into the prompt so the
+        name is used for the {focus} files even if it was never said in the
+        conversation. The auto threshold path relies on the same state.
         """
         if not self._report_and_compact_triggered:
             # No pending wrap-up: a direct call without the flag is a no-op.
@@ -1285,12 +1673,19 @@ class Agent:
             }
         )
         now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+        parts = [self.report_and_compact_prompt]
+        if self._focus_name:
+            parts.append(
+                f"The user has specified the focus name for this wrap-up: "
+                f'"{self._focus_name}". Use it for {{focus}} in both file '
+                "names and headings; it overrides any name from the "
+                "conversation."
+            )
+        parts.append(f"Current date and time: {now}")
         self.messages.append(
             {
                 "role": "user",
-                "content": (
-                    f"{self.report_and_compact_prompt}\n\nCurrent date and time: {now}"
-                ),
+                "content": "\n\n".join(parts),
                 "report_and_compact": True,
             }
         )
@@ -1305,36 +1700,129 @@ class Agent:
         finally:
             self._suppress_auto_context = False
 
-    def _capture_session_journal_path(self, new_messages: list[dict]) -> None:
-        """Capture the journal and current-truth paths from the wrap-up's
-        own tool calls.
+    # ── Durable records (agent13.durable_records) ─────────────────────────
+    #
+    # The focus/record state and its derivations live in DurableRecords;
+    # these are the thin forwards that keep the Agent attribute surface the
+    # UIs, persistence and the existing tests use. History is passed in,
+    # never bound. The two record readers deliberately have NO forward here:
+    # patching agent._read_record_file would be a silent no-op, so tests
+    # patch agent.durable_records.read_record_file instead - the seam the
+    # module exists to make single.
 
-        The wrap-up prompt tells the model to append to
-        docs_archive/{intent_or_feature}_journal.md and rewrite
-        docs_archive/{project}_current_truth.md. The paths the model chose
-        are carried across chain boundaries in the continuation nudge (the
-        journal: append at the next wrap-up; the truth file: read-first cue
-        for the next chain), so each later wrap-up touches the same files.
-        Last matching write wins.
+    @property
+    def _focus_name(self) -> str:
+        """Explicit focus name (authoritative when set) - forwarded."""
+        return self.durable_records.focus_name
+
+    @property
+    def _session_truth_path(self) -> str:
+        """Current-truth record path - forwarded to the durable records."""
+        return self.durable_records.truth_path
+
+    @_session_truth_path.setter
+    def _session_truth_path(self, value: str) -> None:
+        self.durable_records.truth_path = value
+
+    @property
+    def _session_journal_path(self) -> str:
+        """Session journal record path - forwarded to the durable records."""
+        return self.durable_records.journal_path
+
+    @_session_journal_path.setter
+    def _session_journal_path(self, value: str) -> None:
+        self.durable_records.journal_path = value
+
+    @property
+    def _session_focus_name(self) -> str:
+        """Effective focus name (explicit, else path-derived) - forwarded."""
+        return self.durable_records.name
+
+    def set_focus_name(self, name: str) -> None:
+        """Set the explicit focus name; the record paths derive from it."""
+        self.durable_records.set_focus_name(name)
+
+    async def apply_focus_name(self, name: str) -> tuple[str, str]:
+        """Apply /focus [NAME] immediately (the UI command path).
+
+        Thin async forward onto DurableRecords.apply_focus - see there for
+        the semantics and the (message, level) contract the UIs present.
         """
-        for msg in new_messages:
-            for call in msg.get("tool_calls") or []:
-                try:
-                    fn = call["function"]
-                    if fn["name"] not in ("write_file", "edit_file"):
-                        continue
-                    # The file tools' parameter is "filepath" (write_file/
-                    # edit_file signatures). Reading "path" here always
-                    # returned "" - the nudge never carried the journal path.
-                    path = json.loads(fn["arguments"]).get("filepath", "")
-                except (KeyError, TypeError, ValueError):
-                    continue
-                if "docs_archive" not in path:
-                    continue
-                if path.endswith("_journal.md"):
-                    self._session_journal_path = path
-                elif path.endswith("_current_truth.md"):
-                    self._session_truth_path = path
+        return self.durable_records.apply_focus(name, self.messages)
+
+    def seed_from_records(self, force: bool = False) -> bool:
+        """Seed the message history from the focus's durable records."""
+        return self.durable_records.seed(self.messages, force=force)
+
+    def _capture_session_journal_path(self, new_messages: list[dict]) -> None:
+        """Capture the record paths from the wrap-up's own tool calls."""
+        self.durable_records.capture_paths(new_messages)
+
+    def _wrapup_is_current(self) -> bool:
+        """True when the durable record is still current (no tool calls
+        since the last wrap-up completed)."""
+        return self.durable_records.is_wrapup_current(self.messages)
+
+    async def _mechanical_restart(
+        self, carry_skills: bool = True, system_line: str | None = None
+    ) -> bool:
+        """Clear history and inject the pre-baked intro + durable records.
+
+        No AI call. Used by the auto-chain post-wrap-up path and the
+        /chain command. The intro is merged into the records message
+        (single user message, clean role alternation). When carry_skills
+        is True (default) and skills were manually loaded this session,
+        their content is injected as a section between the intro and the
+        records (order: intro -> skills -> truth -> journal). system_line
+        overrides the persistent chat footer the TUI writes with the
+        CHAT_REBUILD (the chain-exhausted path passes the exhaustion
+        notice, so the wipe + rebuild leaves a visible record of why the
+        turn stopped). Returns True if records were injected, False if no
+        record content was found.
+        """
+        self.clear_messages()
+        await self.emit(AgentEvent.CHAT_CLEAR, {})
+        # Full history replacement = one chain (session-lifetime total).
+        self._chain_count += 1
+        # Fresh context = a clean completion for the degeneration guard: the
+        # streak counts CONSECUTIVE degenerate ends, and the restart is the
+        # strongest possible reset between them.
+        self._degenerate_streak = 0
+        intro = self.durable_records.restart_intro()
+        skills_section = (
+            self._format_active_skills_section() if carry_skills else ""
+        )
+        prefix = intro
+        if skills_section:
+            prefix += "\n\n" + skills_section
+        seeded = self.seed_from_records()
+        if self.messages:
+            # Prepend intro (+ skills) to the records message (single user
+            # message).
+            self.messages[0]["content"] = prefix + "\n\n" + self.messages[0]["content"]
+        else:
+            # No records found — intro (+ skills) stands alone.
+            self.messages.append(
+                {"role": "user", "content": prefix, "injected": True}
+            )
+        # Tell the TUI to rebuild its display from the now-populated history.
+        # The CHAT_CLEAR above already wiped the display; this repopulates it
+        # so the user sees the injected records instead of a blank window.
+        await self.emit(
+            AgentEvent.CHAT_REBUILD,
+            {
+                "system_line": (
+                    system_line
+                    or "Context compacted — showing session summary"
+                )
+            },
+        )
+        post_est = await self._estimate_post_compact_context()
+        await self.emit(
+            AgentEvent.CONTEXT_ESTIMATE,
+            {"estimated_tokens": post_est},
+        )
+        return seeded
 
     @property
     def auto_context_chain_used(self) -> int:
@@ -1344,6 +1832,39 @@ class Agent:
         /status). Resets to 0 at the start of each user turn.
         """
         return self._auto_context_chain_used
+
+    @property
+    def chain_count(self) -> int:
+        """Session-lifetime compaction total for UIs (status bar, /status).
+
+        Counts every full history replacement (compacts + chain restarts).
+        Survives save/load; reset only by /new_session.
+        """
+        return self._chain_count
+
+    @property
+    def session_started_at(self) -> str:
+        """ISO timestamp of the original session start.
+
+        Persisted in the .ctx save, so a session resumed days later keeps
+        its true start time (survives save/load; reset by /new_session).
+        """
+        return self._session_started_at
+
+    @property
+    def degenerate_nudges(self) -> int:
+        """Session-lifetime degeneration-guard nudge count (for /status).
+
+        Incremented each time the guard nudges a degenerate stream end
+        (cap-hit or whitespace wall). Persisted in the .ctx save so a
+        resumed session keeps its total (chain_count pattern).
+        """
+        return self._degenerate_nudges_total
+
+    def reset_session_counters(self) -> None:
+        """Start a new session identity: compaction total to 0, start to now."""
+        self._chain_count = 0
+        self._session_started_at = datetime.datetime.now().isoformat()
 
     def _should_check_threshold(self, estimated_context: int) -> bool:
         """Gate for the auto-context threshold check at a safe point.
@@ -1358,16 +1879,42 @@ class Agent:
             and not self._suppress_auto_context
         )
 
+    def _capture_in_flight_user_request(self) -> str:
+        """Store this turn's user instruction from the current history.
+
+        Used by the resume path, where the turn-start user message comes
+        from the restored history (the normal path captures item.text
+        explicitly where it is appended). Scans for the last genuine user
+        message (is_turn_start — excludes injected nudges, interrupt
+        markers, wrap-up prompts) and stores it as the standing
+        instruction re-injected verbatim at each chain restart. A no-op
+        when an instruction is already stored (the turn-start capture
+        wins). Cleared by _reset_auto_context_turn_state at each
+        user-turn start, so a manual /chain while idle carries nothing
+        stale (falls back to the bare nudge).
+        """
+        if self._in_flight_user_request:
+            return self._in_flight_user_request
+        for msg in reversed(self.messages):
+            if is_turn_start(msg):
+                self._in_flight_user_request = str(msg.get("content", ""))
+                break
+        return self._in_flight_user_request
+
     def _reset_auto_context_turn_state(self) -> None:
         """Reset per-turn auto-context state at the start of each user turn.
 
         The chain budget is per-turn (chain=N means N restarts every turn, not
         N for the session). The flag clears are hygiene: a flag left set by a
-        failed wrap-up or compact cannot leak into the next turn.
+        failed wrap-up or compact cannot leak into the next turn. The
+        degeneration streak resets here too — a new user turn is a clean
+        completion as far as the guard is concerned.
         """
         self._auto_context_chain_used = 0
         self._auto_context_triggered = False
         self._report_and_compact_triggered = False
+        self._in_flight_user_request = ""
+        self._degenerate_streak = 0
 
     async def _handle_threshold_check(self, estimated_context: int) -> str:
         """Handle the auto-context threshold being hit at a safe point.
@@ -1495,6 +2042,34 @@ class Agent:
                 None, lambda: self.execute_tool(name, arguments)
             )
 
+    def _bound_tool_result_text(self, text: str, tool_name: str) -> str:
+        """Bound a tool result's text per [tools] max_result_chars.
+
+        A per-tool override (declared on the tool function via
+        @tool(max_result_chars=...)) wins over the global config. 0 = off.
+        Over-cap text is spilled to a temp file; the model receives
+        head + marker + tail (agent13.tool_output_bound.bound_tool_result).
+        """
+        if not text:
+            return text
+        from agent13.tool_output_bound import bound_tool_result
+        from agent13.tools import get_tool_max_result_chars
+        from agent13.config import get_config
+
+        cap = get_tool_max_result_chars(tool_name)
+        if cap is None:
+            # The real Config always sets this (default 30000); fall back to
+            # the design cap if the object lacks it (a minimal test mock).
+            cap = getattr(get_config(), "tools_max_result_chars", 30_000)
+        bounded, _spill = bound_tool_result(text, cap, tool_name)
+        if bounded is not text:
+            # bound_tool_result returns the input object unchanged when no
+            # bounding happened; a new string means the marker was inserted.
+            # Count it even when the spill write failed - the model still
+            # received truncated text.
+            self.tool_stats.bounded += 1
+        return bounded
+
     async def _build_tool_result_content(
         self, result: "str | ToolResult", tool_name: str, tool_call_id: str
     ) -> tuple[dict, list[dict]]:
@@ -1520,6 +2095,12 @@ class Agent:
             text = str(result)
             images = []
             question = ""
+
+        # Phase 1 tool output bounding: over-cap text is spilled to a temp
+        # file; the model gets head + marker + tail (the marker names the
+        # spill file). Applies to the text of BOTH branches - image payloads
+        # pass through untouched (Phase 2).
+        text = self._bound_tool_result_text(text, tool_name)
 
         if not images:
             # No images — current behavior
@@ -1769,6 +2350,10 @@ class Agent:
                 by the caller (run()). The lock is released in the finally
                 below if this is True.
         """
+        # One queue item = one user turn: reset the per-turn tool-call
+        # numbering so each turn's calls number from 1.
+        self._turn_tool_seq = 0
+
         # Clear and load are instant housekeeping operations — skip
         # WAITING status so the bell doesn't arm/ring for them.
         if item.kind not in ("clear", "load"):
@@ -1832,7 +2417,17 @@ class Agent:
                 log_queue_complete(item.id, "complete")
                 await self._emit_queue_update()
             elif item.kind == "compact":
-                compact_prompt = (item.data or {}).get("compact_prompt", "")
+                item_data = item.data or {}
+                compact_prompt = item_data.get("compact_prompt", "")
+                # A wrap-up is still current (it ran and no tool calls - major
+                # work - happened since) and the user gave no explicit prompt:
+                # use the short bridge summary (the files carry the details),
+                # matching the auto path. An explicit prompt (--prompt / focus
+                # text) always wins.
+                if self._wrapup_is_current() and not item_data.get(
+                    "user_specified_prompt", False
+                ):
+                    compact_prompt = DEFAULT_REPORT_AND_COMPACT_SUMMARY_PROMPT
                 success, message = await self.compact_history(compact_prompt)
                 if success:
                     await self.emit(
@@ -1853,6 +2448,69 @@ class Agent:
                 self.queue.complete_current()
                 log_queue_complete(item.id, "complete")
                 await self._emit_queue_update()
+            elif item.kind == "wrapup":
+                # Manual /wrapup: bring the durable record up to date, then
+                # STOP - no compact, no chain restart. The session ends idle
+                # with the full history intact (user can /save it, or
+                # /compact later to start a new chain). Same injected prompt
+                # and turn machinery as the threshold-triggered wrap-up.
+                # /wrapup NAME makes NAME the authoritative focus name (the
+                # prompt reads it from state); bare /wrapup keeps the
+                # existing name, if any. If context is left over threshold,
+                # the pre-turn check handles it on the next user command.
+                focus_name = (item.data or {}).get("focus_name")
+                if focus_name:
+                    self.set_focus_name(focus_name)
+                self._report_and_compact_triggered = True
+                await self._run_report_and_compact_turn(
+                    _polite_acquired=_polite_acquired,
+                )
+                await self.emit(
+                    AgentEvent.NOTIFICATION,
+                    {
+                        "message": (
+                            "Wrap-up complete - journal + current-truth "
+                            "updated. History unchanged; /save to snapshot "
+                            "or /compact to start a new chain."
+                        ),
+                        "level": "info",
+                    },
+                )
+                self.queue.complete_current()
+                log_queue_complete(item.id, "complete")
+                await self._emit_queue_update()
+            elif item.kind == "chain":
+                # /chain - manual "restart the loop": bring the durable
+                # record up to date (wrap-up if stale), clear the history,
+                # and re-inject the records. No compact summary - the
+                # records ARE the context. Zero model calls when the
+                # wrap-up is already current. "no-skills" arg: drop
+                # manually-loaded skills from this restart AND forget
+                # them (they are one /skillname away if still needed).
+                no_skills = bool((item.data or {}).get("no_skills", False))
+                if no_skills:
+                    self.clear_active_skills()
+                if not self._wrapup_is_current():
+                    self._report_and_compact_triggered = True
+                    await self._run_report_and_compact_turn(
+                        _polite_acquired=_polite_acquired,
+                    )
+                seeded = await self._mechanical_restart(carry_skills=not no_skills)
+                suffix = ", skills dropped" if no_skills else ""
+                if seeded:
+                    message = f"Chain restarted - records injected{suffix}"
+                else:
+                    message = (
+                        "Chain restarted - no records found "
+                        "(set a focus name first with /focus NAME)" + suffix
+                    )
+                await self.emit(
+                    AgentEvent.NOTIFICATION,
+                    {"message": message, "level": "info"},
+                )
+                self.queue.complete_current()
+                log_queue_complete(item.id, "complete")
+                await self._emit_queue_update()
             elif item.kind == "clear":
                 # Deferred /clear — safe at this boundary between items
                 mode = (item.data or {}).get("mode", "all")
@@ -1861,6 +2519,9 @@ class Agent:
                     count = self.trim_messages(keep_turns)
                 else:
                     count = self.clear_messages()
+                    # /new_session: wiping the history starts a NEW session
+                    # identity - compaction total resets, start time is now.
+                    self.reset_session_counters()
                 self.queue.complete_current()
                 log_queue_complete(item.id, "complete")
                 await self._emit_queue_update()
@@ -1926,6 +2587,10 @@ class Agent:
 
                 # Add user message to history
                 self.messages.append({"role": "user", "content": item.text})
+                # This message is the turn's standing instruction: carried
+                # verbatim into every chain restart's nudge so intent
+                # survives the restarts (cleared at the next turn start).
+                self._in_flight_user_request = item.text
 
                 # Process with LLM (may include multiple tool call rounds)
                 await self._llm_turn(_polite_acquired=_polite_acquired)
@@ -2099,7 +2764,7 @@ class Agent:
                 # (after tool execution), we re-acquire here.
                 if _polite_acquired and self.polite_lock is not None:
                     if not self.polite_lock.is_held():
-                        await self.polite_lock.acquire()
+                        await self._acquire_polite(resume_status=AgentStatus.WAITING)
 
                 # Stream response, capturing reasoning and tool calls.
                 #
@@ -2115,6 +2780,11 @@ class Agent:
                     content = ""
                     reasoning = ""
                     tool_calls = None
+                    # Terminal finish_reason for this stream attempt (the
+                    # degeneration guard's cap-hit signal). Reset per retry:
+                    # a stale value from an empty-stream attempt must not
+                    # classify the next attempt's end.
+                    _finish_reason = None
                     # Tool-call ids we've already emitted TOOL_CALL_STARTED for, so
                     # the early "name known" signal fires exactly once per tool call.
                     _started_tool_ids: set = set()
@@ -2141,7 +2811,7 @@ class Agent:
                     # Record context size at stream start so the safe point can
                     # estimate the true current context (prompt_tokens alone is
                     # stale - it predates the tool results added after this call).
-                    self._msg_count_before_stream = len(self.messages)
+                    self._context_gauge.record_stream_start(len(self.messages))
 
                     # Stream via _stream_and_emit which handles STREAM_START
                     # and TOKEN_USAGE centrally (DRY).
@@ -2249,6 +2919,12 @@ class Agent:
                                         ],
                                     },
                                 )
+                        elif event_type == "finish":
+                            # Terminal finish_reason (from llm.py's
+                            # choices-bearing terminal chunk - the usage-only
+                            # chunk has empty choices). Missing = no signal;
+                            # the guard stays conservative.
+                            _finish_reason = data.get("finish_reason")
                     # Non-empty stream: break out of the retry loop.
                     if content or reasoning or tool_calls is not None:
                         break
@@ -2324,6 +3000,9 @@ class Agent:
 
                 # Handle tool calls if present
                 if tool_calls:
+                    # A tool-calls round is a clean completion: it breaks the
+                    # consecutive-degenerate-ends streak (plan decision 3).
+                    self._degenerate_streak = 0
                     if is_debug_enabled():
                         log_tps_event(
                             "agent_tool_calls_detected",
@@ -2361,7 +3040,14 @@ class Agent:
                     self.messages.append(msg)
 
                     # Execute each tool call
+                    # seq: 1-based number of the call within the current user
+                    # turn (continues across the turn's LLM iterations),
+                    # carried in the TOOL_CALL and TOOL_RESULT payloads so the
+                    # UIs can pair a result with its call when a batch's
+                    # results render after all its calls.
                     for tc in tool_calls:
+                        self._turn_tool_seq += 1
+                        seq = self._turn_tool_seq
                         # Check if stop requested - exit tool loop immediately
                         if not self._running:
                             break
@@ -2406,6 +3092,7 @@ class Agent:
                             {
                                 "name": name,
                                 "arguments": arguments,
+                                "seq": seq,
                             },
                         )
 
@@ -2427,6 +3114,7 @@ class Agent:
                             {
                                 "name": name,
                                 "result": display_text,
+                                "seq": seq,
                             },
                         )
 
@@ -2529,6 +3217,9 @@ class Agent:
                 reasoning_tool_calls = detect_tool_calls_in_reasoning(reasoning)
 
                 if reasoning_tool_calls:
+                    # Same streak reset as the structured tool-calls branch:
+                    # this is also a tool round (the Qwen workaround path).
+                    self._degenerate_streak = 0
                     # Tool calls detected in reasoning - handle them
                     if is_debug_enabled():
                         log_tps_event(
@@ -2610,8 +3301,11 @@ class Agent:
                     # Transition to TOOLING state
                     await self._set_status(AgentStatus.TOOLING)
 
-                    # Execute each detected tool call
+                    # Execute each detected tool call (i stays for the
+                    # tc_reasoning_{i} ids; seq is the per-turn number)
                     for i, tc in enumerate(reasoning_tool_calls):
+                        self._turn_tool_seq += 1
+                        seq = self._turn_tool_seq
                         name = tc["name"]
                         arguments = tc["arguments"]
 
@@ -2622,6 +3316,7 @@ class Agent:
                             {
                                 "name": name,
                                 "arguments": arguments,
+                                "seq": seq,
                             },
                         )
 
@@ -2643,6 +3338,7 @@ class Agent:
                             {
                                 "name": name,
                                 "result": display_text,
+                                "seq": seq,
                             },
                         )
 
@@ -2664,6 +3360,28 @@ class Agent:
                         )
                     await self._set_status(AgentStatus.WAITING)
                     continue
+
+                # Degeneration guard: classify the no-tool-calls stream end
+                # (cap-hit or whitespace wall). "none" falls through to the
+                # normal append below; "nudge"/"stop" hand the appends over
+                # to _apply_degenerate_outcome (keep-or-drop + injected
+                # nudge, or snapshot + incomplete marker) and its return
+                # value drives the loop.
+                decision = self._classify_degenerate_end(
+                    content, reasoning, _finish_reason
+                )
+                if decision != "none":
+                    keep_going = await self._apply_degenerate_outcome(
+                        decision, content, reasoning, _finish_reason
+                    )
+                    if keep_going:
+                        # Nudged: loop continues - the next LLM call rides
+                        # the warm KV prefix (partial + nudge in history).
+                        continue
+                    # Stop: turn given up (the apply set the incomplete-turn
+                    # marker; /resume retries it from the history tail).
+                    self._strip_images_from_messages()
+                    break
 
                 # No tool calls - add final response to history
                 # Always include reasoning for within-turn continuity; stripping
@@ -2739,11 +3457,19 @@ class Agent:
         coordination tracks the model actually in use. The swap is skipped
         when the lock is held mid-turn (mirrors ``set_client``).
 
+        A real model swap also invalidates the grounded prompt_tokens:
+        token counts are tokenizer-specific, so the old model's grounded
+        count is stale for the new tokenizer (and the stale-grounding
+        guard cannot detect it - the message count is unchanged).
+
         Args:
             model: The model name to use
         """
+        if model == self.model:
+            return
         self.model = model
         self.tool_stats.reset()  # Reset stats on model change
+        self._invalidate_context_grounding()
         # Re-key the polite lock to the new model (per-model coordination).
         if self.polite_lock is not None and not self.polite_lock.is_held():
             old_interval = self.polite_lock.interval
@@ -2782,6 +3508,15 @@ class Agent:
         """
         self.system_prompt = prompt
 
+    def reload_agents_md(self) -> None:
+        """Re-read AGENTS.md from disk, refreshing the system-prompt cache.
+
+        AGENTS.md content is appended to the system prompt on every LLM call;
+        this refreshes the cached copy so edits to AGENTS.md take effect
+        without restarting. Called by the TUI /prompt command.
+        """
+        reload_agents_md()
+
     def set_response_format(self, response_format: dict) -> None:
         """Set the response format.
 
@@ -2817,6 +3552,40 @@ class Agent:
         """
         self._skills_mode = enabled
         self._rebuild_tools()
+
+    @property
+    def active_skills(self) -> dict[str, str]:
+        """Skills manually loaded this session (name -> content, load order)."""
+        return dict(self._active_skills)
+
+    def note_skill_loaded(self, name: str, content: str) -> None:
+        """Track a manually loaded skill for chain-restart re-injection.
+
+        Called by the TUI's /skillname handler with the formatted skill
+        content (including any user-appended args). Dedups by name: a
+        re-load replaces the stored content; first-seen order is kept.
+        Empty name or content is ignored.
+        """
+        if not name or not content:
+            return
+        self._active_skills[name] = content
+
+    def clear_active_skills(self) -> None:
+        """Forget all tracked skills (the /chain no-skills path)."""
+        self._active_skills.clear()
+
+    def _format_active_skills_section(self) -> str:
+        """The chain-restart skills section: a header plus the loaded skill
+        blocks (each already a <skill_content> block), in load order.
+        "" when no skills are tracked."""
+        if not self._active_skills:
+            return ""
+        lines = [
+            "Skills loaded this session (re-injected on chain restart; "
+            "drop them from future restarts with /chain no-skills):"
+        ]
+        lines.extend(self._active_skills.values())
+        return "\n\n".join(lines)
 
     @property
     def polite_mode(self) -> bool:
@@ -2858,6 +3627,10 @@ class Agent:
             interval=interval,
             model=model_key,
             emit=self.emit,
+            # /pause during a lock wait must pause, not interrupt: acquire()
+            # backs off (PolitePauseRequested) so the turn/queue state
+            # survives and /resume re-enters the wait.
+            pause_check=lambda: self._pause_state != PauseState.RUNNING,
         )
 
     def _model_base_name(self) -> str:
@@ -3032,6 +3805,15 @@ class Agent:
 
         if not compact_prompt:
             compact_prompt = DEFAULT_COMPACT_PROMPT
+        # Only the verbose DEFAULT falls through here; a non-empty
+        # compact_prompt (user prompt, bridge prompt) is used as-is. The
+        # durable-record pointer block is appended to the summary of a
+        # DEFAULT-prompt compact only - a user-specified prompt wins clean,
+        # and the bridge prompt already carries the file pointers. Compare
+        # by VALUE, not identity: the REPL/TUI resolve "compaction" from
+        # prompts.yaml (a separate string object, content-pinned to the
+        # constant by test_default_prompts_pin.py).
+        default_prompt = compact_prompt == DEFAULT_COMPACT_PROMPT
 
         if not self.messages:
             return False, "No messages in context"
@@ -3082,6 +3864,9 @@ class Agent:
                     await self._set_status(AgentStatus.IDLE)
                 return False, "Compaction produced no summary"
 
+            if default_prompt:
+                summary = self.durable_records.append_pointer(summary)
+
             tokens_after = len(summary.split())
 
             # Replace entire history with the lightweight pair
@@ -3089,6 +3874,9 @@ class Agent:
                 {"role": "user", "content": COMPACT_REPLACEMENT_MESSAGE},
                 {"role": "assistant", "content": summary},
             ]
+
+            # Full history replacement = one chain (session-lifetime total).
+            self._chain_count += 1
 
             # Emit ASSISTANT_COMPLETE to signal stream end
             await self.emit(AgentEvent.ASSISTANT_COMPLETE, {"text": summary})
@@ -3103,14 +3891,21 @@ class Agent:
                 },
             )
 
-            # Publish a fresh context estimate so the TUI's Ctx counter drops
-            # to the post-compact size immediately. The grounded prompt_tokens
-            # is stale here - it reflects the pre-compact call that just
-            # produced the summary. The next LLM call's TOKEN_USAGE replaces
-            # this with the grounded count.
+            # Re-ground the estimator state AND publish a fresh context
+            # estimate so the TUI's Ctx counter drops to the post-compact
+            # size immediately. prompt_tokens still reflects the pre-compact
+            # call that produced the summary (its REQUEST was the full old
+            # history), and _msg_count_before_stream points past the
+            # rewritten history - left as-is, the pre-turn auto-context
+            # check would compare the stale pre-compact size against the
+            # threshold and fire a spurious wrap-up on the tiny post-compact
+            # history (observed 2026-09-28: /compact to ~14k, next pre-turn
+            # check read 259k and wrapped up). The estimate stands in until
+            # the next real LLM call re-grounds with actual usage.
+            post_compact_estimate = await self._estimate_post_compact_context()
             await self.emit(
                 AgentEvent.CONTEXT_ESTIMATE,
-                {"estimated_tokens": await self._estimate_post_compact_context()},
+                {"estimated_tokens": post_compact_estimate},
             )
 
             return True, f"Compacted {tokens_before}\u2192{tokens_after} words"

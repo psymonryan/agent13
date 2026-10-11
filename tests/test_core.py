@@ -889,3 +889,96 @@ class TestAgentAvailableModels:
         agent.set_client(MockClient(), models=[])
 
         assert agent.available_models == []
+
+
+class TestMCPConnectGate:
+    """The agent loop must not start a turn while MCP is (re)connecting.
+
+    A turn started mid-connect would run with a partial tool list and then
+    need the whole history re-prompted once the connect completes. Queued
+    items must stay in the queue (visible, deletable) until connect_all()
+    returns.
+    """
+
+    class FakeMCP:
+        def __init__(self, connecting: bool = True):
+            self.connecting = connecting
+
+        async def cleanup(self, timeout: float = 5.0):
+            pass
+
+    @pytest.mark.asyncio
+    async def test_turn_deferred_while_mcp_connecting(self):
+        agent = Agent(MockClient(), model="test-model")
+        agent._mcp = self.FakeMCP(connecting=True)
+
+        processed = []
+
+        async def spy(item, polite=False):
+            processed.append(item)
+            agent.queue.complete_current()
+
+        agent._process_item = spy
+
+        run_task = asyncio.create_task(agent.run())
+        try:
+            await agent.add_message("hello")
+            await asyncio.sleep(0.3)
+            # Still connecting: item must stay queued, no turn started
+            assert processed == []
+            assert agent.queue.pending_count == 1
+
+            # Connect finishes: the queued turn starts
+            agent._mcp.connecting = False
+            await asyncio.sleep(0.5)
+            assert len(processed) == 1
+            assert agent.queue.pending_count == 0
+        finally:
+            agent.stop()
+            await run_task
+
+    @pytest.mark.asyncio
+    async def test_no_gate_without_mcp(self):
+        """With no MCP manager, items process immediately (no regression)."""
+        agent = Agent(MockClient(), model="test-model")
+
+        processed = []
+
+        async def spy(item, polite=False):
+            processed.append(item)
+            agent.queue.complete_current()
+
+        agent._process_item = spy
+
+        run_task = asyncio.create_task(agent.run())
+        try:
+            await agent.add_message("hello")
+            await asyncio.sleep(0.5)
+            assert len(processed) == 1
+            assert agent.queue.pending_count == 0
+        finally:
+            agent.stop()
+            await run_task
+
+    @pytest.mark.asyncio
+    async def test_stop_while_waiting_on_mcp_connect(self):
+        """stop() while blocked on the connect gate exits the loop cleanly."""
+        agent = Agent(MockClient(), model="test-model")
+        agent._mcp = self.FakeMCP(connecting=True)  # never releases
+
+        processed = []
+
+        async def spy(item, polite=False):
+            processed.append(item)
+            agent.queue.complete_current()
+
+        agent._process_item = spy
+
+        run_task = asyncio.create_task(agent.run())
+        await agent.add_message("hello")
+        await asyncio.sleep(0.3)
+        assert processed == []
+
+        agent.stop()
+        await asyncio.wait_for(run_task, timeout=2.0)
+        assert processed == []  # item was never started

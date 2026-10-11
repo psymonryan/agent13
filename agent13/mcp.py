@@ -194,6 +194,11 @@ class MCPManager:
             Callable[[AgentEvent, AgentEventData], Awaitable[None]]
         ] = None
         self._shutting_down = False
+        # True while connect_all()/reload() is in flight. The tool list is
+        # partial until it returns, so UIs/agent loop use this to defer
+        # starting a new turn (avoids re-prompting the whole history with a
+        # partial tool list). Single source of truth — set only here.
+        self.connecting = False
 
     def set_event_callback(
         self, callback: Callable[[AgentEvent, AgentEventData], Awaitable[None]]
@@ -913,18 +918,26 @@ class MCPManager:
     async def connect_all(self) -> dict[str, list[str]]:
         """Connect to all configured servers.
 
+        Sets ``connecting`` for the duration of the call so callers can
+        defer starting new turns until the tool list is complete.
+
         Returns:
             Dict of server_name -> list of tool names for successfully connected servers
         """
-        for config in self.server_configs.values():
-            log_event(
-                "mcp_connect_start",
-                {"server": config.name, "transport": config.transport},
-            )
-            try:
-                await self.connect_server_if_needed(config.name)
-            except Exception as e:
-                log_error(e, {"context": "mcp_connect_all", "server": config.name})
+        self.connecting = True
+        await self._emit_event(AgentEvent.MCP_CONNECTING, {})
+        try:
+            for config in self.server_configs.values():
+                log_event(
+                    "mcp_connect_start",
+                    {"server": config.name, "transport": config.transport},
+                )
+                try:
+                    await self.connect_server_if_needed(config.name)
+                except Exception as e:
+                    log_error(e, {"context": "mcp_connect_all", "server": config.name})
+        finally:
+            self.connecting = False
 
         return self.get_server_info()
 
@@ -937,9 +950,17 @@ class MCPManager:
 
         Delegates to ``connect_all`` so a single failing server doesn't
         abort the entire reload (per-server errors are logged, not raised).
+
+        ``connecting`` covers the whole reload (teardown + reconnect), not
+        just the connect phase — the tool list is partial during teardown
+        too.
         """
-        await self.disconnect()
-        return await self.connect_all()
+        self.connecting = True
+        try:
+            await self.disconnect()
+            return await self.connect_all()
+        finally:
+            self.connecting = False
 
     async def disconnect(self) -> dict[str, list[str]]:
         """Disconnect from all servers and clear tools.

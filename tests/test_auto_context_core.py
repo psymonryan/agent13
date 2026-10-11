@@ -9,7 +9,7 @@ the chain / restart-after-compact behaviour is covered by TestAutoContextChain
 (added with the Stage 3 dispatch rework).
 """
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -192,6 +192,96 @@ class TestContextEstimation:
         assert agent._estimate_current_context_tokens() >= 2000
 
 
+class TestStaleGroundingGuard:
+    """Stale-grounding guard: prompt_tokens describes the request that
+    contained messages[0:cursor]. If the history has since shrunk below
+    that point (a compact rewrote the messages), the number is dead and
+    must not drive the estimate. If the history grew - including
+    tool-heavy history that tokenizes far worse than chars/4 - the
+    grounded request is a prefix of the live history and the count is
+    trusted."""
+
+    def test_stale_precompact_count_falls_back_to_estimate(self):
+        """The 2026-09-28 incident: /compact left a 2-message history (~14k)
+        while prompt_tokens still carried 259213 (the compact call's
+        request). The estimate must be the small post-compact size."""
+        agent = make_agent()
+        agent.system_prompt = "S" * 4000  # ~1000 tokens
+        agent.messages = [
+            {"role": "user", "content": "Session summary request"},
+            {"role": "assistant", "content": "Compacted session summary. " * 20},
+        ]
+        agent.prompt_tokens = 259213  # stale pre-compact grounded count
+        agent._msg_count_before_stream = 126  # points past the rewritten history
+
+        est = agent._estimate_current_context_tokens()
+        # Far below the stale 259k; above the system-prompt floor
+        assert est < 10000
+        assert est >= 1000
+
+    def test_fresh_grounding_unchanged(self):
+        """A grounded count consistent with the current history passes
+        through untouched - the guard must not distort normal operation."""
+        agent = make_agent()
+        agent.system_prompt = "S" * 4000  # ~1000 tokens
+        agent.messages = [{"role": "user", "content": "hello world " * 100}]
+        agent.prompt_tokens = 1500  # ~1000 system + ~275 history + ~225 tools
+        agent._msg_count_before_stream = len(agent.messages)
+
+        assert agent._estimate_current_context_tokens() == 1500
+
+    def test_image_session_not_falsely_stale(self):
+        """A grounded count that includes a large base64 image payload is
+        legitimate: the ceiling counts the payload at REAL size, so the
+        guard must not classify it as stale. (The chars/4 message estimate
+        alone says ~170 tokens for the image and would falsely trip,
+        masking the true size and suppressing auto-context.)"""
+        agent = make_agent()
+        agent.system_prompt = "S" * 4000
+        b64 = "A" * 400_000  # ~100k tokens of base64 payload
+        agent.messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "what is in this image?"},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"data:image/png;base64,{b64}"},
+                    },
+                ],
+            }
+        ]
+        # Real API count: ~1000 system + ~100k image + a little
+        agent.prompt_tokens = 102_000
+        agent._msg_count_before_stream = len(agent.messages)
+
+        est = agent._estimate_current_context_tokens()
+        # Grounded value passes through - not clipped to the ~170-token
+        # estimate of the image block
+        assert est == 102_000
+
+    def test_tool_heavy_history_keeps_grounded_count(self):
+        """The 2026-09-29 misfire: tool-result-heavy history tokenizes up to
+        ~3.5x worse than chars/4, so a GENUINE grounded count far exceeds
+        the chars/4 size of the same messages. The history has not shrunk
+        below the grounding point, so the count is trusted - the old
+        ceiling test vetoed it and the threshold never fired all day."""
+        agent = make_agent()
+        agent.system_prompt = "S" * 4000
+        # ~40k chars of tool-heavy content -> chars/4 ~= 10k, but the real
+        # request charged 237k for this content
+        agent.messages = [
+            {"role": "user", "content": "please continue"},
+            {"role": "assistant", "content": "x" * 20_000},
+            {"role": "tool", "content": "y" * 20_000},
+        ]
+        agent.prompt_tokens = 237_227
+        agent._msg_count_before_stream = len(agent.messages)
+
+        est = agent._estimate_current_context_tokens()
+        assert est == 237_227
+
+
 class TestContextEstimateEmission:
     """The safe point emits CONTEXT_ESTIMATE with the estimated context size."""
 
@@ -306,6 +396,47 @@ class TestPostCompactContextEstimate:
         assert 1000 < est < 2000
 
     @pytest.mark.asyncio
+    async def test_regrounds_estimator_state(self):
+        """After a compact, prompt_tokens and the stream cursor are reset to
+        the POST-compact size - the compact call's own token_usage (the
+        pre-compact request) must not leak into the next pre-turn check,
+        which would compare 259k against the threshold on a 2-message
+        history and fire a spurious wrap-up (observed 2026-09-28 22:37)."""
+        agent = make_agent(auto_context_threshold=180_000)
+        agent.system_prompt = "S" * 4000  # ~1000 tokens
+        agent.messages = [{"role": "user", "content": "old history " * 200}]
+        agent.prompt_tokens = 259_213  # stale pre-compact grounded count
+        agent._msg_count_before_stream = 100  # cursor past the rewrite
+
+        async def mock_stream(client, model, messages, system_prompt, tools, **kw):
+            yield (
+                "content",
+                "This is the compacted session summary. " * 5,  # 300 chars
+            )
+            yield (
+                "token_usage",
+                {
+                    "prompt_tokens": 259_213,
+                    "completion_tokens": 100,
+                    "total_tokens": 259_313,
+                },
+            )
+
+        with patch("agent13.llm.stream_response_with_tools", side_effect=mock_stream):
+            ok, _ = await agent.compact_history("")
+
+        assert ok
+        # Grounded count reset to the post-compact estimate (not 259k)
+        assert agent.prompt_tokens < 5000
+        # Cursor reset to the rewritten history length (added=[] next check)
+        assert agent._msg_count_before_stream == 2
+        # The value the pre-turn check reads is post-compact: below the
+        # estimate ceiling AND below the threshold
+        est = agent._estimate_current_context_tokens()
+        assert est < 5000
+        assert est < agent.auto_context_threshold
+
+    @pytest.mark.asyncio
     async def test_estimate_includes_tools_schema(self):
         agent = make_agent()
         agent.system_prompt = "S" * 4000  # ~1000 tokens
@@ -335,6 +466,46 @@ class TestPostCompactContextEstimate:
         est = await agent._estimate_post_compact_context()
         # Falls back to system prompt + messages only
         assert est >= 1000
+
+    @pytest.mark.asyncio
+    async def test_wrapup_not_current_after_compact(self):
+        """A compact replaces the history with the summary pair, erasing the
+        wrap-up marker - so _wrapup_is_current() reverts to False and the next
+        plain /compact uses the verbose default (no separate flag)."""
+        agent = make_agent()
+        agent.system_prompt = "S" * 4000
+        agent.messages = [
+            {
+                "role": "assistant",
+                "content": "[Wrapping up]",
+                "report_and_compact": True,
+            },
+            {
+                "role": "user",
+                "content": "wrap-up prompt",
+                "report_and_compact": True,
+            },
+            {"role": "assistant", "content": "Wrap-up complete."},
+        ]
+        assert agent._wrapup_is_current() is True
+
+        async def mock_stream(client, model, messages, system_prompt, tools, **kw):
+            yield ("content", "This is the compacted session summary. " * 5)
+            yield (
+                "token_usage",
+                {
+                    "prompt_tokens": 1000,
+                    "completion_tokens": 100,
+                    "total_tokens": 1100,
+                },
+            )
+
+        with patch("agent13.llm.stream_response_with_tools", side_effect=mock_stream):
+            ok, _ = await agent.compact_history("")
+
+        assert ok
+        # The compact replaced the history - the wrap-up marker is gone.
+        assert agent._wrapup_is_current() is False
 
 
 class TestAutoContextSnapshot:
@@ -434,3 +605,243 @@ api_base = "http://localhost:8000/v1"
             assert config.auto_context_threshold == 220000
         finally:
             path.unlink()
+
+
+class TestDurableRecordPointer:
+    """A verbose compact summary carries the durable-record pointer block
+    when the record paths are known (captured from the wrap-up's own file
+    writes). The 09-29 games incident: the model-written verbose summary
+    named no record files, the new context had no pointer, and the agent
+    re-struggled ~1 h re-discovering file-resident knowledge. The block is
+    appended mechanically - a model-written pointer is exactly what dropped.
+    """
+
+    SUMMARY_TEXT = "Model-written summary of the session."
+
+    async def _compact(self, agent, compact_prompt=""):
+        async def mock_stream(client, model, messages, system_prompt, tools, **kw):
+            yield ("content", self.SUMMARY_TEXT)
+            yield (
+                "token_usage",
+                {
+                    "prompt_tokens": 1000,
+                    "completion_tokens": 10,
+                    "total_tokens": 1010,
+                },
+            )
+
+        with patch("agent13.llm.stream_response_with_tools", side_effect=mock_stream):
+            ok, _ = await agent.compact_history(compact_prompt)
+        assert ok
+        # The history is the replacement pair; the summary is the assistant msg
+        return agent.messages[-1]["content"]
+
+    @pytest.mark.asyncio
+    async def test_verbose_summary_carries_pointer_block(self):
+        agent = make_agent()
+        agent.messages = [{"role": "user", "content": "history " * 100}]
+        agent._session_truth_path = "docs_archive/auto_context_current_truth.md"
+        agent._session_journal_path = "docs_archive/auto_context_journal.md"
+
+        summary = await self._compact(agent)
+
+        # The model-written summary is intact, with the block appended after
+        assert summary.startswith(self.SUMMARY_TEXT)
+        assert "Durable record (focus auto_context):" in summary
+        assert "docs_archive/auto_context_current_truth.md" in summary
+        assert "docs_archive/auto_context_journal.md" in summary
+        # The cues ride with the paths
+        assert "work queue (top unblocked ticket first)" in summary
+        assert "LAST entry holds the state at handoff" in summary
+
+    @pytest.mark.asyncio
+    async def test_no_paths_no_block(self):
+        """Fresh restore with no in-session wrap-up: no captured paths, so
+        the summary is untouched (out of scope)."""
+        agent = make_agent()
+        agent.messages = [{"role": "user", "content": "history " * 100}]
+
+        summary = await self._compact(agent)
+
+        assert summary == self.SUMMARY_TEXT
+
+    @pytest.mark.asyncio
+    async def test_user_specified_prompt_untouched(self):
+        """A user-specified compact prompt wins clean - no pointer block."""
+        agent = make_agent()
+        agent.messages = [{"role": "user", "content": "history " * 100}]
+        agent._session_truth_path = "docs_archive/auto_context_current_truth.md"
+        agent._session_journal_path = "docs_archive/auto_context_journal.md"
+
+        summary = await self._compact(agent, compact_prompt="My custom prompt.")
+
+        assert summary == self.SUMMARY_TEXT
+
+    @pytest.mark.asyncio
+    async def test_bridge_prompt_untouched(self):
+        """The short bridge summary prompt already instructs the model to
+        name both files - no mechanical block on top."""
+        from agent13.prompts import DEFAULT_REPORT_AND_COMPACT_SUMMARY_PROMPT
+
+        agent = make_agent()
+        agent.messages = [{"role": "user", "content": "history " * 100}]
+        agent._session_truth_path = "docs_archive/auto_context_current_truth.md"
+        agent._session_journal_path = "docs_archive/auto_context_journal.md"
+
+        summary = await self._compact(
+            agent, compact_prompt=DEFAULT_REPORT_AND_COMPACT_SUMMARY_PROMPT
+        )
+
+        assert summary == self.SUMMARY_TEXT
+
+    @pytest.mark.asyncio
+    async def test_journal_only_pointer(self):
+        """Only the journal path known: block carries the journal line and
+        the project name derived from the journal file name."""
+        agent = make_agent()
+        agent.messages = [{"role": "user", "content": "history " * 100}]
+        agent._session_journal_path = "docs_archive/games_journal.md"
+
+        summary = await self._compact(agent)
+
+        assert "Durable record (focus games):" in summary
+        assert "docs_archive/games_journal.md" in summary
+        assert "current_truth" not in summary
+
+    @pytest.mark.asyncio
+    async def test_unrecognizable_names_bare_header(self):
+        """Paths that don't follow the <focus>_current_truth/_journal
+        convention: bare header, no invented project name."""
+        agent = make_agent()
+        agent.messages = [{"role": "user", "content": "history " * 100}]
+        agent._session_truth_path = "docs_archive/notes.md"
+
+        summary = await self._compact(agent)
+
+        assert "Durable record:" in summary
+        assert "(project" not in summary
+        assert "docs_archive/notes.md" in summary
+
+
+class TestModelSwapGrounding:
+    """A /model swap must invalidate the grounded prompt_tokens: counts are
+    tokenizer-specific (10.2% measured Swift vs DeepSeek, 2026-09-29), and
+    the stale-grounding guard cannot detect a swap - the message count is
+    unchanged, so the old tokenizer's grounded count would be trusted
+    as-is (e.g. a 237k count driving auto-context decisions on a history
+    the new tokenizer charges ~213k for)."""
+
+    def test_set_model_regrounds_to_estimate(self):
+        agent = make_agent(auto_context_threshold=180_000)
+        agent.system_prompt = "S" * 4000  # ~1000 tokens
+        agent.messages = [{"role": "user", "content": "history " * 200}]
+        agent.prompt_tokens = 237_227  # the old model's grounded count
+        agent._msg_count_before_stream = 1
+
+        agent.set_model("other-model")
+
+        # Re-grounded to the fresh estimate (system + chars/4 of messages),
+        # not the stale 237k
+        assert agent.prompt_tokens < 5000
+        # Cursor at the end of the history (added=[] at the next check)
+        assert agent._msg_count_before_stream == 1
+
+    def test_set_model_same_model_keeps_grounding(self):
+        agent = make_agent()
+        agent.system_prompt = "S" * 4000
+        agent.messages = [{"role": "user", "content": "history " * 200}]
+        agent.prompt_tokens = 237_227
+        agent._msg_count_before_stream = 1
+
+        agent.set_model("test-model")  # the current model
+
+        assert agent.prompt_tokens == 237_227
+        assert agent._msg_count_before_stream == 1
+
+    def test_estimate_not_stale_after_swap(self):
+        """The pre-turn check's input after a swap is the fresh estimate
+        (below the threshold) - not the stale grounded count, which would
+        fire a spurious wrap-up on a tiny history."""
+        agent = make_agent(auto_context_threshold=180_000)
+        agent.system_prompt = "S" * 4000
+        agent.messages = [{"role": "user", "content": "history " * 200}]
+        agent.prompt_tokens = 237_227
+        agent._msg_count_before_stream = 1
+
+        agent.set_model("other-model")
+
+        est = agent._estimate_current_context_tokens()
+        assert est < 5000
+        assert est < agent.auto_context_threshold
+
+
+class TestPostTurnDecisionLog:
+    """The post-turn handler's terminal decision is logged (reason + chain +
+    chain_used) so a budget-exhausted idle is never silent in debug.log - the
+    09-28 02:48 "silent stall" was by design (chain 5/5 spent) but the TUI-only
+    idle notification was never logged, so the log went quiet and the idle
+    looked like a silent no-op. The restart path (which loops back into
+    _llm_turn) is not a terminal decision and logs nothing."""
+
+    async def _decisions(self, agent, restart, compact_result):
+        agent._auto_context_triggered = True
+        agent._report_and_compact_triggered = False
+        calls = []
+
+        def fake_log(event_type, data=None):
+            calls.append((event_type, data))
+
+        with (
+            patch("agent13.core.is_debug_enabled", return_value=True),
+            patch("agent13.core.log_tps_event", side_effect=fake_log),
+            patch.object(agent, "_save_auto_context_snapshot"),
+            patch.object(
+                agent, "compact_history", new=AsyncMock(return_value=compact_result)
+            ),
+        ):
+            await agent._run_auto_context_post_turn(restart=restart)
+
+        return [d for et, d in calls if et == "auto_context_decision"]
+
+    @pytest.mark.asyncio
+    async def test_chain_exhausted_logs_decision(self):
+        agent = make_agent(auto_context_threshold=180_000)
+        agent.auto_context_chain = 5
+        agent._auto_context_chain_used = 5  # budget spent (the 09-28 case)
+
+        decisions = await self._decisions(
+            agent, restart=True, compact_result=(True, "ok")
+        )
+
+        assert len(decisions) == 1
+        assert decisions[0]["reason"] == "chain_exhausted"
+        assert decisions[0]["chain"] == 5
+        assert decisions[0]["chain_used"] == 5
+
+    @pytest.mark.asyncio
+    async def test_pre_turn_logs_continuing(self):
+        agent = make_agent(auto_context_threshold=180_000)
+        agent.auto_context_chain = 5
+        agent._auto_context_chain_used = 0
+
+        decisions = await self._decisions(
+            agent, restart=False, compact_result=(True, "ok")
+        )
+
+        assert len(decisions) == 1
+        assert decisions[0]["reason"] == "continuing"
+        assert decisions[0]["chain_used"] == 0
+
+    @pytest.mark.asyncio
+    async def test_compact_failed_logs_decision(self):
+        agent = make_agent(auto_context_threshold=180_000)
+        agent.auto_context_action = "compact"
+        agent.auto_context_chain = 5
+        agent._auto_context_chain_used = 1
+
+        decisions = await self._decisions(
+            agent, restart=True, compact_result=(False, "boom")
+        )
+
+        assert len(decisions) == 1
+        assert decisions[0]["reason"] == "compact_failed"

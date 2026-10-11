@@ -30,6 +30,17 @@ else:
     _SUBPROCESS_ENCODING = "utf-8"
 
 
+def _decode_output(data: bytes) -> str:
+    """Decode captured subprocess bytes for tool output.
+
+    Decodes with the platform encoding (OEM codepage on Windows, utf-8
+    elsewhere). CRLF is normalized to LF: Windows text-mode children emit
+    CRLF, and tool output must be platform-consistent LF text (the model
+    and byte-exact comparisons both assume it).
+    """
+    return data.decode(_SUBPROCESS_ENCODING, errors="replace").replace("\r\n", "\n")
+
+
 def get_temp_dir() -> str:
     """Return the appropriate temp directory for the current platform.
 
@@ -680,7 +691,7 @@ def run_sandboxed(
             if data is None:
                 return ""
             if isinstance(data, bytes):
-                return data.decode(_SUBPROCESS_ENCODING, errors="replace")
+                return _decode_output(data)
             return data
 
         return _timeout_result(
@@ -810,6 +821,12 @@ async def run_sandboxed_async(
         # CREATE_NEW_PROCESS_GROUP (0x200): Allows process tree termination
         process = await asyncio.create_subprocess_exec(
             *build_powershell_command(command),
+            # stdin=DEVNULL: inheriting the REPL's stdin pipe made Windows
+            # children stall in C-level startup inside the REPL process tree
+            # (120 s tool timeout; 0.35 s standalone). The tool is
+            # non-interactive - interactive commands get an immediate EOF
+            # (fast, actionable failure) instead of a silent hang.
+            stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             creationflags=0x08000200,  # CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP
@@ -859,8 +876,8 @@ async def run_sandboxed_async(
         except asyncio.TimeoutError:
             await _kill_process_tree(process)
 
-        stdout = b"".join(chunks_out).decode(_SUBPROCESS_ENCODING, errors="replace")
-        stderr = b"".join(chunks_err).decode(_SUBPROCESS_ENCODING, errors="replace")
+        stdout = _decode_output(b"".join(chunks_out))
+        stderr = _decode_output(b"".join(chunks_err))
 
         if timed_out:
             return _timeout_result(timeout, stdout, stderr, mode, max_output)

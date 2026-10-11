@@ -917,6 +917,81 @@ class TestBashToolUseCases:
         # Reset sandbox
         set_session_sandbox_mode(None)
 
+    @pytest.mark.asyncio
+    async def test_output_crlf_normalized_to_lf(self, tmp_path):
+        """A child emitting raw CRLF bytes must come back as LF text.
+
+        Windows text-mode children (e.g. python print to a pipe) emit CRLF;
+        tool output is platform-consistent LF text, and the bounding
+        integration test's byte-exact blob comparison relies on it.
+        """
+        from agent13.sandbox import SandboxMode, run_sandboxed_async
+
+        script = tmp_path / "crlf_child.py"
+        script.write_text(
+            "import sys\n"
+            "sys.stdout.buffer.write(b'a\\r\\nb\\r\\n')\n"
+            "sys.stderr.buffer.write(b'e\\r\\nf\\r\\n')\n",
+            encoding="utf-8",
+        )
+        result = await run_sandboxed_async(
+            f"{sys.executable} {script}",
+            SandboxMode.OFF,
+            timeout=30,
+        )
+        assert result["success"] is True
+        assert result["stdout"] == "a\nb\n"
+        assert result["stderr"] == "e\nf\n"
+
+    @pytest.mark.asyncio
+    @pytest.mark.skipif(
+        sys.platform != "win32",
+        reason="Windows-only: the Windows spawn passes stdin=DEVNULL",
+    )
+    async def test_windows_child_stdin_is_devnull(self, tmp_path):
+        """The child's stdin is DEVNULL, not the harness's stdin pipe.
+
+        A stdin-reading child must get an immediate EOF (fast, actionable
+        failure) - inheriting the REPL's stdin pipe stalled Windows children
+        in C-level startup (120 s tool timeout inside the REPL).
+        """
+        from agent13.sandbox import SandboxMode, run_sandboxed_async
+
+        script = tmp_path / "stdin_child.py"
+        script.write_text(
+            "import sys\n"
+            "sys.stdout.write('got:' + repr(sys.stdin.read()))\n",
+            encoding="utf-8",
+        )
+        result = await run_sandboxed_async(
+            f"{sys.executable} {script}",
+            SandboxMode.OFF,
+            timeout=15,
+        )
+        assert result["success"] is True
+        assert result["timed_out"] is False
+        assert result["stdout"] == "got:''"
+
+
+class TestDecodeOutput:
+    """_decode_output: platform decoding + CRLF -> LF normalization."""
+
+    def test_crlf_normalized_to_lf(self):
+        from agent13.sandbox import _decode_output
+
+        assert _decode_output(b"a\r\nb\r\nc") == "a\nb\nc"
+
+    def test_bare_cr_and_lf_preserved(self):
+        """Only CRLF pairs are normalized; lone CR (progress bars) survives."""
+        from agent13.sandbox import _decode_output
+
+        assert _decode_output(b"a\rb\nc") == "a\rb\nc"
+
+    def test_empty(self):
+        from agent13.sandbox import _decode_output
+
+        assert _decode_output(b"") == ""
+
 
 class TestPowershellRouting:
     """Tests for Windows PowerShell direct-spawn routing (command v2 phase 1)."""

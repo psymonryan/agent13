@@ -37,10 +37,16 @@ from agent13 import (
     __version__,
 )
 from agent13.llm import close_tracked_asyncgens
+from agent13.durable_records import startup_focus
 from agent13.persistence import save_context, get_auto_save_path
 from agent13.models import fetch_models, select_model, print_model_list
 from agent13.sandbox import parse_sandbox_mode, get_pinned_sandbox_mode
-from agent13.pins import get_pinned_devel
+from agent13.status import parse_token_count
+from agent13.pins import (
+    get_pinned_devel,
+    get_pinned_reasoning,
+    get_pinned_toolview,
+)
 from agent13.skills import SkillManager, ensure_default_skills
 from agent13.prompts import get_skills_section, resolve_report_and_compact_prompt
 from tools.security import set_session_sandbox_mode
@@ -81,6 +87,7 @@ async def run_batch_with_display(
     model: str,
     prompt: str,
     read_files: list[str] | None = None,
+    focus_name: str | None = None,
     pretty: bool = True,
     debug: bool = False,
     tool_response_format: str = "raw",
@@ -128,6 +135,18 @@ async def run_batch_with_display(
         priming_enabled=priming_enabled,
     )
 
+    # Focus name from --focus: authoritative state; on a fresh session the
+    # records become the first turn - the model reads them and replies a
+    # minimal ack before the batch prompt runs (the --read pattern). Batch
+    # passes the message into run_batch rather than enqueueing here: its
+    # completion waits would otherwise desynchronize (see batch.run_batch).
+    # One wiring for all four UIs - see agent13.durable_records.startup_focus.
+    message, _level, enqueue_msg = startup_focus(
+        agent.durable_records, focus_name, agent.messages
+    )
+    if message:
+        print(message, file=sys.stderr)
+
     # Connect to MCP servers if requested (mirrors TUI _connect_mcp_on_startup)
     if connect_mcp and _config.mcp_servers:
         agent.set_mcp_servers(_config.mcp_servers)
@@ -148,7 +167,14 @@ async def run_batch_with_display(
 
     # Use RichDisplay for pretty mode, simple print for non-pretty
     if pretty:
-        display = RichDisplay(pretty=True, debug=debug)
+        # Batch output IS the product (one prompt, printed, exit) - nothing to
+        # fold, so the interactive widget settings deliberately don't apply.
+        display = RichDisplay(
+            pretty=True,
+            debug=debug,
+            reasoning_collapsed=False,
+            toolview_collapsed=False,
+        )
 
         async def on_token(text: str):
             if not display._in_content:
@@ -205,6 +231,7 @@ async def run_batch_with_display(
             agent,
             prompt,
             read_files=read_files,
+            preprocess_msg=enqueue_msg,
             on_token=on_token,
             on_reasoning=on_reasoning,
             on_tool_call=on_tool_call,
@@ -227,6 +254,21 @@ class _HelpFormatter(
     """Show defaults in help, preserve epilog formatting."""
 
     pass
+
+
+def _resolve_widget_collapse(flag, pinned, config_default: bool) -> bool:
+    """Resolve a widget-collapse setting: CLI flag > per-project pin > config.
+
+    The same precedence rule /devel and /sandbox follow: an explicit flag
+    always wins, so the flag stays the only way to override a pin for a
+    single run. ``flag`` is the raw argparse value ("collapsed", "expanded"
+    or None when omitted).
+    """
+    if flag is not None:
+        return flag == "collapsed"
+    if pinned is not None:
+        return pinned
+    return config_default
 
 
 async def async_main():
@@ -323,17 +365,34 @@ Provider names are read from ~/.agent13/config.toml
         help="Enable priming prompt pair after journal compaction (default: off)",
     )
     parser.add_argument(
-        "--remove-reasoning",
+        "--remove-api-reasoning",
         action="store_true",
-        help="Strip reasoning tokens between turns",
+        help="Strip reasoning tokens between turns (API context, not display)",
+    )
+    parser.add_argument(
+        "--reasoning",
+        choices=["collapsed", "expanded"],
+        default=None,
+        metavar="STATE",
+        help="Reasoning widgets (Thoughts/Reflection) start collapsed or "
+        "expanded. Overrides the per-project pin and the [ui] config value",
+    )
+    parser.add_argument(
+        "--toolview",
+        choices=["collapsed", "expanded"],
+        default=None,
+        metavar="STATE",
+        help="Tool call/result widgets start collapsed or expanded. "
+        "Overrides the per-project pin and the [ui] config value",
     )
     parser.add_argument(
         "--auto-context-threshold",
-        type=int,
+        type=parse_token_count,
         default=None,
         metavar="TOKENS",
         help="Auto-context threshold: take the configured action when context "
-        "exceeds TOKENS (e.g. 150000). 0 or omitted = use config value",
+        "exceeds TOKENS (e.g. 150000 or 150k). 0 = disabled, omitted = use "
+        "config value",
     )
     parser.add_argument(
         "--auto-context-chain",
@@ -344,14 +403,25 @@ Provider names are read from ~/.agent13/config.toml
         "turn (0 = no restarts). Omitted = use config value",
     )
     parser.add_argument(
-        "--report-and-compact",
-        action="store_true",
+        "--auto-context-action",
+        choices=["compact", "report_and_compact", "none"],
         default=None,
+        metavar="ACTION",
         help=(
-            "At the auto-context threshold, snapshot, run a wrap-up report turn, "
-            "then compact (and restart the turn when --auto-context-chain > 0). "
+            "Auto-context action at the threshold: compact, "
+            "report_and_compact (wrap-up report turn, then compact; restarts "
+            "the turn when --auto-context-chain > 0), or none (disabled). "
             "Omitted = use config value"
         ),
+    )
+    parser.add_argument(
+        "--auto-context-nudge-cap",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Consecutive degenerate model outputs (cap-hit or whitespace "
+        "wall) before the guard stops the turn and saves a snapshot "
+        "(0 = guard off). Omitted = use config value",
     )
     parser.add_argument(
         "-c",
@@ -430,6 +500,20 @@ Provider names are read from ~/.agent13/config.toml
             "Read files into context before the prompt. Files are injected as "
             'a separate first message; the model acknowledges with "files read". '
             "Can be used multiple times: --read file1.py --read file2.md"
+        ),
+    )
+    parser.add_argument(
+        "--focus",
+        type=str,
+        default=None,
+        metavar="NAME",
+        help=(
+            "Focus name: sets the authoritative focus name at startup and, "
+            "on a fresh session, runs its durable records "
+            "(docs_archive/NAME_current_truth.md and the last journal "
+            "entry) as the first turn - the model reads them and replies a "
+            "minimal ack while you type, so no /focus is needed in a new "
+            "session"
         ),
     )
     parser.add_argument(
@@ -523,19 +607,29 @@ Provider names are read from ~/.agent13/config.toml
     if last_result:
         print(f"\n{last_result}\n", file=sys.stderr)
 
-    # Check for updates (throttled, respects config)
+    # Check for updates (throttled, respects config). Interactive startups
+    # only - batch runs stay quiet and never consume the check interval.
+    from agent13.changelog import fetch_whats_new
     from agent13.updater import check_for_update, format_update_notice, perform_update
 
     cfg = get_config()
-    if cfg.update_check_enabled and not os.environ.get("AGENT13_NO_UPDATE_CHECK"):
+    is_batch = args.prompt is not None
+    if (
+        not is_batch
+        and cfg.update_check_enabled
+        and not os.environ.get("AGENT13_NO_UPDATE_CHECK")
+    ):
         update_info = check_for_update(cfg.update_check_interval_hours)
         if update_info:
             notice = format_update_notice(update_info)
-            print(f"\n{notice}\n", file=sys.stderr)
+            # What's-new notes: fetched only now that an offer is certain;
+            # any failure leaves the offer unchanged.
+            notes = fetch_whats_new(update_info["local_version"])
+            block = f"{notes}\n{notice}" if notes else notice
+            print(f"\n{block}\n", file=sys.stderr)
 
             # Interactive prompt: only in TUI mode on a real terminal
-            is_batch = args.prompt is not None
-            if not is_batch and sys.stdin.isatty():
+            if sys.stdin.isatty():
                 try:
                     print(file=sys.stderr)
                     choice = input("  Apply update now? [y/N] ").strip().lower()
@@ -684,6 +778,14 @@ Provider names are read from ~/.agent13/config.toml
     # Devel mode: explicit --devel flag > per-project pin > off
     devel_mode = bool(args.devel) or get_pinned_devel() is True
 
+    # Widget collapse defaults: explicit flag > per-project pin > [ui] config
+    reasoning_collapsed = _resolve_widget_collapse(
+        args.reasoning, get_pinned_reasoning(), cfg.reasoning_collapsed
+    )
+    toolview_collapsed = _resolve_widget_collapse(
+        args.toolview, get_pinned_toolview(), cfg.toolview_collapsed
+    )
+
     # Create skill manager (needed for both batch and TUI if skills enabled)
     skill_manager = SkillManager(lambda: get_config())
 
@@ -710,23 +812,27 @@ Provider names are read from ~/.agent13/config.toml
                 prompt_manager=prompt_manager,
                 system_prompt=system_prompt,
                 journal_mode=args.journal,
-                remove_reasoning=args.remove_reasoning,
+                remove_reasoning=args.remove_api_reasoning,
                 devel_mode=devel_mode,
                 skills_mode=include_skills and bool(skill_manager.skills),
                 skill_manager=skill_manager,
                 continue_session=args.continue_session,
                 read_files=args.read,
+                focus_name=args.focus,
                 polite_interval=args.polite,
                 priming_enabled=args.priming_prompt,
                 auto_context_threshold=args.auto_context_threshold
                 if args.auto_context_threshold is not None
                 else cfg.auto_context_threshold,
-                auto_context_action="report_and_compact"
-                if args.report_and_compact
+                auto_context_action=args.auto_context_action
+                if args.auto_context_action is not None
                 else cfg.auto_context_action,
                 auto_context_chain=args.auto_context_chain
                 if args.auto_context_chain is not None
                 else cfg.auto_context_chain,
+                auto_context_nudge_cap=args.auto_context_nudge_cap
+                if args.auto_context_nudge_cap is not None
+                else cfg.auto_context_nudge_cap,
                 report_and_compact_prompt=resolve_report_and_compact_prompt(
                     prompt_manager
                 ),
@@ -748,12 +854,13 @@ Provider names are read from ~/.agent13/config.toml
                 model=model,
                 prompt=args.prompt,
                 read_files=args.read,
+                focus_name=args.focus,
                 pretty=args.pretty == "on",
                 debug=args.debug,
                 tool_response_format=args.tool_response,
                 prompt_manager=prompt_manager,
                 system_prompt=system_prompt,
-                remove_reasoning=args.remove_reasoning,
+                remove_reasoning=args.remove_api_reasoning,
                 devel_mode=devel_mode,
                 skills_mode=include_skills and bool(skill_manager.skills),
                 connect_mcp=args.mcp,
@@ -782,7 +889,7 @@ Provider names are read from ~/.agent13/config.toml
                 prompt_manager=prompt_manager,
                 system_prompt=system_prompt,
                 journal_mode=args.journal,
-                remove_reasoning=args.remove_reasoning,
+                remove_reasoning=args.remove_api_reasoning,
                 devel_mode=devel_mode,
                 skills_mode=include_skills and bool(skill_manager.skills),
                 skill_manager=skill_manager,
@@ -790,7 +897,10 @@ Provider names are read from ~/.agent13/config.toml
                 output_path=args.output,
                 model_names=model_names,
                 read_files=args.read,
+                focus_name=args.focus,
                 polite_interval=args.polite,
+                reasoning_collapsed=reasoning_collapsed,
+                toolview_collapsed=toolview_collapsed,
                 bell_threshold=args.bell,
                 bell_enabled=cfg.bell_enabled,
                 bell_command=args.bell_command
@@ -800,12 +910,15 @@ Provider names are read from ~/.agent13/config.toml
                 auto_context_threshold=args.auto_context_threshold
                 if args.auto_context_threshold is not None
                 else cfg.auto_context_threshold,
-                auto_context_action="report_and_compact"
-                if args.report_and_compact
+                auto_context_action=args.auto_context_action
+                if args.auto_context_action is not None
                 else cfg.auto_context_action,
                 auto_context_chain=args.auto_context_chain
                 if args.auto_context_chain is not None
                 else cfg.auto_context_chain,
+                auto_context_nudge_cap=args.auto_context_nudge_cap
+                if args.auto_context_nudge_cap is not None
+                else cfg.auto_context_nudge_cap,
                 report_and_compact_prompt=resolve_report_and_compact_prompt(
                     prompt_manager
                 ),
@@ -847,7 +960,7 @@ Provider names are read from ~/.agent13/config.toml
         system_prompt=system_prompt,
         include_skills=include_skills,
         journal_mode=args.journal,
-        remove_reasoning=args.remove_reasoning,
+        remove_reasoning=args.remove_api_reasoning,
         continue_session=args.continue_session,
         devel_mode=devel_mode,
         spinner_speed=args.spinner,
@@ -855,6 +968,7 @@ Provider names are read from ~/.agent13/config.toml
         if args._clipboard_explicit
         else cfg.clipboard_method,
         read_files=args.read,
+        focus_name=args.focus,
         polite_interval=args.polite,
         bell_threshold=args.bell,
         bell_enabled=cfg.bell_enabled,
@@ -863,15 +977,20 @@ Provider names are read from ~/.agent13/config.toml
         else cfg.bell_command,
         priming_enabled=args.priming_prompt,
         cursor_blink=cfg.cursor_blink,
+        reasoning_collapsed=reasoning_collapsed,
+        toolview_collapsed=toolview_collapsed,
         auto_context_threshold=args.auto_context_threshold
         if args.auto_context_threshold is not None
         else cfg.auto_context_threshold,
-        auto_context_action="report_and_compact"
-        if args.report_and_compact
+        auto_context_action=args.auto_context_action
+        if args.auto_context_action is not None
         else cfg.auto_context_action,
         auto_context_chain=args.auto_context_chain
         if args.auto_context_chain is not None
         else cfg.auto_context_chain,
+        auto_context_nudge_cap=args.auto_context_nudge_cap
+        if args.auto_context_nudge_cap is not None
+        else cfg.auto_context_nudge_cap,
         report_and_compact_prompt=resolve_report_and_compact_prompt(prompt_manager),
     )
 

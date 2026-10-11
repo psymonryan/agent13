@@ -242,6 +242,8 @@ class Config:
         clipboard_method: Clipboard method - "osc52" or "system"
         saves_location: Auto-save location - "central" (global) or "local" (project dir)
         cursor_blink: Whether the input cursor blinks (default false for tmux activity silence)
+        reasoning_collapsed: Reasoning widgets start folded (display only, default true)
+        toolview_collapsed: Tool call/result widgets start folded (display only, default true)
     """
 
     providers: list[ProviderConfig] = field(default_factory=list)
@@ -258,6 +260,8 @@ class Config:
     bell_enabled: bool = True  # Whether bell is active
     bell_command: str = ""  # External command to run instead of terminal bell
     cursor_blink: bool = False  # Whether input cursor blinks (false = tmux-friendly)
+    reasoning_collapsed: bool = True  # Reasoning widgets start folded (display)
+    toolview_collapsed: bool = True  # Tool call/result widgets start folded
     auto_context_threshold: int = (
         220000  # Token threshold for auto-context (0 = disabled)
     )
@@ -265,6 +269,10 @@ class Config:
         "report_and_compact"  # At threshold: compact | report_and_compact | none
     )
     auto_context_chain: int = 3  # Turn restarts after a compact per turn (0 = none)
+    auto_context_nudge_cap: int = (
+        2  # Consecutive degenerate ends before the guard gives up (0 = off)
+    )
+    tools_max_result_chars: int = 30000  # Tool result text cap; 0 = off
     vision: Optional[VisionConfig] = None  # Vision/image routing config
 
     @classmethod
@@ -483,6 +491,41 @@ class Config:
                         f"[auto_context] 'chain' must be >= 0, got {chain}"
                     )
                 config.auto_context_chain = int(chain)
+            if "nudge_cap" in auto_context_data:
+                nudge_cap = auto_context_data["nudge_cap"]
+                if isinstance(nudge_cap, bool) or not isinstance(
+                    nudge_cap, (int, float)
+                ):
+                    raise ConfigFileError(
+                        f"[auto_context] 'nudge_cap' must be an integer, got "
+                        f"{nudge_cap!r}. Use e.g. nudge_cap = 2 (0 = guard off)."
+                    )
+                if nudge_cap < 0:
+                    raise ConfigFileError(
+                        f"[auto_context] 'nudge_cap' must be >= 0, got {nudge_cap}"
+                    )
+                config.auto_context_nudge_cap = int(nudge_cap)
+
+        # Parse [tools] section. Fail fast on a bad value, like
+        # [auto_context] - a typo must surface at startup, never be silently
+        # dropped. Absent keys fall back to the dataclass defaults.
+        if "tools" in data:
+            tools_data = data["tools"]
+            if not isinstance(tools_data, dict):
+                raise ConfigFileError("[tools] must be a table")
+            if "max_result_chars" in tools_data:
+                mrc = tools_data["max_result_chars"]
+                if isinstance(mrc, bool) or not isinstance(mrc, (int, float)):
+                    raise ConfigFileError(
+                        f"[tools] 'max_result_chars' must be an integer number "
+                        f"of characters, got {mrc!r}. "
+                        f"Use e.g. max_result_chars = 30000 (or 0 to disable)."
+                    )
+                if mrc < 0:
+                    raise ConfigFileError(
+                        f"[tools] 'max_result_chars' must be >= 0, got {mrc}"
+                    )
+                config.tools_max_result_chars = int(mrc)
 
         # Parse [ui] section
         ui_data = data.get("ui", {})
@@ -490,6 +533,22 @@ class Config:
             cb = ui_data.get("cursor_blink", False)
             if isinstance(cb, bool):
                 config.cursor_blink = cb
+            # Display-collapse defaults. Fail fast on a bad value, like
+            # [auto_context] - a typo must surface at startup, never be
+            # silently dropped.
+            for key, attr in (
+                ("reasoning_collapsed", "reasoning_collapsed"),
+                ("toolview_collapsed", "toolview_collapsed"),
+            ):
+                if key not in ui_data:
+                    continue
+                value = ui_data[key]
+                if not isinstance(value, bool):
+                    raise ConfigFileError(
+                        f"[ui] '{key}' must be a boolean (true = start folded, "
+                        f"false = start expanded), got {value!r}."
+                    )
+                setattr(config, attr, value)
 
         # Parse [vision] section
         vision_data = data.get("vision")

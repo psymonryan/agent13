@@ -97,7 +97,11 @@ class TestDropInAgainstRealSeam:
             events.append((event_type, data))
 
         types = [t for t, _ in events]
-        assert types == ["content", "token_usage"], f"Unexpected events: {types}"
+        # "finish" is the degeneration guard's terminal finish_reason capture
+        # (yielded when the backend sends one, before the usage event).
+        assert types == ["content", "finish", "token_usage"], (
+            f"Unexpected events: {types}"
+        )
 
         content_data = next(d for t, d in events if t == "content")
         assert content_data == DEFAULT_RESPONSE

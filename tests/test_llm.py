@@ -15,11 +15,49 @@ from agent13 import (
     append_assistant_message,
     format_context_size,
 )
-from agent13.llm import categorize_error, TimeoutError_
+from agent13 import llm
+from agent13.llm import categorize_error, reload_agents_md, TimeoutError_
 
 
 # Mock working directory for tests
 MOCK_CWD = "/test/working/directory"
+
+
+class TestReloadAgentsMd:
+    """Tests for reload_agents_md (on-demand AGENTS.md refresh)."""
+
+    def test_reads_file_into_cache(self, tmp_path):
+        """Should read AGENTS.md from disk into the module cache."""
+        (tmp_path / "AGENTS.md").write_text("New guidance v2", encoding="utf-8")
+        with patch("agent13.llm.Path.cwd", return_value=tmp_path):
+            reload_agents_md()
+        assert llm._AGENTS_MD_CACHE == "New guidance v2"
+
+    def test_reloads_changed_file(self, tmp_path):
+        """A second call should pick up edits (the /prompt re-read case)."""
+        agents = tmp_path / "AGENTS.md"
+        agents.write_text("v1", encoding="utf-8")
+        with patch("agent13.llm.Path.cwd", return_value=tmp_path):
+            reload_agents_md()
+        assert llm._AGENTS_MD_CACHE == "v1"
+
+        agents.write_text("v2", encoding="utf-8")
+        with patch("agent13.llm.Path.cwd", return_value=tmp_path):
+            reload_agents_md()
+        assert llm._AGENTS_MD_CACHE == "v2"
+
+    def test_missing_file_clears_cache(self, tmp_path):
+        """If AGENTS.md is gone, the cache should be cleared to None."""
+        agents = tmp_path / "AGENTS.md"
+        agents.write_text("content", encoding="utf-8")
+        with patch("agent13.llm.Path.cwd", return_value=tmp_path):
+            reload_agents_md()
+        assert llm._AGENTS_MD_CACHE == "content"
+
+        agents.unlink()
+        with patch("agent13.llm.Path.cwd", return_value=tmp_path):
+            reload_agents_md()
+        assert llm._AGENTS_MD_CACHE is None
 
 
 class TestBuildMessagesWithSystem:

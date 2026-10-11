@@ -16,6 +16,7 @@ import time
 import uuid
 from typing import Optional
 
+from agent13.durable_records import startup_focus
 from agent13 import (
     Agent,
     AgentEvent,
@@ -112,11 +113,13 @@ async def run_pipe_mode(
     skill_manager=None,
     continue_session: bool = False,
     read_files: list[str] | None = None,
+    focus_name: str | None = None,
     polite_interval: float | None = None,
     priming_enabled: bool = False,
     auto_context_threshold: int = 220000,
     auto_context_action: str = "report_and_compact",
     auto_context_chain: int = 3,
+    auto_context_nudge_cap: int = 2,
     report_and_compact_prompt: str = "",
 ) -> None:
     """Long-running pipe session: NDJSON in on stdin, NDJSON out on stdout.
@@ -157,6 +160,7 @@ async def run_pipe_mode(
         auto_context_threshold=auto_context_threshold,
         auto_context_action=auto_context_action,
         auto_context_chain=auto_context_chain,
+        auto_context_nudge_cap=auto_context_nudge_cap,
         report_and_compact_prompt=report_and_compact_prompt,
     )
 
@@ -180,6 +184,19 @@ async def run_pipe_mode(
                 _log(f"Could not resume: {msg}")
         else:
             _log("No saved session found, starting fresh")
+
+    # Focus name from --focus: authoritative state; on a fresh session the
+    # records become the first turn - the model reads them and replies a
+    # minimal ack before the first stdin turn (the --read pattern). The
+    # agent loop starts below; the queued item is processed immediately.
+    # One wiring for all four UIs - see agent13.durable_records.startup_focus.
+    message, _level, enqueue_msg = startup_focus(
+        agent.durable_records, focus_name, agent.messages
+    )
+    if enqueue_msg:
+        await agent.add_message(enqueue_msg, kind="prompt")
+    if message:
+        _log(message)
 
     # ── Session ID ─────────────────────────────────────────────────────
     session_id = str(uuid.uuid4())

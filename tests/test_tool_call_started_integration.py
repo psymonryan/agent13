@@ -102,6 +102,16 @@ class TestStreamYieldsEarlyToolCall:
         assert tc["arguments"] == '{"x": 5}'
 
 
+def widget_text(widget) -> str:
+    """The widget's visible text: header markup plus the buffered body.
+
+    A ToolWidget is a CollapsibleMessage - the header and the body are child
+    widgets, so the container's own ``content`` is always empty.
+    """
+    header = widget._header.content if widget._header is not None else ""
+    return f"{header}\n{widget._content}"
+
+
 # =============================================================================
 # TUI: pending widget appears, updates in place, then result
 # =============================================================================
@@ -133,22 +143,22 @@ class TestTUIPendingWidget:
             tui.post_message(ToolCallStartedMessage("write_file"))
             await _wait_for(pilot, lambda: len(tool_call_widgets()) == 1)
             w = tool_call_widgets()[0]
-            assert "write_file" in w.content
-            assert "…" in w.content, "pending widget should show the ellipsis"
+            assert "write_file" in widget_text(w)
+            assert "…" in widget_text(w), "pending widget should show the ellipsis"
 
             # 2. Tool call complete -> SAME widget updated in place (no duplicate)
             tui.post_message(ToolCallMessage("write_file", {"filepath": "test.py"}))
             await _wait_for(
                 pilot,
                 lambda: "test.py" in (
-                    tool_call_widgets()[0].content if tool_call_widgets() else ""
+                    widget_text(tool_call_widgets()[0]) if tool_call_widgets() else ""
                 ),
             )
             assert len(tool_call_widgets()) == 1, (
                 "widget must update in place, not duplicate"
             )
-            assert "test.py" in tool_call_widgets()[0].content
-            assert "…" not in tool_call_widgets()[0].content
+            assert "test.py" in widget_text(tool_call_widgets()[0])
+            assert "…" not in widget_text(tool_call_widgets()[0])
 
             # 3. Result -> result widget appears
             tui.post_message(ToolResultMessage("write_file", '{"success": true}'))

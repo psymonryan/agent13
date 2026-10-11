@@ -3,6 +3,7 @@
 from typing import Optional
 
 from tools import tool
+from tools.command import _arg_error
 from agent13.remote_transfer import remote_put as _remote_put
 from agent13.remote_transfer import remote_get as _remote_get
 
@@ -37,12 +38,15 @@ async def remote_put(
     Returns: Dict with success, exit_code, bytes, local_sha256, remote_sha256,
              verified, stderr
     """
-    return await _remote_put(
-        host=remote,
-        local_path=local_path,
-        remote_path=remote_path,
-        remote_shell=remote_shell,
-    )
+    try:
+        return await _remote_put(
+            host=remote,
+            local_path=local_path,
+            remote_path=remote_path,
+            remote_shell=remote_shell,
+        )
+    except ValueError as e:
+        return _arg_error(str(e))
 
 
 @tool(is_async=True)
@@ -73,9 +77,12 @@ async def remote_get(
     Returns: Dict with success, exit_code, bytes, local_sha256, remote_sha256,
              verified, stderr
     """
-    return await _remote_get(
-        host=remote,
-        remote_path=remote_path,
-        local_path=local_path,
-        remote_shell=remote_shell,
-    )
+    try:
+        return await _remote_get(
+            host=remote,
+            remote_path=remote_path,
+            local_path=local_path,
+            remote_shell=remote_shell,
+        )
+    except ValueError as e:
+        return _arg_error(str(e))

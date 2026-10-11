@@ -390,6 +390,9 @@ class MessageHistory:
         - Last message is tool (results not yet processed by LLM)
         - Last message is user (no assistant reply — e.g. quit while
           streaming; the next user message would be consecutive users)
+        - Last message is the [Interrupted] marker (interrupt: True) —
+          repair_interrupted() closed a cut-short turn with it; the work is
+          still pending (mirrors persistence._is_incomplete_turn)
 
         Returns:
             True if the turn is incomplete and needs to be resumed.
@@ -409,6 +412,10 @@ class MessageHistory:
 
         # Case 3: User message with no assistant reply
         if last_msg.get("role") == "user":
+            return True
+
+        # Case 4: [Interrupted] marker (assistant, no tool_calls, interrupt=True)
+        if last_msg.get("role") == "assistant" and last_msg.get("interrupt"):
             return True
 
         return False

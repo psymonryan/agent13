@@ -11,7 +11,7 @@ from tools.security import (
 )
 
 __all__ = ["command", "set_session_sandbox_mode", "get_session_sandbox_mode"]
-from agent13.sandbox import run_sandboxed_async
+from agent13.sandbox import MAX_COMMAND_TIMEOUT, run_sandboxed_async
 from agent13.remote_exec import run_remote_command
 from agent13.remote_jobs import detach_remote_job, poll_remote_job
 
@@ -48,8 +48,9 @@ async def command(
     Remote shell auto-detected (posix/powershell), cached per host.
     Override with remote_shell="posix" or remote_shell="powershell".
 
-    Long-running remote jobs (remote only) — for anything past the 120 s
-    cap (game runs, debuggers, builds):
+    Long commands: timeout is in SECONDS (default 120, max 1200) - raise
+    it for builds, testsuites, game runs. For anything past the max, use
+    a detached remote job (remote only):
       mode="detach"  -> runs the script as a detached remote job that
                         survives this session; returns job_id + log path.
       mode="poll"    -> with job_id (+ remote), returns the log tail
@@ -76,7 +77,7 @@ async def command(
 
     Args:
         command: The command to run (plain script, no ssh wrapping)
-        timeout: Timeout in seconds (default 120, max 600)
+        timeout: Timeout in seconds (default 120, max 1200)
         remote: ssh target (user@host or host). Set this instead of writing
                 ssh yourself. The script runs remotely with zero quoting layers.
         remote_shell: Override auto-detect: 'posix' or 'powershell'.
@@ -97,7 +98,7 @@ async def command(
             timeout = float(timeout)
         except (ValueError, TypeError):
             timeout = 120.0
-    timeout = max(0.1, min(timeout, 600.0))  # Clamp to 0.1-600 seconds
+    timeout = max(0.1, min(timeout, MAX_COMMAND_TIMEOUT))  # Clamp to 0.1-1200 seconds
 
     # Mode dispatch (remote jobs)
     mode_norm = (mode or "run").strip().lower()

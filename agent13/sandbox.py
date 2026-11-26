@@ -19,6 +19,11 @@ import tomllib
 
 from agent13.config_paths import get_config_file
 
+# Hard cap on the command tool's timeout argument, in seconds.
+# Shared by the clamp in tools/command.py and the timeout error messages
+# in sandbox.py / remote_exec.py so the taught max matches the enforced max.
+MAX_COMMAND_TIMEOUT = 1200.0
+
 # Encoding for subprocess output
 # Windows: Use OEM code page (what cmd.exe/native programs output)
 # Unix: Use UTF-8 (standard terminal encoding)
@@ -648,16 +653,25 @@ def run_sandboxed(
     sandbox_cmd = build_sandbox_command(command, mode, project_dir)
 
     try:
+        # Capture bytes, not text: text=True decodes with the *locale* code
+        # page (cp1252 on Windows), which is not what native programs emit and
+        # which raises UnicodeDecodeError on any byte it cannot map - losing
+        # the whole command's output. _decode_output uses the OEM code page
+        # with errors="replace", matching run_sandboxed_async.
         result = subprocess.run(
             sandbox_cmd,
+            # stdin=DEVNULL: the tool is non-interactive. An inherited stdin
+            # lets the child read the caller's terminal (swallowing keystrokes)
+            # and, on the async path, lets it take the tty away entirely - see
+            # the note in run_sandboxed_async.
+            stdin=subprocess.DEVNULL,
             capture_output=True,
-            text=True,
             timeout=timeout,
             cwd=str(project_dir) if project_dir else None,
         )
 
-        stdout = result.stdout
-        stderr = result.stderr
+        stdout = _decode_output(result.stdout or b"")
+        stderr = _decode_output(result.stderr or b"")
         truncated = False
 
         # Truncate output if needed
@@ -838,6 +852,18 @@ async def run_sandboxed_async(
         # Use start_new_session to create a new process group for clean termination
         process = await asyncio.create_subprocess_exec(
             *sandbox_cmd,
+            # stdin=DEVNULL: the tool is non-interactive. This is not just
+            # hygiene - an inherited tty stdin is a whole-app wedge. The child
+            # is a session leader (start_new_session), so the shell it runs
+            # (/bin/sh -c) adopts the inherited tty as its controlling
+            # terminal; when it exits, macOS revokes the tty and the PARENT's
+            # fds 0/1/2 are closed. Textual writes the UI to fd 2, so its
+            # writer thread dies on the next write, its bounded queue fills,
+            # and the event loop blocks forever in queue.put: frozen status
+            # bar, ~100% CPU, no child process. Interactive commands now get
+            # an immediate EOF instead (fast, actionable failure), matching
+            # the Windows path above.
+            stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             start_new_session=True,
@@ -979,10 +1005,9 @@ def _timeout_result(
         truncated = True
 
     message = (
-        f"Command timed out after {timeout} seconds. If the command is "
-        "interactive (TUI, ssh, a prompt), it was likely blocked waiting on "
-        "stdin - retry with stdin closed (e.g. `cmd </dev/null`) or a "
-        "non-interactive flag."
+        f"Command timed out after {timeout} seconds. If it legitimately "
+        f"needs longer, re-run with a larger timeout (timeout is in "
+        f"SECONDS: default 120, max {MAX_COMMAND_TIMEOUT:g})."
     )
     stderr = (stderr + "\n" if stderr else "") + message
 

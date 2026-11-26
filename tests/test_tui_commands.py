@@ -27,6 +27,8 @@ from pathlib import Path
 
 from agent13.history import History
 from agent13.queue import AgentQueue, ItemStatus
+from agent13.completion import filename_completion_scan, plan_completion
+from ui.tui import AgentTUI
 
 
 # ============== History Tests ==============
@@ -546,7 +548,6 @@ class MockAgentTUI:
         "/model",
         "/list",
         "/tool-response",
-        "/pretty",
         "/prompt",
         "/queue",
         "/pause",
@@ -820,116 +821,6 @@ def test_completion_empty_text():
     assert len(matches) == 0  # Empty string doesn't start with /
 
 
-def test_elapsed_timer_reset_on_idle():
-    """Test that elapsed timer resets when going idle with no queue items."""
-    import time
-
-    # Create a mock TUI with minimal setup
-    class MockQueue:
-        def __init__(self):
-            self._pending_count = 0
-
-        @property
-        def pending_count(self):
-            return self._pending_count
-
-    class MinimalTUI:
-        def __init__(self):
-            self._elapsed_start_time = None
-            self.agent = type("obj", (object,), {"queue": MockQueue()})()
-            self.processing = False
-            self.status = "Ready"
-
-        def _update_status(self, status: str) -> None:
-            """Simplified version of TUI._update_status for testing."""
-            if status == "processing":
-                self.processing = True
-                self.status = "Processing"
-                if self._elapsed_start_time is None:
-                    self._elapsed_start_time = time.time()
-            elif status == "idle":
-                self.processing = False
-                self.status = "Ready"
-                if self.agent.queue.pending_count == 0:
-                    self._elapsed_start_time = None
-
-    tui = MinimalTUI()
-
-    # Initially no timer
-    assert tui._elapsed_start_time is None
-    assert tui.status == "Ready"
-
-    # Start processing - timer should start
-    tui._update_status("processing")
-    assert tui._elapsed_start_time is not None
-    start_time = tui._elapsed_start_time
-
-    # Small delay
-    time.sleep(0.01)
-
-    # Processing again - timer should NOT reset (already running)
-    tui._update_status("processing")
-    assert tui._elapsed_start_time == start_time
-
-    # Go idle - timer should reset
-    tui._update_status("idle")
-    assert tui._elapsed_start_time is None
-    assert tui.status == "Ready"
-
-
-def test_elapsed_timer_continues_with_queue():
-    """Test that elapsed timer continues when queue has pending items."""
-    import time
-
-    class MockQueue:
-        def __init__(self):
-            self._pending_count = 0
-
-        @property
-        def pending_count(self):
-            return self._pending_count
-
-    class MinimalTUI:
-        def __init__(self):
-            self._elapsed_start_time = None
-            self.agent = type("obj", (object,), {"queue": MockQueue()})()
-            self.processing = False
-            self.status = "Ready"
-
-        def _update_status(self, status: str) -> None:
-            if status == "processing":
-                self.processing = True
-                self.status = "Processing"
-                if self._elapsed_start_time is None:
-                    self._elapsed_start_time = time.time()
-            elif status == "idle":
-                self.processing = False
-                self.status = "Ready"
-                if self.agent.queue.pending_count == 0:
-                    self._elapsed_start_time = None
-
-    tui = MinimalTUI()
-
-    # Start processing
-    tui._update_status("processing")
-    assert tui._elapsed_start_time is not None
-    start_time = tui._elapsed_start_time
-
-    # Add a queue item
-    tui.agent.queue._pending_count = 1
-
-    # Go idle with pending items - timer should NOT reset
-    tui._update_status("idle")
-    assert tui._elapsed_start_time == start_time
-
-    # Queue empty now
-    tui.agent.queue._pending_count = 0
-
-    # Go idle again - timer should reset
-    tui._update_status("idle")
-    assert tui._elapsed_start_time is None
-
-
 # =============================================================================
 # Completion Context Tests (Phase 1: Cursor-aware completion)
 # =============================================================================
@@ -1121,174 +1012,314 @@ def test_completion_context_after_file_completion():
     assert result[1] == (0, 22)  # Last @ position
 
 
-class MockFilenameCompleter:
-    """Mock class to test _get_filename_completions logic."""
+class _ScanStub:
+    """The real scanner methods, without a Textual app."""
 
-    def _get_filename_completions(self, partial: str) -> list[str]:
-        """Get filename completions for @file syntax.
+    _get_filename_completions = AgentTUI._get_filename_completions
 
-        This is a copy of the TUI method for testing.
-        """
-        import os
 
-        if not partial.startswith("@"):
-            return []
+def _complete(partial: str) -> list[str]:
+    """Call the REAL TUI filename completer.
 
-        # Strip the leading @ to get the path
-        path_part = partial[1:]
+    These tests used to run against a hand-copied duplicate of the method,
+    which silently drifted: the copy still had the bug that dropped a typed
+    directory name from the completion.
+    """
+    return _ScanStub()._get_filename_completions(partial)
 
-        # Determine the directory to scan and the prefix to filter by
-        if not path_part:
-            # Just "@" - list files in current directory
-            dir_path = "."
-            prefix = ""
-            base_for_completion = ""
-        elif path_part.startswith("~"):
-            # Handle home directory expansion
-            expanded = os.path.expanduser(path_part)
-            if os.path.isdir(expanded):
-                dir_path = expanded
-                prefix = ""
-            else:
-                dir_path = os.path.dirname(expanded)
-                prefix = os.path.basename(expanded)
-            # Preserve ~ in the completion
-            base_for_completion = (
-                path_part if path_part == "~" else os.path.dirname(path_part)
-            )
-            if base_for_completion and not base_for_completion.endswith("/"):
-                base_for_completion += "/"
-        else:
-            # Handle relative or absolute paths
-            if os.path.isabs(path_part):
-                full_path = path_part
-            else:
-                full_path = os.path.join(os.getcwd(), path_part)
 
-            if os.path.isdir(full_path):
-                dir_path = full_path
-                prefix = ""
-            else:
-                dir_path = os.path.dirname(full_path)
-                prefix = os.path.basename(full_path)
+@pytest.fixture
+def tree(tmp_path, monkeypatch):
+    """A small directory tree to complete against, with cwd inside it.
 
-            # Preserve the base path for completion
-            if "/" in path_part:
-                base_for_completion = path_part.rsplit("/", 1)[0] + "/"
-            else:
-                base_for_completion = ""
-
-        # Get the directory to scan
-        if not os.path.isdir(dir_path):
-            return []
-
-        try:
-            entries = os.listdir(dir_path)
-        except (PermissionError, OSError):
-            return []
-
-        # Filter by prefix and build completions
-        matches = []
-        for entry in sorted(entries):
-            if entry.startswith("."):
-                continue  # Skip hidden files
-            if prefix and not entry.lower().startswith(prefix.lower()):
-                continue
-
-            # Build the completion preserving the user's input style
-            completion = f"@{base_for_completion}{entry}"
-
-            # Add trailing / for directories
-            full_entry_path = os.path.join(dir_path, entry)
-            if os.path.isdir(full_entry_path):
-                completion += "/"
-
-            matches.append(completion)
-
-            if len(matches) >= 20:  # Limit matches
-                break
-
-        return matches
+    docs/          <- directory whose name is typed in full
+      a.md
+      sub/
+        b.md
+    doc.txt        <- file sharing a prefix with docs/
+    """
+    (tmp_path / "docs" / "sub").mkdir(parents=True)
+    (tmp_path / "docs" / "a.md").write_text("a")
+    (tmp_path / "docs" / "sub" / "b.md").write_text("b")
+    (tmp_path / "doc.txt").write_text("c")
+    monkeypatch.chdir(tmp_path)
+    return tmp_path
 
 
 def test_filename_completion_no_at_sign():
     """Test that filename completion requires @ prefix."""
-    completer = MockFilenameCompleter()
-    matches = completer._get_filename_completions("src/")
-    assert matches == []
+    assert _complete("docs/") == []
 
 
-def test_filename_completion_just_at():
+def test_filename_completion_just_at(tree):
     """Test @ alone lists current directory."""
-    completer = MockFilenameCompleter()
-    matches = completer._get_filename_completions("@")
-    # Should return files from current directory
-    assert all(m.startswith("@") for m in matches)
-    # Hidden files should be excluded
-    assert not any(m.startswith("@.") for m in matches)
+    matches = _complete("@")
+    assert sorted(matches) == ["@doc.txt", "@docs/"]
 
 
-def test_filename_completion_partial_match():
+def test_filename_completion_partial_match(tree):
     """Test partial filename matching."""
-    completer = MockFilenameCompleter()
-    # Assuming there's a 'tests' directory in the project
-    matches = completer._get_filename_completions("@te")
-    assert any("tests" in m.lower() for m in matches)
+    assert _complete("@do") == ["@doc.txt", "@docs/"]
 
 
-def test_filename_completion_case_insensitive():
+def test_filename_completion_case_insensitive(tree):
     """Test case-insensitive matching."""
-    completer = MockFilenameCompleter()
-    # Should match 'tests' with '@TE'
-    matches = completer._get_filename_completions("@TE")
-    assert any("tests" in m.lower() for m in matches)
+    assert _complete("@DO") == ["@doc.txt", "@docs/"]
 
 
-def test_filename_completion_directories_have_slash():
+def test_filename_completion_directories_have_slash(tree):
     """Test that directory completions end with /."""
-    completer = MockFilenameCompleter()
-    # Assuming 'tests' is a directory
-    matches = completer._get_filename_completions("@tests")
-    # Find the tests match
-    for m in matches:
-        if "tests" in m and m.endswith("/"):
-            assert True
-            return
-    # If no match found, that's also OK (might not be tests dir)
-    assert True
+    assert _complete("@docs") == ["@docs/"]
 
 
-def test_filename_completion_nested_path():
-    """Test completion with nested path."""
-    completer = MockFilenameCompleter()
-    # Complete inside tests directory
-    matches = completer._get_filename_completions("@tests/")
-    # Should list files in tests directory
-    assert all(m.startswith("@tests/") for m in matches)
+def test_typed_directory_name_is_not_dropped_from_the_completion(tree):
+    """Typing a complete directory name completes to `dir/`, not its contents.
+
+    Regression: `@docs` used to descend into docs/ and return `@a.md`,
+    `@sub/` - the directory name vanished from the path, so accepting the
+    first match produced a path that did not exist.
+    """
+    assert _complete("@docs") == ["@docs/"]
 
 
-def test_filename_completion_tilde_expansion():
+def test_typed_nested_directory_name_keeps_the_whole_path(tree):
+    """The same bug on a nested path: `@docs/sub` -> `@docs/sub/`."""
+    assert _complete("@docs/sub") == ["@docs/sub/"]
+
+
+def test_filename_completion_nested_path(tree):
+    """Test completion with nested path (trailing slash descends)."""
+    matches = _complete("@docs/")
+    assert matches == ["@docs/a.md", "@docs/sub/"]
+
+
+def test_nested_partial_file_keeps_the_directory_prefix(tree):
+    """A partial inside a directory still carries the directory prefix."""
+    assert _complete("@docs/su") == ["@docs/sub/"]
+
+
+def test_filename_completion_tilde_expansion(tmp_path, monkeypatch):
     """Test ~ expansion for home directory."""
-    completer = MockFilenameCompleter()
-    matches = completer._get_filename_completions("@~")
-    # Should expand to home directory contents
-    # Just verify it doesn't crash and returns @-prefixed paths
-    assert all(m.startswith("@") for m in matches)
+    (tmp_path / "docs").mkdir()
+    (tmp_path / "docs" / "a.md").write_text("a")
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))  # Windows expanduser
+
+    assert _complete("@~") == ["@~/"]
+    assert _complete("@~/docs") == ["@~/docs/"]
+    assert _complete("@~/docs/") == ["@~/docs/a.md"]
 
 
-def test_filename_completion_nonexistent_directory():
+def test_filename_completion_nonexistent_directory(tree):
     """Test completion for non-existent directory returns empty."""
-    completer = MockFilenameCompleter()
-    matches = completer._get_filename_completions("@nonexistent_xyz_dir/")
-    assert matches == []
+    assert _complete("@nonexistent_xyz_dir/") == []
 
 
-def test_filename_completion_limit():
+def test_filename_completion_limit(tree):
     """Test that completion is limited to 50 matches."""
-    completer = MockFilenameCompleter()
-    # Just @ should list current directory, but be limited
-    matches = completer._get_filename_completions("@")
-    assert len(matches) <= 50
+    for i in range(60):
+        (tree / f"f{i:02d}.txt").write_text("x")
+    assert len(_complete("@")) == 50
+
+
+# ===== Cycling: Tab walks the LEVEL, not just the prefix matches =====
+#
+# Tab completes to the first prefix match, then keeps moving through the
+# siblings at that level - a unique match must not trap the user inside a
+# directory. `→` opens a directory; a path typed in full leaves Tab inert.
+
+
+def _scan(partial: str):
+    """(matches, level) for an @path partial, from the real scanner."""
+    return filename_completion_scan(partial)
+
+
+def _plan(matches, level, partial):
+    return plan_completion(matches, level, partial)
+
+
+def _descend(text: str, row: int, col: int):
+    """The `→` gesture: descend only at the end of a directory path."""
+
+    class _Stub:
+        _get_completion_context = AgentTUI._get_completion_context
+
+    return AgentTUI._descend_target(_Stub(), text, (row, col))
+
+
+def test_scan_level_is_the_parent_when_a_directory_is_named_in_full(tree):
+    """`@docs` completes to `@docs/`; the level to cycle is the PARENT."""
+    matches, level = _scan("@docs")
+    assert matches == ["@docs/"]
+    assert level == ["@doc.txt", "@docs/"]
+
+
+def test_scan_level_is_the_directory_when_a_slash_was_typed(tree):
+    """`@docs/` descends: matches and level are both the directory's entries."""
+    matches, level = _scan("@docs/")
+    assert matches == ["@docs/a.md", "@docs/sub/"]
+    assert level == matches
+
+
+def test_scan_level_keeps_the_whole_level_for_a_partial(tree):
+    """A partial's level is unfiltered, so Tab can move past its match."""
+    matches, level = _scan("@docs/su")
+    assert matches == ["@docs/sub/"]
+    assert level == ["@docs/a.md", "@docs/sub/"]
+
+
+def test_plan_completion_cycles_the_level_after_a_unique_match():
+    """The reported trap: one match, but Tab must still move on."""
+    plan = _plan(["@docs/"], ["@doc.txt", "@docs/", "@done/"], "@doc")
+    assert plan == (["@doc.txt", "@docs/", "@done/"], 1)
+
+
+def test_plan_completion_is_inert_on_a_path_typed_in_full():
+    """Tab must never replace a complete path the user typed."""
+    assert _plan(["@docs/a.md"], ["@docs/a.md", "@docs/sub/"], "@docs/a.md") is None
+
+
+def test_plan_completion_cycles_when_another_entry_extends_the_text(tree):
+    """`@a.py` is complete but also a prefix of `@a.py.bak` - still cycles."""
+    (tree / "a.py").write_text("x")
+    (tree / "a.py.bak").write_text("y")
+    matches, level = _scan("@a.py")
+    assert matches == ["@a.py", "@a.py.bak"]
+    assert _plan(matches, level, "@a.py") == (level, 0)
+
+
+def test_plan_completion_nothing_matched():
+    assert _plan([], [], "@zzz") is None
+
+
+def test_right_arrow_opens_a_directory_at_the_end_of_the_line(tree):
+    assert _descend("@docs/", 0, 6) == ("@docs/", (0, 0), (0, 6))
+
+
+def test_right_arrow_opens_a_directory_named_without_a_slash(tree):
+    assert _descend("@docs", 0, 5) == ("@docs", (0, 0), (0, 5))
+
+
+def test_right_arrow_is_ordinary_cursor_movement_mid_line(tree):
+    """Mid-line `→` must move the cursor, not rewrite the path."""
+    assert _descend("@docs/ x", 0, 6) is None
+
+
+def test_right_arrow_does_not_open_a_file(tree):
+    assert _descend("@doc.txt", 0, 8) is None
+
+
+def test_right_arrow_needs_an_at_reference(tree):
+    """A line ending in a real directory path is not a file reference."""
+    assert _descend("see /tmp/", 0, 9) is None
+
+
+class _FakeField:
+    """Just enough TextArea for _apply_completion (single-line spans)."""
+
+    def __init__(self, text: str):
+        self.text = text
+        self.cursor_location = (0, len(text))
+
+    def replace(self, completion: str, start, end) -> None:
+        self.text = self.text[: start[1]] + completion + self.text[end[1] :]
+
+    def move_cursor(self, location) -> None:
+        self.cursor_location = location
+
+
+class _CompletionStub:
+    """The real completion methods on a stub app (no Textual, no widgets)."""
+
+    _get_completions_for_context = AgentTUI._get_completions_for_context
+    _get_filename_completions = AgentTUI._get_filename_completions
+    _apply_completion = AgentTUI._apply_completion
+    _reset_completion_state = AgentTUI._reset_completion_state
+    _start_completion = AgentTUI._start_completion
+
+    def __init__(self):
+        self._completion_matches = []
+        self._completion_index = 0
+        self._completion_prefix = ""
+        self._completion_start = (0, 0)
+        self._completion_end = (0, 0)
+        self._completion_text = ""
+        self._info_pane_mode = None
+        self.shown = None
+        self.hidden = False
+
+    def _show_completions(self, matches, current=None):
+        self.shown = (matches, current)
+
+    def _hide_info_pane(self):
+        self.hidden = True
+
+
+def test_start_completion_enters_a_cycle_over_the_level(tree):
+    """`@docs` + Tab completes, and leaves Tab able to move to `@doc.txt`."""
+    stub = _CompletionStub()
+    field = _FakeField("@docs")
+
+    stub._start_completion(field, "@filename", "@docs", "@docs", (0, 0), (0, 5))
+
+    assert field.text == "@docs/"
+    assert stub._completion_matches == ["@doc.txt", "@docs/"]
+    assert stub._completion_index == 1
+    assert stub._completion_text == "@docs/"
+    assert stub.shown == (["@doc.txt", "@docs/"], "@docs/")
+
+
+def test_start_completion_is_inert_on_a_complete_path(tree):
+    """No rewrite, no cycle, no pane - Tab does nothing."""
+    stub = _CompletionStub()
+    field = _FakeField("@docs/a.md")
+
+    stub._start_completion(field, "@filename", "@docs/a.md", "@docs/a.md", (0, 0), (0, 9))
+
+    assert field.text == "@docs/a.md"
+    assert stub._completion_matches == []
+    assert stub.shown is None
+
+
+class TestPoliteWaitOverlay:
+    """The "wait: Ns" overlay must clear when the wait ends WITHOUT the lock.
+
+    Reported live 2026-11-09: /polite off during a lock wait started the turn
+    correctly, but the status bar stayed on "wait: 0s" for the whole turn -
+    POLITE_ACQUIRED never fires on that path and the status stays
+    "processing", so nothing cleared it.
+    """
+
+    def _app(self):
+        from unittest.mock import MagicMock
+
+        app = MagicMock()
+        app._polite_wait_elapsed = 12.0
+        app._info_pane_mode = None
+        return app
+
+    def test_the_overlay_is_cleared(self):
+        app = self._app()
+
+        AgentTUI._handle_polite_wait_ended(app)
+
+        app._clear_polite_waiting.assert_called_once_with()
+
+    def test_the_queue_pane_is_refreshed_when_it_is_open(self):
+        """It still says "Waiting for lock" otherwise."""
+        app = self._app()
+        app._info_pane_mode = "queue"
+
+        AgentTUI._handle_polite_wait_ended(app)
+
+        app.call_later.assert_called_once_with(app._show_queue)
+
+    def test_no_pane_refresh_when_the_queue_pane_is_not_open(self):
+        app = self._app()
+
+        AgentTUI._handle_polite_wait_ended(app)
+
+        app.call_later.assert_not_called()
 
 
 class TestCompletionWindowing:
@@ -1443,7 +1474,7 @@ class TestProviderCompletion:
     """Tests for /provider command showing navigable list."""
 
     def test_get_provider_completions_returns_config_names(self):
-        """_get_provider_completions returns provider names from config."""
+        """_complete_provider returns provider names from config."""
         from unittest.mock import MagicMock, patch
 
         mock_config = MagicMock()
@@ -1456,17 +1487,15 @@ class TestProviderCompletion:
         mock_config.providers[1].name = "beta"
         mock_config.providers[2].name = "gamma"
 
-        app = MagicMock()
-        # Call the real method with mocked self
-        with patch("ui.tui.get_config", return_value=mock_config):
-            from ui.tui import AgentTUI
+        from agent13.commands import _complete_provider
 
-            result = AgentTUI._get_provider_completions(app, "")
+        with patch("agent13.config.get_config", return_value=mock_config):
+            result = _complete_provider(None, "")
 
         assert result == ["alpha", "beta", "gamma"]
 
     def test_get_provider_completions_filters_partial(self):
-        """_get_provider_completions filters by partial input."""
+        """_complete_provider filters by partial input."""
         from unittest.mock import MagicMock, patch
 
         mock_config = MagicMock()
@@ -1479,55 +1508,51 @@ class TestProviderCompletion:
         mock_config.providers[1].name = "openrouter"
         mock_config.providers[2].name = "local"
 
-        app = MagicMock()
-        with patch("ui.tui.get_config", return_value=mock_config):
-            from ui.tui import AgentTUI
+        from agent13.commands import _complete_provider
 
-            result = AgentTUI._get_provider_completions(app, "open")
+        with patch("agent13.config.get_config", return_value=mock_config):
+            result = _complete_provider(None, "open")
 
         assert result == ["openai", "openrouter"]
         assert "local" not in result
 
     def test_handle_provider_no_args_enters_completion(self):
-        """/provider with no args enters completion mode with provider names."""
+        """/provider with no args opens the picker at the current provider.
+
+        The listing itself is shared (execute_provider); the picker is the
+        TUI's own tail, driven by data["providers"].
+        """
         from unittest.mock import MagicMock
 
-        mock_config = MagicMock()
-        mock_config.providers = [
-            MagicMock(name="alpha"),
-            MagicMock(name="beta"),
-        ]
-        mock_config.providers[0].name = "alpha"
-        mock_config.providers[1].name = "beta"
-
-        app = MagicMock()
-        app.provider = "alpha"
-        app._get_provider_completions.return_value = ["alpha", "beta"]
-        app._enter_command_completion = MagicMock()
-
+        from agent13.commands import CommandResult
         from ui.tui import AgentTUI
 
-        AgentTUI._handle_provider_command(app, "")
+        app = MagicMock()
+        app._enter_command_completion = MagicMock()
+        result = CommandResult(
+            True,
+            "Available providers:\n  1. alpha *\n  2. beta",
+            data={"providers": ["alpha", "beta"], "current": "alpha"},
+        )
 
+        consumed = AgentTUI._run_command_follow_up(app, result, "")
+
+        assert consumed is True
         app._enter_command_completion.assert_called_once_with(
             "provider", ["alpha", "beta"], "alpha"
         )
 
     def test_handle_provider_no_args_no_providers_shows_error(self):
         """/provider with no args and no providers shows error."""
-        from unittest.mock import MagicMock
+        from unittest.mock import MagicMock, patch
 
-        app = MagicMock()
-        app._get_provider_completions.return_value = []
-        app._update_info_content = MagicMock()
+        from agent13 import commands as C
 
-        from ui.tui import AgentTUI
+        with patch("agent13.config.get_provider_names", return_value=[]):
+            result = C.run_command("provider", MagicMock(), "")
 
-        AgentTUI._handle_provider_command(app, "")
-
-        app._update_info_content.assert_called_once()
-        call_arg = app._update_info_content.call_args[0][0]
-        assert "No providers" in call_arg
+        assert not result.success
+        assert "No providers" in result.message
 
 
 if __name__ == "__main__":
@@ -1575,116 +1600,154 @@ if __name__ == "__main__":
             result = AgentTUI._get_provider_completions(app, "99")
 
         assert result == []
+# ============== Retry Command Tests ==============
 
 
-# ============== History Preview Newline Regression ==============
-# /history displays one entry per line.  Tool call arguments and tool
-# result messages (especially edit_file's "Replaced ... of '<find>' with
-# '<content>'") embed raw user content that frequently contains newlines.
-# If those newlines reach the rendered output they corrupt the layout —
-# see samples/corrupted_history.md.  These tests pin the single-line
-# guarantee.
+class TestRetryTail:
+    """/retry: the shared handler removes the group, the TUI loads the text.
+
+    The REPL re-queues the same text instead - that tail is its own.
+    """
+
+    def test_follow_up_loads_the_text_into_the_input(self):
+        from unittest.mock import MagicMock
+
+        from agent13.commands import CommandResult
+        from ui.tui import AgentTUI
+
+        app = MagicMock()
+        result = CommandResult(True, "Retrying", {"user_text": "second question"})
+
+        consumed = AgentTUI._run_command_follow_up(app, result, "")
+
+        assert consumed is True
+        app._load_retry_text.assert_called_once_with("second question")
+
+    def test_load_retry_text_fills_the_input_field(self):
+        from unittest.mock import MagicMock
+
+        from ui.tui import AgentTUI
+
+        app = MagicMock()
+        field = MagicMock()
+        app.query_one.return_value = field
+
+        AgentTUI._load_retry_text(app, "second question")
+
+        assert field.text == "second question"
+        field.focus.assert_called_once()
+        app.update_status.assert_called_once()
 
 
-def test_tool_result_preview_edit_file_multiline_message():
-    """edit_file success message embeds find/content with newlines."""
-    import json
-    from ui.tui import AgentTUI
-
-    msg = "Replaced 1 occurrence of '---\n\n## 6. Open Questions' with '---\n\n## 6. iPad Safar"
-    content = json.dumps({"success": True, "message": msg, "filepath": "doc.md"})
-    result = AgentTUI._format_tool_result_preview(content)
-    assert "\n" not in result, f"newline leaked into preview: {repr(result)}"
-    assert "✓" in result or "[green]" in result
+# ============== Queued-turn tails ==============
+# /wrapup, /chain and /journal last|all all leave one agent turn in
+# data["agent_message"] as (text, kind, data); the TUI schedules it and still
+# renders the handler's confirmation.
 
 
-def test_tool_result_preview_error_with_newlines():
-    import json
-    from ui.tui import AgentTUI
+class TestQueuedTurnTail:
+    async def test_journal_queues_the_agent_message(self):
+        import asyncio
+        from unittest.mock import AsyncMock, MagicMock
 
-    content = json.dumps({"success": False, "error": "line1\nline2\n## bad"})
-    result = AgentTUI._format_tool_result_preview(content)
-    assert "\n" not in result
+        from agent13.commands import CommandResult
+        from ui.tui import AgentTUI
 
+        app = MagicMock()
+        app.agent.add_message = AsyncMock()
+        result = CommandResult(
+            True,
+            "Journaling the most recent tool-using turn",
+            {"agent_message": ("/journal last", "journal_last", {})},
+        )
 
-def test_tool_result_preview_command_multiline_stdout():
-    import json
-    from ui.tui import AgentTUI
+        consumed = AgentTUI._run_command_follow_up(app, result, "last")
+        await asyncio.sleep(0)  # let the scheduled task run
 
-    content = json.dumps(
-        {"success": True, "exit_code": 0, "stdout": "line1\nline2\n## out", "stderr": ""}
-    )
-    result = AgentTUI._format_tool_result_preview(content)
-    assert "\n" not in result
+        assert consumed is False, "the confirmation must still render"
+        app.agent.add_message.assert_awaited_once_with(
+            "/journal last", kind="journal_last", data={}
+        )
 
+    async def test_wrapup_queues_the_turn_with_its_focus_name(self):
+        import asyncio
+        from unittest.mock import AsyncMock, MagicMock
 
-def test_tool_result_preview_non_json_multiline():
-    from ui.tui import AgentTUI
+        from agent13.commands import execute_wrapup
+        from ui.tui import AgentTUI
 
-    result = AgentTUI._format_tool_result_preview("raw\ntext\n## heading")
-    assert "\n" not in result
+        app = MagicMock()
+        app.agent.add_message = AsyncMock()
 
+        consumed = AgentTUI._run_command_follow_up(
+            app, execute_wrapup(app.agent, "  my cool game  "), "my cool game"
+        )
+        await asyncio.sleep(0)
 
-def test_tool_result_preview_fallback_dict_multiline_value():
-    import json
-    from ui.tui import AgentTUI
+        assert consumed is False
+        app.agent.add_message.assert_awaited_once_with(
+            "/wrapup my cool game", kind="wrapup", data={"focus_name": "my cool game"}
+        )
 
-    content = json.dumps({"custom_key": "val1\nval2\n## x"})
-    result = AgentTUI._format_tool_result_preview(content)
-    assert "\n" not in result
+    async def test_chain_queues_the_no_skills_flag(self):
+        import asyncio
+        from unittest.mock import AsyncMock, MagicMock
 
+        from agent13.commands import execute_chain
+        from ui.tui import AgentTUI
 
-def test_tool_call_preview_multiline_content_arg():
-    """Tool not in KEY_ARGS falls back to first arg — may be multiline content."""
-    import json
-    from ui.tui import AgentTUI
+        app = MagicMock()
+        app.agent.add_message = AsyncMock()
 
-    args = json.dumps({"content": "line1\nline2\n## Heading", "filepath": "x.md"})
-    result = AgentTUI._format_tool_call_preview("some_tool", args)
-    assert "\n" not in result, f"newline leaked into preview: {repr(result)}"
+        AgentTUI._run_command_follow_up(app, execute_chain(app.agent, "no-skills"), "no-skills")
+        await asyncio.sleep(0)
 
+        app.agent.add_message.assert_awaited_once_with(
+            "/chain", kind="chain", data={"no_skills": True}
+        )
 
-def test_tool_call_preview_multiline_command_arg():
-    import json
-    from ui.tui import AgentTUI
+    async def test_new_session_queues_the_deferred_clear(self):
+        import asyncio
+        from unittest.mock import AsyncMock, MagicMock
 
-    args = json.dumps({"command": "echo a\necho b\n## Heading"})
-    result = AgentTUI._format_tool_call_preview("command", args)
-    assert "\n" not in result
+        from agent13.commands import execute_new_session
+        from ui.tui import AgentTUI
 
+        app = MagicMock()
+        app.agent.request_clear = AsyncMock()
 
-def test_tool_result_preview_normal_still_works():
-    """Regression fix must not break normal single-line results."""
-    import json
-    from ui.tui import AgentTUI
+        consumed = AgentTUI._run_command_follow_up(
+            app, execute_new_session(app.agent, ""), ""
+        )
+        await asyncio.sleep(0)
 
-    content = json.dumps(
-        {"success": True, "filepath": "doc.md", "total_lines": 406, "view": "raw"}
-    )
-    result = AgentTUI._format_tool_result_preview(content)
-    assert "\n" not in result
-    assert "doc.md" in result
-    assert "406" in result
+        # Not consumed - the handler's "New session queued" still renders.
+        assert consumed is False
+        app.agent.request_clear.assert_awaited_once_with(mode="all")
+        # The display is reset by the MESSAGES_CLEARED handler, not here.
+        app.agent.clear_messages.assert_not_called()
 
+    async def test_load_queues_and_records_the_path(self):
+        import asyncio
+        from pathlib import Path
+        from unittest.mock import AsyncMock, MagicMock
 
-def test_tool_call_preview_normal_still_works():
-    import json
-    from ui.tui import AgentTUI
+        from agent13.commands import execute_load
+        from ui.tui import AgentTUI
 
-    args = json.dumps({"filepath": "doc.md", "find": "x"})
-    result = AgentTUI._format_tool_call_preview("edit_file", args)
-    assert "\n" not in result
-    assert "doc.md" in result
+        app = MagicMock()
+        app.agent.request_load = AsyncMock()
 
+        result = execute_load(app.agent, "mine")
+        result.data["load_path"] = "/tmp/mine.ctx"  # bypass the filesystem check
 
-def test_tool_result_preview_long_message_truncated():
-    import json
-    from ui.tui import AgentTUI
+        consumed = AgentTUI._run_command_follow_up(app, result, "mine")
+        await asyncio.sleep(0)
 
-    content = json.dumps({"success": True, "message": "x" * 200})
-    result = AgentTUI._format_tool_result_preview(content)
-    assert result.endswith("...")
-    assert "\n" not in result
+        assert consumed is False
+        # Recorded first so on_context_loaded can capture the resumed stats.
+        assert app._pending_load_path == Path("/tmp/mine.ctx")
+        app.agent.request_load.assert_awaited_once_with("/tmp/mine.ctx")
 
 
 # ============== Bell Command Tests ==============
@@ -1768,35 +1831,38 @@ class TestLoadCompletions:
     def test_lists_save_stems(self):
         from unittest.mock import patch
 
-        app = _make_tui_app()
+        from agent13.commands import _complete_load
+
         with patch(
-            "ui.tui.list_all_saves",
+            "agent13.persistence.list_all_saves",
             return_value=[Path("/saves/manual.ctx"), Path("/saves/2026-09-22.ctx")],
         ):
-            result = app._get_load_completions("")
+            result = _complete_load(None, "")
         assert result == ["manual", "2026-09-22"]
 
     def test_filters_by_partial(self):
         from unittest.mock import patch
 
-        app = _make_tui_app()
+        from agent13.commands import _complete_load
+
         with patch(
-            "ui.tui.list_all_saves",
+            "agent13.persistence.list_all_saves",
             return_value=[Path("/saves/manual.ctx"), Path("/saves/2026-09-22.ctx")],
         ):
-            result = app._get_load_completions("2026")
+            result = _complete_load(None, "2026")
         assert result == ["2026-09-22"]
 
     def test_failure_shows_hint_with_error(self):
         """A raising list_all_saves yields a visible hint, not an empty list."""
         from unittest.mock import patch
 
-        app = _make_tui_app()
+        from agent13.commands import _complete_load
+
         with patch(
-            "ui.tui.list_all_saves",
+            "agent13.persistence.list_all_saves",
             side_effect=PermissionError("[WinError 5] Access is denied"),
         ):
-            result = app._get_load_completions("")
+            result = _complete_load(None, "")
         assert len(result) == 1
         assert result[0].startswith("saves list unavailable:")
         assert "Access is denied" in result[0]
@@ -1805,11 +1871,121 @@ class TestLoadCompletions:
         """Long exception strings can't blow out the completion dropdown."""
         from unittest.mock import patch
 
-        app = _make_tui_app()
+        from agent13.commands import _complete_load
+
         with patch(
-            "ui.tui.list_all_saves",
+            "agent13.persistence.list_all_saves",
             side_effect=RuntimeError("x" * 500),
         ):
-            result = app._get_load_completions("")
+            result = _complete_load(None, "")
         assert len(result) == 1
         assert len(result[0]) <= 100
+
+
+# ============== Prompt / snippet tails ==============
+
+
+class TestPromptTail:
+    """/prompt with no args opens the TUI picker instead of printing a list."""
+
+    def test_follow_up_opens_the_picker(self):
+        from unittest.mock import MagicMock
+
+        from agent13.commands import CommandResult
+        from ui.tui import AgentTUI
+
+        app = MagicMock()
+        app._enter_command_completion = MagicMock()
+        result = CommandResult(
+            True,
+            "Available prompts:\n  * default\n    concise",
+            data={"prompt_picker": (["default", "concise"], "default")},
+        )
+
+        consumed = AgentTUI._run_command_follow_up(app, result, "")
+
+        assert consumed is True
+        app._enter_command_completion.assert_called_once_with(
+            "prompt", ["default", "concise"], "default"
+        )
+
+
+class TestSnippetTail:
+    """/snippet: the TUI fills the input and keeps its slash commands in step."""
+
+    def test_use_fills_the_input(self):
+        from unittest.mock import MagicMock
+
+        from agent13.commands import CommandResult
+        from ui.tui import AgentTUI
+
+        app = MagicMock()
+        field = MagicMock()
+        app.query_one.return_value = field
+        result = CommandResult(
+            True, "Snippet 'mine':\nthe text", {"snippet_text": "the text"}
+        )
+
+        consumed = AgentTUI._run_command_follow_up(app, result, "mine")
+
+        assert consumed is True
+        assert field.text == "the text"
+        field.focus.assert_called_once()
+
+    def test_add_registers_the_slash_command(self):
+        from unittest.mock import MagicMock
+
+        from ui.tui import AgentTUI
+
+        app = MagicMock()
+        app.SLASH_COMMANDS = list(AgentTUI._BUILTIN_SLASH_COMMANDS)
+        app._BUILTIN_SLASH_COMMANDS = AgentTUI._BUILTIN_SLASH_COMMANDS
+
+        AgentTUI._add_snippet_slash_command(app, "mine")
+
+        assert "/mine" in app.SLASH_COMMANDS
+
+    def test_add_skips_a_name_that_collides_with_a_builtin(self):
+        from unittest.mock import MagicMock
+
+        from ui.tui import AgentTUI
+
+        app = MagicMock()
+        app.SLASH_COMMANDS = list(AgentTUI._BUILTIN_SLASH_COMMANDS)
+        app._BUILTIN_SLASH_COMMANDS = AgentTUI._BUILTIN_SLASH_COMMANDS
+
+        AgentTUI._add_snippet_slash_command(app, "help")
+
+        assert app.SLASH_COMMANDS.count("/help") == 1
+
+    def test_delete_drops_the_slash_command(self):
+        from unittest.mock import MagicMock
+
+        from ui.tui import AgentTUI
+
+        app = MagicMock()
+        app.SLASH_COMMANDS = list(AgentTUI._BUILTIN_SLASH_COMMANDS) + ["/mine"]
+        app._BUILTIN_SLASH_COMMANDS = AgentTUI._BUILTIN_SLASH_COMMANDS
+
+        AgentTUI._remove_snippet_slash_command(app, "mine")
+
+        assert "/mine" not in app.SLASH_COMMANDS
+
+    def test_follow_up_dispatches_add_and_remove(self):
+        from unittest.mock import MagicMock
+
+        from agent13.commands import CommandResult
+        from ui.tui import AgentTUI
+
+        app = MagicMock()
+        result = CommandResult(
+            True,
+            "Renamed snippet 'old' -> 'new'",
+            {"snippet_removed": "old", "snippet_added": "new"},
+        )
+
+        consumed = AgentTUI._run_command_follow_up(app, result, "rename old new")
+
+        assert consumed is False, "the confirmation still renders"
+        app._remove_snippet_slash_command.assert_called_once_with("old")
+        app._add_snippet_slash_command.assert_called_once_with("new")

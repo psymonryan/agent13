@@ -90,6 +90,21 @@ class BellManager:
         self._cancel_timer()
         self._armed = False
 
+    def on_paused(self) -> None:
+        """Ring to announce the pause took effect, and disarm the timer.
+
+        ``/pause`` does not stop the agent instantly - it pauses at the next
+        safe point - so this runs when the agent is ACTUALLY paused. The user
+        has usually walked away by then, and the bell is what turns the tmux
+        tab yellow to say "pause complete". Rings regardless of threshold
+        (that governs turn completion, not pause completion); still respects
+        ``enabled`` so ``/bell off`` silences this too.
+        """
+        self._cancel_timer()
+        self._armed = False
+        if self.enabled:
+            self.ring()
+
     # ── Timer ────────────────────────────────────────────────────────
 
     def _start_timer(self) -> None:

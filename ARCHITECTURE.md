@@ -19,6 +19,7 @@ This document describes the architecture, design decisions, and implementation d
 13. [Sandbox Security](#sandbox-security)
 14. [Testing Strategy](#testing-strategy)
 15. [Extensibility Points](#extensibility-points)
+16. [Durable Records and Goal Windows](#durable-records-and-goal-windows)
 
 ***
 
@@ -439,8 +440,8 @@ class ItemStatus(Enum):
 
 ### Message Priority Syntax
 
-- `message!` - Priority message (jumps queue, processed next)
-- `!!message` - Interrupt message (stops current processing, breaks agent loop)
+- `!message` - Priority message (jumps queue, processed next)
+- `!!message` - Interrupt message (injected into the running turn at the next tool-call boundary; the turn is not stopped)
 
 ### Deferred Operations
 
@@ -877,3 +878,27 @@ ruff check agent13/ ui/ tools/ tests/
 5. **Custom skills**: Add skill directories with `SKILL.md` to `~/.agent13/skills/` or project `.agent13/skills/`.
 6. **Tool filtering**: Use `enabled_tools`/`disabled_tools` in config with glob or regex patterns.
 7. **Sandbox profiles**: Add custom profiles in `~/.agent13/sandbox/`.
+
+***
+
+## Durable Records and Goal Windows
+
+The subsystem that lets the agent work across sessions and in unattended mode. Five modules, none of which import the agent core:
+
+- `agent13/durable_records.py` - owns the record files: the truth file (`records/<focus>_current_truth.md`), the journal, and the seed (what a new session is handed when it loads a focus)
+- `agent13/truth_format.py` - the record format's reading half: topic spans, ticket lines, the `h.` re-rank convention. Imports nothing from agent13, so prompts, records and goal logic all share it
+- `agent13/truth_select.py` - the seed's selector: scores topics against the incoming query and loads what fits the budget, never the whole file
+- `agent13/handoff.py` - the machine-readable closing block of a wrap-up (what to load next session, what is unresolved for the user)
+- `agent13/goal.py` - pure rules for the goal window: duration parsing, ticket classification, the progress question and its answer
+
+### The wrap-up turn
+
+When the context crosses the auto-context threshold (or `/wrapup` runs), the agent writes before it compacts: it reconciles the truth file in place (correct facts, add topics, re-ranks tickets), appends a journal entry, and closes with a handoff block. The next session's seed is built from that block: nominated topics plus the ticket section, with unresolved FOR THE USER items carried forward in a list. A wrap-up interrupted by a pause or quit is finished on an explicit resume.
+
+### The goal window
+
+`/grind <duration> [text]` arms a deadline. While it is armed, the idle decision at the end of each turn changes: instead of going idle, the agent classifies the record's tickets, asks itself a progress question, and on `can_progress` enqueues its own next step. The question and its answer are deleted from history once consumed, so a grind session does not accumulate question overhead. The model never sees the remaining time - a visible budget invites early hand-backs. When every ticket is blocked or the record carries unresolved user items, the question goes to the user instead; the answer is parsed as JSON and the window continues. The window survives save/load (the deadline is persisted, an in-flight question is not), and expiring clears the chain budget so the wind-down hands back cleanly.
+
+### Design constraint
+
+The record is only rewritten at a wrap-up, so everything downstream (ticket states, the seed) is allowed to be stale between wrap-ups. The goal window's mechanical ticket check shapes its questions but never stops the run: continuing is the safe failure.

@@ -17,6 +17,9 @@ pytest-of-*
 # Virtual env
 .venv/
 venv/
+# Platform-suffixed venvs (e.g. .venv_Darwin_arm64/). Untracked today, but a
+# `git add -A` would otherwise sweep in a venv full of local paths.
+.venv_*/
 
 # Build artifacts
 dist/
@@ -25,3 +28,4 @@ build/
 .testing
 .scratch
 worktrees/
+tests/.testing*

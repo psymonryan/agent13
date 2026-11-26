@@ -58,6 +58,18 @@ class PolitePauseRequested(Exception):
     """
 
 
+class PoliteCancelled(Exception):
+    """Raised by ``PoliteLock.acquire()`` when the lock is no longer wanted.
+
+    /polite off (or a re-key to another model) during a wait must END the wait,
+    not let it run to completion: the agent would otherwise block until the
+    lock frees, win it, and then run a turn holding a lock it no longer tracks
+    — the release guards all test ``agent.polite_lock is not None``, so nothing
+    frees it. The caller re-reads ``agent.polite_lock`` and proceeds unlocked
+    when it is gone.
+    """
+
+
 def _sanitize_provider(provider: str) -> str:
     """Sanitize provider string for use in a lock filename.
 
@@ -92,6 +104,7 @@ class PoliteLock:
         model: Optional[str] = None,
         emit: Optional[Callable[..., Coroutine[Any, Any, None]]] = None,
         pause_check: Optional[Callable[[], bool]] = None,
+        cancel_check: Optional[Callable[[], bool]] = None,
     ) -> None:
         self._interval = max(0.0, float(interval))
         self._emit = emit
@@ -100,6 +113,11 @@ class PoliteLock:
         # caller can go PAUSED instead of being force-cancelled (which reads
         # as an interrupt). None = pause-awareness disabled (tests, legacy).
         self._pause_check = pause_check
+        # Returns True when this lock is no longer the agent's current one -
+        # /polite off, or a re-key to another model. acquire() raises
+        # PoliteCancelled so the wait ENDS instead of running to completion
+        # and winning a lock nobody will release. None = not cancellable.
+        self._cancel_check = cancel_check
         self._lock: Optional[BaseFileLock] = None
         self._provider = provider
         self._model = model
@@ -168,6 +186,12 @@ class PoliteLock:
                 # a wasted sleep.
                 if self._pause_check is not None and self._pause_check():
                     raise PolitePauseRequested()
+                # No longer wanted (/polite off, or re-keyed)? End the wait
+                # now. Without this the wait runs to completion, wins a lock
+                # the agent has already forgotten, and runs the turn holding
+                # it - the release guards all test `polite_lock is not None`.
+                if self._cancel_check is not None and self._cancel_check():
+                    raise PoliteCancelled()
 
                 # Non-blocking acquire attempt — instant, never hands
                 # priority to the OS scheduler.
@@ -185,13 +209,21 @@ class PoliteLock:
                         await self._emit_waiting(now - wait_start)
                     if self._pause_check is not None and self._pause_check():
                         raise PolitePauseRequested()
+                    if self._cancel_check is not None and self._cancel_check():
+                        raise PoliteCancelled()
                     # asyncio.sleep(0) cooperatively yields without blocking —
                     # this is the N=0 "most aggressive" behaviour.
                     await asyncio.sleep(self._interval)
                     continue
 
-                # We won the lock.
+                # We won the lock. Claim it FIRST, then re-check: a cancel
+                # that landed between the attempt and here would otherwise
+                # hand the caller a lock it has already stopped tracking.
+                # Claiming first means the except-BaseException handler below
+                # releases it on the way out.
                 self._lock = lock
+                if self._cancel_check is not None and self._cancel_check():
+                    raise PoliteCancelled()
                 break
 
             await self._emit_acquired()

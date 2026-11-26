@@ -213,7 +213,7 @@ async def test_rebuild_labels_a_completed_reasoning_block_thoughts():
     from ui.tui import ReasoningMessage
 
     tui = MagicMock()
-    tui._reasoning_collapsed = True
+    tui.agent.reasoning_collapsed = True
     tui._is_at_bottom = MagicMock(return_value=False)
     tui._scroll_if_at_bottom = AsyncMock()
     mounted = []
@@ -253,8 +253,8 @@ async def test_rebuild_numbers_tool_calls_and_results_per_turn():
     from ui.tui import AgentTUI
 
     tui = MagicMock()
-    tui._reasoning_collapsed = True
-    tui._toolview_collapsed = True
+    tui.agent.reasoning_collapsed = True
+    tui.agent.toolview_collapsed = True
     tui._is_at_bottom = MagicMock(return_value=False)
     tui._scroll_if_at_bottom = AsyncMock()
     tui._safe_mount = AsyncMock(return_value=True)

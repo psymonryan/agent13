@@ -34,7 +34,12 @@ COMPACT_NEEDLE = "Summarize our conversation"  # DEFAULT_COMPACT_PROMPT
 # prompt when action = report_and_compact (DEFAULT_REPORT_AND_COMPACT_SUMMARY_PROMPT).
 SUMMARY_NEEDLE = "Write a SHORT bridge summary"
 HINT_NEEDLE = "Continue work on the outstanding items"  # AUTO_CONTEXT_CONTINUE_HINT
-CARRY_NEEDLE = "standing instruction for this run"  # AUTO_CONTEXT_CARRY_HINT
+# The restart carries the record pointer when a record exists and the bare
+# hint when none does. These fixtures set no focus, so there is no record: the
+# restart falls back to the hint. (The record-pointer branch is unit-tested in
+# tests/test_goal.py - TestChainRestartMessage.) The recency-ranked carry hint
+# (AUTO_CONTEXT_CARRY_HINT) and the user-message quoting that chose between the
+# two are gone - docs_archive/work_order_2026-11-03_agent13_goal_loop.md s3.
 
 
 # ────────────────────────────────────────────────────────────────
@@ -487,12 +492,15 @@ def pointer_llm_server(tmp_path):
     use the VERBOSE prompt), the /compact itself, and one turn after it (to
     observe the compacted summary on the wire).
 
-    The record paths are absolute tmp paths so the wrap-up's write_file
-    calls land in the test's tmp dir, never the repo. Usage stays tiny
+    The record paths are in the temp project's records directory - where the
+    harness looks for a record, and inside the test's tmp dir, so the
+    wrap-up's write_file calls never touch the real one. Usage stays tiny
     (prompt_tokens: 50) so no auto-context check can fire.
     """
-    journal_path = str(tmp_path / "docs_archive" / "pointer_journal.md")
-    truth_path = str(tmp_path / "docs_archive" / "pointer_current_truth.md")
+    records = tmp_path / "records"
+    records.mkdir(parents=True, exist_ok=True)
+    journal_path = str(records / "pointer_journal.md")
+    truth_path = str(records / "pointer_current_truth.md")
 
     captured = []
     call_count = 0
@@ -647,9 +655,12 @@ class TestDurableRecordPointerIntegration:
     captured at the wrap-up."""
 
     def test_verbose_compact_summary_carries_pointer(
-        self, pointer_repl_env, pointer_llm_server
+        self, pointer_repl_env, pointer_llm_server, tmp_path, monkeypatch
     ):
         _, captured, journal_path, truth_path = pointer_llm_server
+        # The REPL inherits this process's cwd, and the records directory is
+        # <cwd>/records - so it must run in the temp project.
+        monkeypatch.chdir(tmp_path)
         proc = spawn_repl(pointer_repl_env)
 
         try:
@@ -858,10 +869,8 @@ class TestAutoContextChain:
             assert count_requests_ending_with(captured, WRAPUP_NEEDLE) == 2
             # Restarts are mechanical — no compact AI calls on the wire.
             assert count_requests_ending_with(captured, SUMMARY_NEEDLE) == 0
-            # The restart nudge carries the turn's user instruction verbatim
-            # (standing-instruction design) — the bare hint no longer appears.
-            assert count_requests_ending_with(captured, CARRY_NEEDLE) == 1
-            assert count_requests_ending_with(captured, HINT_NEEDLE) == 0
+            # No record in this fixture: the restart carries the bare hint.
+            assert count_requests_ending_with(captured, HINT_NEEDLE) == 1
         finally:
             proc.close()
 
@@ -882,12 +891,11 @@ class TestAutoContextChain:
             proc.expect("idle, over to you", timeout=30)
 
             assert len(captured) == 8
-            # A second carry nudge proves the budget was fresh: with the
-            # turn-1 counter (1 of 1 restarts used) still in effect, the
+            # A second restart nudge proves the budget was fresh: with
+            # the turn-1 counter (1 of 1 restarts used) still in effect, the
             # second turn would have wrapped up once and gone idle without
             # restarting.
-            assert count_requests_ending_with(captured, CARRY_NEEDLE) == 2
-            assert count_requests_ending_with(captured, HINT_NEEDLE) == 0
+            assert count_requests_ending_with(captured, HINT_NEEDLE) == 2
         finally:
             proc.close()
 
@@ -1065,16 +1073,20 @@ class TestPreTurnThreshold:
     [pytest.param(("report_and_compact", 1), id="rac-chain1")],
     indirect=True,
 )
-class TestInFlightInstructionCarry:
-    """Mid-turn threshold hit on a user QUESTION: the mechanical restart
-    carries the question VERBATIM into the nudge (the standing-instruction
-    design), so the post-restart turn continues the question instead of
-    drifting to the ticket queue. The injected intro no longer commands
-    ticket work."""
+class TestRestartContinuation:
+    """Mid-turn threshold hit on a user QUESTION: the mechanical restart carries
+    the record pointer and nothing else.
+
+    It used to carry the question VERBATIM (the standing-instruction design,
+    chosen by a recency rule). That whole mechanism is gone - see
+    docs_archive/work_order_2026-11-03_agent13_goal_loop.md section 3 - so the
+    restart must not quote the user, and must not fall back to the bare hint
+    while a record exists.
+    """
 
     QUESTION = "what is the multiplexing rule for agents"
 
-    def test_question_survives_mechanical_restart(
+    def test_question_is_not_quoted_by_the_restart(
         self, repl_env, capturing_llm_server
     ):
         _, captured = capturing_llm_server
@@ -1095,11 +1107,12 @@ class TestInFlightInstructionCarry:
             restart_req = captured[2]
             last = last_user_message(restart_req)
 
-            # The nudge carries the question VERBATIM...
-            assert CARRY_NEEDLE in last
-            assert self.QUESTION in last
-            # ...not the bare hint.
-            assert HINT_NEEDLE not in last
+            # No record in this fixture, so the restart carries the bare hint.
+            assert HINT_NEEDLE in last
+            # It does NOT quote the user's message: the bug 5b51563 fixed
+            # (a resumed chain re-injecting its own seed as "the user's last
+            # message") cannot recur because nothing is quoted.
+            assert self.QUESTION not in last
 
             # The injected intro orients on the records but no longer
             # commands the ticket queue.

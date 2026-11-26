@@ -274,6 +274,108 @@ async def test_second_agent_waits_for_first(mock_server, isolated_config):
 
 
 @pytest.mark.asyncio
+async def test_polite_off_ends_the_wait_and_runs_unlocked(
+    mock_server, isolated_config
+):
+    """/polite off during a lock wait must END the wait, not win it later.
+
+    The bug this pins: the wait polls until the lock frees, wins it, and only
+    then does the turn run - with ``agent.polite_lock`` already None, so every
+    release guard (all of which test ``polite_lock is not None``) skips and the
+    lock is freed only by GC. The user sees "it waits for the lock before being
+    disabled".
+    """
+    agent = _make_agent(mock_server, isolated_config)
+    coll = EventCollector()
+    agent.on_event(coll.make_handler())
+    agent.set_polite(interval=0.05)
+
+    # A SECOND agent holds the lock, as if mid-turn. It must be a different
+    # object: /polite off releases the agent's OWN hold, so using its own lock
+    # as the blocker would test nothing.
+    other = _make_agent(mock_server, isolated_config)
+    other.set_polite(interval=0.05)
+    assert other.polite_lock.path == agent.polite_lock.path
+    await other.polite_lock.acquire()
+    assert other.polite_lock.is_held()
+
+    agent.queue.add("a message")
+    task = asyncio.create_task(agent.run())
+
+    # Wait until it is actually blocked on the lock.
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline and not coll.has(AgentEvent.POLITE_WAITING):
+        await asyncio.sleep(0.02)
+    assert coll.has(AgentEvent.POLITE_WAITING), "agent should be waiting"
+
+    # /polite off while it waits.
+    result = execute_polite(agent, "off")
+    assert result.data["action"] == "disabled"
+    assert agent.polite_lock is None
+
+    # The wait must END - and without the other agent ever releasing the lock.
+    # Waiting for the API call is the proof the wait ended: asserting only
+    # "did not acquire" also passes when the agent is still blocked forever.
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline and not mock_server.log:
+        await asyncio.sleep(0.02)
+    chat = [r for r, _resp in mock_server.log if r.path == "/v1/chat/completions"]
+    assert chat, "the wait must END - the turn should have run unlocked"
+
+    assert other.polite_lock.is_held(), (
+        "the other agent never released - ours must not have won the lock"
+    )
+    assert not coll.has(AgentEvent.POLITE_ACQUIRED), (
+        "the wait ran to completion and won a lock the agent had forgotten"
+    )
+
+    agent.stop()
+    await asyncio.sleep(0.2)
+    if not task.done():
+        task.cancel()
+        try:
+            await task
+        except (asyncio.CancelledError, Exception):
+            pass
+    other.polite_lock.release()
+
+
+@pytest.mark.asyncio
+async def test_polite_off_mid_wait_still_runs_the_turn(
+    mock_server, isolated_config
+):
+    """The queued item runs unlocked - politeness is off, the work is not."""
+    agent = _make_agent(mock_server, isolated_config)
+    agent.set_polite(interval=0.05)
+    other = _make_agent(mock_server, isolated_config)
+    other.set_polite(interval=0.05)
+    await other.polite_lock.acquire()
+
+    agent.queue.add("run me anyway")
+    task = asyncio.create_task(agent.run())
+    await asyncio.sleep(0.3)
+
+    execute_polite(agent, "off")
+
+    # The turn reaches the model: the mock server answers it.
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline and not mock_server.log:
+        await asyncio.sleep(0.02)
+    chat = [r for r, _resp in mock_server.log if r.path == "/v1/chat/completions"]
+    assert chat, "the turn should have called the API without the lock"
+
+    agent.stop()
+    await asyncio.sleep(0.2)
+    if not task.done():
+        task.cancel()
+        try:
+            await task
+        except (asyncio.CancelledError, Exception):
+            pass
+    other.polite_lock.release()
+
+
+@pytest.mark.asyncio
 async def test_non_polite_agent_ignores_lock(mock_server, isolated_config):
     """An agent without polite mode ignores the lock entirely.
 

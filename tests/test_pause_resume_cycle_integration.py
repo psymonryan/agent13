@@ -69,6 +69,28 @@ def _slow_response(early, late, hold: float = PHASE1_HOLD) -> Response:
     )
 
 
+def _wait_for_first_request(captured, timeout: float = 20.0) -> None:
+    """Block until the mock has received the turn's first chat request.
+
+    Gating /pause on the printed ``[processing]`` line is not enough. The REPL
+    writes that line before ``agent.add_message()`` returns, and ``add_message``
+    only *queues* - ``_status`` stays IDLE until the run loop picks the message
+    up. So /pause dispatched in that window hits ``agent.is_idle`` and is
+    refused with "Nothing to pause (agent is idle)", and the test then waits out
+    its full timeout for a line that will never come. It passed on an unloaded
+    box (the run loop usually wins) and failed on loaded Windows CI.
+
+    The mock receiving a request proves the turn is running, which is exactly
+    the state /pause needs.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if captured:
+            return
+        time.sleep(0.02)
+    raise AssertionError("the turn never issued its first LLM request")
+
+
 def make_scripted_chat_handler(captured, counter):
     """Chat handler implementing the scripted cycle.
 
@@ -211,17 +233,27 @@ class TestPauseQuitContinueResumeCycle:
         proc, _banner1 = spawn_repl(env)
         try:
             proc.sendline("square 4 for me")
-            # Wait for the turn to start, then type /pause INSIDE the stream
-            # window: the mock withholds the tool call for PHASE1_HOLD, so the
-            # pause request is in effect before the agent reaches its first
-            # safe point (the tool call is executed as soon as it arrives, and
-            # the safe point follows within milliseconds - typing /pause after
-            # the tool-call line is a ~30ms race that the display used to win
-            # by printing more). Before the turn starts the agent is idle and
-            # /pause is refused, so [processing] is the gate.
+            # Wait for the turn to actually start, then type /pause INSIDE the
+            # stream window: the mock withholds the tool call for PHASE1_HOLD,
+            # so the pause request is in effect before the agent reaches its
+            # first safe point (the tool call is executed as soon as it
+            # arrives, and the safe point follows within milliseconds - typing
+            # /pause after the tool-call line is a ~30ms race that the display
+            # used to win by printing more).
             proc.expect(r"\[processing\]", timeout=20)
+            _wait_for_first_request(captured)
             proc.sendline("/pause")
-            proc.expect(r"(?i)pausing at next safe point", timeout=10)
+            # Match the refusal too: a bare timeout here hides which branch
+            # ran, and "the agent was idle" is the failure mode this test has
+            # actually hit.
+            matched = proc.expect(
+                [r"(?i)pausing at next safe point", r"(?i)nothing to pause"],
+                timeout=10,
+            )
+            assert matched == 0, (
+                "/pause was refused - the agent was not processing when the "
+                f"command was dispatched: {proc.before!r}"
+            )
             # The mock releases the tool call at PHASE1_HOLD; it executes and
             # the loop stops at the safe point before the next LLM call. The
             # tool line can't be waited on: the REPL's output controller

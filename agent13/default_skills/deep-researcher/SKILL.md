@@ -1,5 +1,6 @@
 ---
 name: deep-researcher
+disable-model-invocation: true
 description: |
   What: Perform comprehensive, in-depth research with rigorous source attribution and evidence-based findings.
   When: Use when creating well-sourced research documents that require credible citations, balanced analysis, and authoritative references.
@@ -8,6 +9,9 @@ compatibility: Requires access to web_search and fetch tools
 metadata:
   version: 1.0.0
   author: Converted from deep-researcher prompt
+  source: "https://github.com/ignidus/iscagent (MIT, converted from skills/deep-research)"
+  source_path: skills/deep-research/SKILL.md
+  source_ref: "a79031f 2026-03-18"
   created: 2026-04-01
   category: research
   tags:

@@ -35,6 +35,8 @@ Complete reference for using Agent13 - configuration, tools, skills, TUI command
 - [Sandbox Modes](#sandbox-modes)
 - [Session Management](#session-management)
 - [Journal Mode](#journal-mode)
+- [Working with a Focus](#working-with-a-focus)
+- [Factory Mode (/grind)](#factory-mode-grind)
 - [Auto-Context](#auto-context)
 - [MCP Integration](#mcp-integration)
 - [Troubleshooting](#troubleshooting)
@@ -101,7 +103,7 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 Install the latest release:
 
 ```bash
-uv tool install https://github.com/psymonryan/agent13/releases/download/v0.6.0/agent13-0.6.0-py3-none-any.whl
+uv tool install https://github.com/psymonryan/agent13/releases/download/v0.7.0/agent13-0.7.0-py3-none-any.whl
 ```
 
 ### Uninstall Agent13
@@ -116,11 +118,13 @@ uv tool uninstall agent13
 agent13 --upgrade
 ```
 
-Or inside a running session:
+Or, inside a REPL session:
 
 ```text
 /upgrade
 ```
+
+The TUI has no `/upgrade`: the startup check offers the update at the moment you learn about it, and `agent13 --upgrade` covers every other case.
 
 ## Running Agent13
 
@@ -137,7 +141,7 @@ The TUI provides:
 
 - **Streaming token output** - See responses arrive in real time
 - **Reasoning display** - Collapsible view of model reasoning tokens
-- **Queue management** - Submit multiple prompts, manage queue priorities, or bypass queue with an !!interrupt command for "inflight steering"
+- **Queue management** - Submit multiple prompts, manage queue priorities, or bypass queue with an !!steer command for "inflight steering"
 - **Info pane** - Context stats, model info, queue depth, token usage
 - **Tab completion** - Slash commands, model names, file paths
 - **Auto-save on exit** - Conversations saved to `.agent13/saves/` (local working directory)
@@ -282,40 +286,41 @@ Full protocol spec: `agent13-pipe-mode-spec.md`. Orchestrator usage guide: `docs
 
 ## Command-Line Options
 
-| Option                                                    | Description                                                                                                                                                                                                    | Default               |
-| --------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------- |
-| `provider`                                                | Provider name from config or OpenAI-compatible URL                                                                                                                                                             | -                     |
-| `--list-providers`                                        | List available providers and exit                                                                                                                                                                              | -                     |
-| `--version`                                               | Show version and exit                                                                                                                                                                                          | -                     |
-| `-p`, `--prompt`                                          | Run in batch mode with this prompt                                                                                                                                                                             | -                     |
-| `--model`                                                 | Select model by name or number; with no value, lists models                                                                                                                                                    | prompts interactively |
-| `--system-prompt`                                         | System prompt to use                                                                                                                                                                                           | default               |
-| `--sandbox`                                               | Sandbox mode (permissive-open, permissive-closed, etc.)                                                                                                                                                        | permissive-open       |
-| `--pretty on\|off`                                        | Enable/disable markdown rendering                                                                                                                                                                              | on                    |
-| `--debug`                                                 | Enable debug logging                                                                                                                                                                                           | off                   |
-| `--tool-response raw\|json`                               | Tool response format                                                                                                                                                                                           | raw                   |
-| `--mcp`                                                   | Connect to MCP servers on startup (TUI and batch modes)                                                                                                                                                        | off                   |
-| `--skills`                                                | Show discovered skills in the system prompt and enable the `skill` tool                                                                                                                                        | off                   |
-| `--journal`                                               | Enable journal mode (context compaction)                                                                                                                                                                       | off                   |
-| `--auto-context-threshold N`                              | Auto-context token threshold for this run (k suffix ok, e.g. `150k`; 0 = disabled)                                                                                                                             | 220000                |
-| `--auto-context-action compact\|report_and_compact\|none` | Auto-context action for this run (`none` = disabled)                                                                                                                                                           | from config           |
-| `--auto-context-chain N`                                  | Auto-context chain (restarts per turn) for this run                                                                                                                                                            | 3                     |
-| `--auto-context-nudge-cap N`                              | Degeneration guard: consecutive cut-off/empty outputs before the turn is stopped for this run (0 = off)                                                                                                        | from config           |
-| `--remove-api-reasoning`                                  | Strip reasoning tokens between turns (API context, not display)                                                                                                                                                | off                   |
-| `--reasoning collapsed\|expanded`                         | Initial fold state of reasoning widgets for this run (display only)                                                                                                                                            | from config/pin       |
-| `--toolview collapsed\|expanded`                          | Initial fold state of tool call/result widgets for this run (display only)                                                                                                                                     | from config/pin       |
-| `-c`, `--continue`                                        | Continue from last auto-saved session                                                                                                                                                                          | -                     |
-| `--devel`                                                 | Enable devel mode (show devel-group tools); also pinnable per project via `/devel pin`                                                                                                                         | off                   |
-| `--spinner fast\|slow\|off`                               | Spinner style                                                                                                                                                                                                  | fast                  |
-| `--upgrade`                                               | Check for updates and apply, then exit                                                                                                                                                                         | -                     |
-| `--clipboard osc52\|system`                               | Clipboard method for this session                                                                                                                                                                              | osc52                 |
-| `--bell`                                                  | Bell threshold: N seconds (0=always), or 'off'                                                                                                                                                                 | off                   |
-| `--polite`                                                | Polite mode: N seconds poll interval or 'off'                                                                                                                                                                  | 10                    |
-| `--read FILE`                                             | Read file(s) into the user message before processing                                                                                                                                                           | -                     |
-| `--focus NAME`                                            | Set the focus name at startup and, on an empty session, reads the durable records (docs_archive/NAME_current_truth.md + last journal entry) as the first turn - the model reads them and replies a minimal ack | -                     |
-| `--repl`                                                  | Run in REPL mode (readline-based, no TUI)                                                                                                                                                                      | off                   |
-| `--output FILE`                                           | Write REPL chat transcript to file (implies `--repl`) (the REPL still gets output for command responses)                                                                                                       | -                     |
-| `--io-format text\|json`                                  | I/O format: `text` (default) or `json` (NDJSON pipe mode)                                                                                                                                                      | text                  |
+| Option                                                    | Description                                                                                                                                                                                               | Default               |
+| --------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------- |
+| `provider`                                                | Provider name from config or OpenAI-compatible URL                                                                                                                                                        | -                     |
+| `--list-providers`                                        | List available providers and exit                                                                                                                                                                         | -                     |
+| `--version`                                               | Show version and exit                                                                                                                                                                                     | -                     |
+| `-p`, `--prompt`                                          | Run in batch mode with this prompt                                                                                                                                                                        | -                     |
+| `--model`                                                 | Select model by name or number; with no value, lists models                                                                                                                                               | prompts interactively |
+| `--system-prompt`                                         | System prompt to use                                                                                                                                                                                      | default               |
+| `--sandbox`                                               | Sandbox mode (permissive-open, permissive-closed, etc.)                                                                                                                                                   | permissive-open       |
+| `--pretty on\|off`                                        | Enable/disable markdown rendering (batch and REPL; the TUI always renders markdown)                                                                                                                       | on                    |
+| `--debug`                                                 | Enable debug logging                                                                                                                                                                                      | off                   |
+| `--tool-response raw\|json`                               | Tool response format                                                                                                                                                                                      | raw                   |
+| `--mcp`                                                   | Connect to MCP servers on startup (TUI and batch modes)                                                                                                                                                   | off                   |
+| `--skills`                                                | Show discovered skills in the system prompt and enable the `skill` tool                                                                                                                                   | off                   |
+| `--journal`                                               | Enable journal mode (context compaction)                                                                                                                                                                  | off                   |
+| `--auto-context-threshold N`                              | Auto-context token threshold for this run (k suffix ok, e.g. `150k`; 0 = disabled)                                                                                                                        | 220000                |
+| `--auto-context-action compact\|report_and_compact\|none` | Auto-context action for this run (`none` = disabled)                                                                                                                                                      | from config           |
+| `--auto-context-chain N`                                  | Auto-context chain (restarts per turn) for this run                                                                                                                                                       | 3                     |
+| `--auto-context-nudge-cap N`                              | Degeneration guard: consecutive cut-off/empty outputs before the turn is stopped for this run (0 = off)                                                                                                   | from config           |
+| `--auto-save-idle N`                                      | Write the daily auto-save once after N seconds with nothing to do for this run (0 = off)                                                                                                                  | from config           |
+| `--remove-api-reasoning`                                  | Strip reasoning tokens between turns (API context, not display)                                                                                                                                           | off                   |
+| `--reasoning collapsed\|expanded`                         | Initial fold state of reasoning widgets for this run (display only)                                                                                                                                       | from config/pin       |
+| `--toolview collapsed\|expanded`                          | Initial fold state of tool call/result widgets for this run (display only)                                                                                                                                | from config/pin       |
+| `-c`, `--continue`                                        | Continue from last auto-saved session                                                                                                                                                                     | -                     |
+| `--devel`                                                 | Enable devel mode (show devel-group tools); also pinnable per project via `/devel pin`                                                                                                                    | off                   |
+| `--spinner fast\|slow\|off`                               | Spinner style                                                                                                                                                                                             | fast                  |
+| `--upgrade`                                               | Check for updates and apply, then exit                                                                                                                                                                    | -                     |
+| `--clipboard osc52\|system`                               | Clipboard method for this session                                                                                                                                                                         | osc52                 |
+| `--bell`                                                  | Bell threshold: N seconds (0=always), or 'off'                                                                                                                                                            | off                   |
+| `--polite`                                                | Polite mode: N seconds poll interval or 'off'                                                                                                                                                             | 10                    |
+| `--read FILE`                                             | Read file(s) into the user message before processing                                                                                                                                                      | -                     |
+| `--focus NAME`                                            | Set the focus name at startup and, on an empty session, reads the durable records (records/NAME_current_truth.md + last journal entry) as the first turn - the model reads them and replies a minimal ack | -                     |
+| `--repl`                                                  | Run in REPL mode (readline-based, no TUI)                                                                                                                                                                 | off                   |
+| `--output FILE`                                           | Write REPL chat transcript to file (implies `--repl`) (the REPL still gets output for command responses)                                                                                                  | -                     |
+| `--io-format text\|json`                                  | I/O format: `text` (default) or `json` (NDJSON pipe mode)                                                                                                                                                 | text                  |
 
 ## TUI Reference
 
@@ -331,7 +336,8 @@ Full protocol spec: `agent13-pipe-mode-spec.md`. Orchestrator usage guide: `docs
 | `Ctrl+Y`                  | Copy full markdown of message containing selection (Select any text with mouse first) |
 | `Ctrl+Shift+C`            | Copy rendered text selection                                                          |
 | `Enter`                   | Submit input; close panes/modals on empty input                                       |
-| `Tab`                     | Autocomplete (slash commands, model names, file paths)                                |
+| `Tab`                     | Autocomplete; further `Tab`s cycle the entries at that level                          |
+| `→`                       | Open a directory in an `@path` (at the end of the line)                               |
 | Mouse drag select         | Auto copies selection to paste buffer                                                 |
 
 ### Status bar
@@ -393,7 +399,6 @@ Note: both /model and /provider can use numbered or named models and providers. 
 
 | Command                               | Description                                                    |
 | ------------------------------------- | -------------------------------------------------------------- |
-| `/pretty on\|off`                     | Toggle markdown rendering                                      |
 | `/tool-response raw\|json`            | Toggle tool output format api request                          |
 | `/spinner fast\|slow\|off`            | Change spinner style for slow connections (eg from your phone) |
 | `/remove-api-reasoning on\|off`       | Strip reasoning between turns (API context, not display)       |
@@ -407,7 +412,7 @@ Note: both /model and /provider can use numbered or named models and providers. 
 | Command                                | Description                                   |
 | -------------------------------------- | --------------------------------------------- |
 | `/tools`                               | List active tools                             |
-| `/skills [on                           | off                                           |
+| `/skills [on\|off\|list\|status]`      | Toggle the skills list, or list the skills    |
 | `/sandbox [mode]`                      | Change sandbox mode (tab-complete for modes)  |
 | `/devel [on\|off\|status\|pin\|unpin]` | Toggle devel tool visibility, pin per project |
 
@@ -439,17 +444,17 @@ Note: both /model and /provider can use numbered or named models and providers. 
 | `/wrapup [name]`                                           | Update the journal + current-truth files now, then idle (no compact); optional name sets the focus name                                                                                                                                                                   |
 | `/chain [no-skills]`                                       | Manually restart the loop: wrap-up if stale, then clear history and re-inject the focus records (no compact; no AI call when the wrap-up is current). `no-skills` also drops manually-loaded skills from the restart and forgets them                                     |
 | `/focus [name]`                                            | Set the focus name (no args shows current); on an empty history it loads the focus's records (truth file + last journal entry) into the session. Applied immediately, even mid-turn - a name set while a turn is running takes effect for the next wrap-up's record files |
+| `/grind <dur> [text]`                                      | Arm a goal window (see [Factory Mode](#factory-mode-grind)): for the duration, the agent keeps working instead of idling, asking only when blocked. `off` stops the window and keeps the goal text, `clear` forgets the text too, no args shows the window                |
 
 #### Other
 
-| Command                      | Description                                                |
-| ---------------------------- | ---------------------------------------------------------- |
-| `/history`                   | Show input history                                         |
-| `/delete [h\|q\|s] spec      | name`                                                      |
-|                              | eg: `/delete h last` `/delete q -2:` `/delete h 14:18`     |
-| `/snippet`                   | Manage text snippets (saved user messages)                 |
-| `/upgrade [--copy]`          | Check for updates and apply (or copy command to clipboard) |
-| `/clipboard [osc52\|system]` | Show or set clipboard method (default: osc52)              |
+| Command                      | Description                                            |
+| ---------------------------- | ------------------------------------------------------ |
+| `/history`                   | Show input history                                     |
+| `/delete [h\|q\|s] spec      | name`                                                  |
+|                              | eg: `/delete h last` `/delete q -2:` `/delete h 14:18` |
+| `/snippet`                   | Manage text snippets (saved user messages)             |
+| `/clipboard [osc52\|system]` | Show or set clipboard method (default: osc52)          |
 
 #### Skill Commands
 
@@ -464,7 +469,8 @@ This sends the skill's content as a message to the agent. Invoking a skill also 
 ### Input Features
 
 - **Tab completion** - Type `/` then `Tab` to see slash commands; complete model names, file paths
-- **Priority messages** - Append `!` for priority, `!!` for interrupt
+- **`@path` cycling** - `Tab` completes to the first match and then keeps walking the entries at that level (`Shift+Tab`/`Up`/`Down` too), so a directory never traps you; `→` at the end of the line opens a directory, and any edit ends the cycle. A path typed in full is left alone - `Tab` never replaces it
+- **Priority messages** - Prefix `!` for priority, `!!` to steer
 - **Multi-line input** - Use `^J`
 - **Snippet expansion** - Save frequent prompts as snippets, invoke as `/snippet-name`
 
@@ -683,7 +689,32 @@ OPENAI_API_KEY=sk-project-key
 | `skill`         | Load a specialized skill by name (available with `--skills`, or after you invoke a skill)                       |
 | `square_number` | Demo/example tool (used for testing)                                                                            |
 | `tui_viewer`    | TUI testing tools: launch, screenshot, type, press, wait, quit (devel group - wont load unless you use --devel) |
-| `self_update`   | Check for updates, apply upgrade, or copy install command to clipboard                                          |
+| `read_map`      | Read an iThoughts mind map (.itmz): root + children, drill in, or search                                        |
+| `edit_map`      | Edit a map - a batch of ops in one atomic write                                                                 |
+| `create_map`    | Create a new map, optionally with an outline, from a style template                                             |
+
+### Mind Maps
+
+The three map tools are default-visible and inert without an explicit path; hide
+them with `disabled_tools = ["*map*"]`. Two `[tools]` keys tune them:
+
+```toml
+[tools]
+mindmap_quiet_seconds = 20      # refuse a write to a map saved this recently
+mindmap_style_template = ""     # .itmz whose style.xml new maps copy
+```
+
+`mindmap_quiet_seconds` guards against the iThoughts app autosaving 10-20 s
+after an edit: a write inside that window can discard the user's unsaved
+typing. `0` disables the guard. `mindmap_style_template` is used only by
+`create_map`; empty means the bundled outline style.
+
+Every tool that touches a map appends a short `check:` trailer when it finds
+something wrong - a topic with no position, a malformed uuid, a stale manifest -
+and appends nothing when the map is clean. Nothing is ever refused: a map with a
+pre-existing defect stays editable. The checks cover what our own writer can
+break, not what a map from another tool can; for that, run `utils/itmz-check.py`
+in the ithoughtsx repo.
 
 ### Tool Groups and Devel Mode
 
@@ -761,7 +792,7 @@ Agent13 ships with these skills (copied to `~/.agent13/skills/` on first run):
 
 ### Managing Skills
 
-- **List skills**: `/skills` in TUI
+- **List skills**: `/skills` (TUI and REPL); `/skills on|off` toggles the descriptions in the system prompt, `/skills status` shows both switches
 
 - **Invoke skill**: `/skill-name` (also enables the `skill` tool for the session) or, with `--skills`, ask the AI to use the `skill` tool
 
@@ -778,12 +809,20 @@ Agent13 ships with these skills (copied to `~/.agent13/skills/` on first run):
 Agent13 uses a message queue to manage multiple prompts:
 
 - **Normal priority** - Messages processed in order
-- **Priority** (`!` suffix) - Inserts command at the top of the queue until agent finishes the current turn
-- **Interrupt** (`!!` suffix) - Leaves agent running but inserts the command immediately into the existing turn. (useful to steer agent with extra knowledge while it is running - no need to stop it and restart the turn)
+- **Priority** (`!` prefix) - Inserts command at the top of the queue until agent finishes the current turn
+- **Steer** (`!!` prefix) - Leaves agent running but inserts the command immediately into the existing turn. (useful to steer agent with extra knowledge while it is running - no need to stop it and restart the turn)
 
 ```text
-Fix the bug in main.py!       # Priority - goes ahead of normal items
-URGENT: Stop and answer this!!  # Interrupt - pauses current work
+!Fix the bug in main.py         # Priority - goes ahead of normal items
+!!URGENT: Stop and answer this  # Steer - injected into the running turn
+```
+
+Typing `!` or `!!` **on its own** promotes the most recently queued message to
+that level instead of sending an empty one - useful when you queued something
+and then decide it should go next, or should steer the running turn:
+
+```text
+> !!                            # [steer] "Fix the bug in main.py"
 ```
 
 Queue commands:
@@ -858,6 +897,19 @@ Manual save/load: (this saves in current working directory. ie: ./agent13/saves)
 
 Saves are stored in `.agent13/saves/` in your current working directory (override with `AGENT13_SAVES_DIR` environment variable). Use `/status` to check session state, turn stats, and whether a restorable auto-save is available.
 
+### Save on Idle
+
+The daily auto-save is written when you exit. It is also written once after a stretch of idleness, so a session that is left open (or a machine that dies) never loses more than the last idle period:
+
+```toml
+[auto_save]
+idle_seconds = 300   # write the auto-save once after 5 minutes idle (0 = off)
+```
+
+It writes the same daily auto-save file, so `--continue` picks up the freshest state. It fires **once per idle period** and only when the history changed since the last idle save - a long quiet stretch never rewrites an unchanged file, and a period that only ran commands (e.g. `/status`) is skipped. The idle clock restarts on any new turn, and a paused agent does not count as idle.
+
+Override per run with `--auto-save-idle N` (0 = off). The current value appears in `/status` under Settings (`idle-save`).
+
 ## Journal Mode
 
 Journal mode enables context compaction - after each turn, a journal summary replaces the tool calls, with intention / result for each tool (this is far more effective that trying to use 'entire session' compaction.
@@ -877,6 +929,71 @@ Journal commands:
 - `/journal last` - Convert the last turn into a journal summary
 - `/journal all` - Iterate over all turns, journalling each
 - `/journal status` - Show current status
+
+## Working with a Focus
+
+A focus is a named bucket of memory for a project. Give the work a name and agent13 maintains two files for it in the project's `records/` directory:
+
+- `<name>_current_truth.md` - what is known, organised by topic: decisions, file locations, gotchas, open tickets
+- `<name>_journal.md` - what happened, and when, one entry per wrap-up
+
+### Why bother
+
+A conversation is disposable. When context fills up, something has to go, and in most agents what goes is everything the agent learned. A focus moves what matters out of the conversation and onto disk, so restarting is cheap: you get a new session with the same expertise/memory. This method seems superior to trying to get the agent to 'lookup' memories in an mcp server.
+
+### The loop
+
+1. `/focus my-project` names the work (`--focus my-project` does the same at startup)
+2. Work as usual. When the context nears the model's limit, the wrap-up fires: the agent updates the truth file, writes a journal entry, then compacts or restarts with the records fresh in context
+3. `/wrapup` does the same on demand, without waiting for the threshold
+4. Next session, `/focus my-project` again - the agent reads the records back before anything else
+
+The truth file is edited in place, never regenerated: facts are corrected as they change, and the journal keeps the history.
+
+### What the agent reads at startup
+
+On `/focus` with an empty session, the agent is handed a topic index of the truth file plus the last journal entry, and reads what it needs from there. A record pointer in the context tells it where the full files live, so any topic can be pulled on demand.
+
+### Open tickets
+
+The truth file ends with an **Open tickets** section: one line per ticket, stamped FIRST SEEN with a date. Tickets carry their state in the line (BLOCKED, NEEDS USER, PARKED), and the agent re-ranks them as it works - a line starting `h.` records a re-rank it made on its own judgement. This section is what factory mode works from.
+
+### FOR THE USER
+
+Under the tickets, `FOR THE USER (unresolved)` lists what the agent needs from you: a decision, a credential, an answer. Items survive restarts until you deal with them - the agent will not silently drop a question you have not answered.
+
+## Factory Mode (/grind)
+
+Factory mode is the focus loop without you in it. `/grind 4h` arms a goal window: for the next four hours, when the agent finishes a turn and would idle, it picks its own next step and keeps working.
+
+```text
+/grind 4h Work through the Open tickets in the record
+/grind 90m Refactor the parser, run the tests after each step
+```
+
+The text after the duration is the goal, and it is sticky: `/grind off` stops the window but keeps the text, so a bare `/grind 2h` re-arms the same goal later. `/grind clear` forgets the text as well. `/grind` with no args shows the current window. Factory mode works best with a focus (the ticket list lives in the record), but the goal text alone is enough.
+
+### What it asks you
+
+Almost nothing. At each turn end the agent checks its own progress and either continues or stops. It stops and asks only when:
+
+- every ticket it can see is blocked, needs a user decision, or is parked
+- the record carries unresolved FOR THE USER items it cannot clear
+- there is nothing left that makes progress
+
+The question arrives as a normal turn; answer in plain text and it keeps going. Everything else - which file to edit, which test to run, which ticket to pick - it decides itself.
+
+### While it runs
+
+- The status bar shows the remaining window time. The model never sees the clock: a visible budget invites "I'm running low, let me hand back", which defeats the point
+- The auto-context chain budget is ignored while the window is armed
+- `/pause` and `/resume` work as usual
+- `--bell N` rings when the agent stops for you, so you can hear it from another room (or so that your tmux config can change the tab to 'red')
+- `--polite N` coordinates several agents sharing one provider
+
+### When the window ends
+
+The agent hands back with a summary. The record is current as of the last wrap-up; run `/wrapup` if you want to capture the final state before closing the session.
 
 ## Auto-Context
 
@@ -982,7 +1099,7 @@ square: square all the numbers from 1.06 to 3.06, step 1.0 for me (do one at a t
   rather than all in parallel)
 ```
 
-Use `/snippet` in the TUI to see available snippets and insert one. `/snippet list` re-reads the snippets file first, so external edits are picked up without restarting. Snippets can use `{placeholder}` syntax - you'll be prompted to fill in values before insertion.
+Use `/snippet` to see available snippets. In the TUI `/snippet use <name>` fills the input; in the REPL it prints the text. `/snippet list` re-reads the snippets file first, so external edits are picked up without restarting. Snippets can use `{placeholder}` syntax - you'll be prompted to fill in values before insertion.
 
 ## Reasoning Token Control
 
@@ -1007,7 +1124,7 @@ agent13 local --system-prompt my-prompt
 
 The prompt name references a file in `~/.agent13/prompts/` (without the `.md` extension). You can also add custom content that gets appended to the default prompt using the `custom_additions` mechanism in the prompt file.
 
-Use `/prompt` in the TUI to see the current system prompt.
+Use `/prompt` to list the prompts and `/prompt <name>` to switch (TUI and REPL).
 
 ## History Management
 
@@ -1047,8 +1164,7 @@ Agent13 checks GitHub releases for new versions on interactive startup (once per
 
 >> Update available: v0.1.9 (you have 0.1.8)
 
-  From TUI use:  /upgrade
-  Or run:        agent13 --upgrade
+  Run:           agent13 --upgrade
   ...
   Apply update now? [y/N]
 ```
@@ -1057,12 +1173,11 @@ If the changelog can't be fetched, the offer appears without the notes. Disable 
 
 ### Applying Updates
 
-| Method              | How                                                                                   |
-| ------------------- | ------------------------------------------------------------------------------------- |
-| `/upgrade`          | In the TUI - checks, downloads wheel from GitHub, installs, then tells you to restart |
-| `/upgrade --copy`   | Copies the manual install command to clipboard instead of running it                  |
-| `agent13 --upgrade` | Non-interactive - check and apply from the command line, then exit                    |
-| Manual              | Run the `uv tool install --force <url>` command from the notification                 |
+| Method              | How                                                                                  |
+| ------------------- | ------------------------------------------------------------------------------------ |
+| `agent13 --upgrade` | Non-interactive - check and apply from the command line, then exit                   |
+| `/upgrade`          | REPL only - checks, downloads wheel from GitHub, installs, then tells you to restart |
+| Manual              | Run the `uv tool install --force <url>` command from the notification                |
 
 ### Update Configuration
 
@@ -1102,7 +1217,7 @@ Not all models support tool/function calling. Try a model known for good tool su
 
 ### Clipboard Not Working
 
-If mouse select, Ctrl+Y, or `/upgrade --copy` doesn't copy to your clipboard:
+If mouse select or Ctrl+Y doesn't copy to your clipboard:
 
 1. Type `/clipboard system` in the TUI to switch to OS clipboard commands
 2. This persists to your config - you only need to do it once

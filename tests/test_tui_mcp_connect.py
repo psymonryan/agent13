@@ -57,6 +57,10 @@ def _make_app(mcp):
 
     agent = MagicMock()
     agent.durable_records = DurableRecords()
+    # The status bar reads model/provider from the agent (single source
+    # of truth), so the stub must carry real strings, not MagicMocks.
+    agent.model = "test-model"
+    agent.provider_name = "test"
     agent.mcp = mcp
     agent._mcp = mcp
     agent._mcp_server_configs = [object()]
@@ -89,14 +93,23 @@ def isolated_config(tmp_path, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_mcp_connect_updates_status_bar(isolated_config):
-    """/mcp connect refreshes the status bar when the connect finishes."""
+    """/mcp connect refreshes the status bar when the connect finishes.
+
+    Drives the real path: the shared handler returns data["mcp_action"], the
+    TUI's follow-up starts the async action, and that action refreshes the
+    status bar once the connect finishes.
+    """
     import asyncio
+
+    from agent13.commands import run_command
 
     app = _make_app(FakeMCP(connecting=True))
     app.update_status = MagicMock()
 
     async with app.run_test():
-        app._handle_mcp_command("connect")
+        result = run_command("mcp", app.agent, "connect")
+        assert result.data["mcp_action"] == "connect"
+        app._run_command_follow_up(result, "connect")
         # do_connect runs as a background task — poll for the refresh
         for _ in range(100):
             if app.update_status.called:

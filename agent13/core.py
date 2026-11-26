@@ -2,6 +2,7 @@
 
 import asyncio
 import datetime
+import hashlib
 import json
 import re
 import time
@@ -12,15 +13,29 @@ from typing import Callable, Awaitable, Optional, TYPE_CHECKING
 from openai import AsyncOpenAI
 
 from agent13.context_gauge import ContextGauge
-from agent13.durable_records import DurableRecords
+from agent13.durable_records import DurableRecords, heading_age_seconds
 from agent13.events import AgentEvent, AgentEventData, EventHandler
 from agent13.journal import JournalManager
-from agent13.polite import PoliteLock, PolitePauseRequested, _sanitize_provider
+from agent13.polite import (
+    PoliteCancelled,
+    PoliteLock,
+    PolitePauseRequested,
+    _sanitize_provider,
+)
 from agent13.message_history import MessageHistory, is_turn_start
+from agent13 import goal as goal_rules
+from agent13.truth_format import (
+    count_facts,
+    encoding_of,
+    h_block_reports_rerank,
+    h_block_text,
+    rank_moves,
+    ticket_order,
+)
 from agent13.prompts import (
-    DEFAULT_PROMPT,
     AUTO_CONTEXT_CONTINUE_HINT,
-    AUTO_CONTEXT_CARRY_HINT,
+    AUTO_CONTEXT_RECORD_FRESH_HINT,
+    DEFAULT_PROMPT,
     DEFAULT_REPORT_AND_COMPACT_PROMPT,
     DEFAULT_REPORT_AND_COMPACT_SUMMARY_PROMPT,
     DEGENERATE_NUDGE_PROMPT,
@@ -46,10 +61,12 @@ from agent13.debug_log import (
     log_compact_start,
     log_degenerate_nudge,
     log_degenerate_stop,
+    log_idle_save,
     # TPS debug logging
     is_debug_enabled,
     log_tps_event,
 )
+from agent13.timing import TaskClock
 from agent13.vision import (
     NATIVE_MAX_DIMENSION,
     SIDECAR_MAX_DIMENSION,
@@ -344,6 +361,8 @@ class Agent:
         auto_context_action: str = "report_and_compact",
         auto_context_chain: int = 3,
         auto_context_nudge_cap: int = 2,
+        auto_save_idle_seconds: int = 300,
+        datetime_nudge_seconds: int = 3600,
         report_and_compact_prompt: str = "",
     ):
         """Initialize the agent.
@@ -369,12 +388,55 @@ class Agent:
             auto_context_chain: How many times the turn may restart after a
                 compact within one user turn (0 = none; ignored when action is
                 "none").
+            auto_save_idle_seconds: Write the daily auto-save once after this
+                many seconds with nothing to do (0 = off). The same file the
+                exit path writes, so --continue picks up the freshest state.
+            datetime_nudge_seconds: Refresh the model's clock this often while
+                a turn is running, and at turn start when the session sat idle
+                this long (0 = off). The system prompt's start stamp is frozen
+                for the session, so this is how "now" reaches the model.
             report_and_compact_prompt: Prompt text injected for the wrap-up
                 turn. Resolved from prompts.yaml ("report_and_compact") by the
                 caller; empty = use DEFAULT_REPORT_AND_COMPACT_PROMPT.
         """
         self.client = client
         self.model = model
+        # Config name of the provider the client points at ("" for a raw URL).
+        # Set by the front-end at startup and by /provider on a switch, so the
+        # status bar shows the name the user chose rather than guessing it from
+        # the base_url (two config entries can share one URL).
+        self.provider_name = ""
+        # Managers the shared command handlers need (/prompt, /skills,
+        # /snippet, /compact, /status). cli.py constructs them once so every
+        # mode shares one instance; the front-end attaches them here right
+        # after construction. The Agent itself never reads them - they are
+        # session state, not agent behaviour.
+        self.prompt_manager = None
+        self.skill_manager = None
+        self.snippet_manager = None
+        # Session state /status reports. The front-end owns the *behaviour*
+        # (the tracker is fed by its stream handlers, the display flags drive
+        # its widgets) but the agent owns the values, so one shared handler
+        # can read them.
+        self.tracker = None
+        self.session_start_time = 0.0
+        self.spinner_speed = "fast"
+        self.clipboard_method = "osc52"
+        self.reasoning_collapsed = True
+        self.toolview_collapsed = True
+        self.last_turn_duration = None
+        self.last_turn_end_time = None
+        # Time on the current task (status bar's "dur:"). Survives the
+        # wrap-up + chain restarts, excludes paused time. Front-ends read it;
+        # the agent drives it (see _process_item / _wait_if_paused /
+        # _set_status).
+        self.task_clock = TaskClock()
+        # Resumed-session stats, captured by /load so /status can show what
+        # this session added on top of the save it started from.
+        self.resumed_turn_count = 0
+        self.resumed_saved_at = None
+        self.resumed_prompt_tokens = 0
+        self.resumed_completion_tokens = 0
         self.queue = queue or AgentQueue()
         self.system_prompt = system_prompt or DEFAULT_PROMPT
         self.history = MessageHistory(messages)
@@ -385,6 +447,11 @@ class Agent:
         self.remove_reasoning = remove_reasoning
         self._devel_mode = devel_mode
         self._skills_mode = skills_mode
+        # Whether the skills *list* (descriptions) is in the system prompt.
+        # Toggled by /skills on|off; the skill *tool* has its own one-way
+        # switch (skills_mode) and never turns off. Front-ends set this at
+        # startup from --skills / config.include_skills.
+        self.skills_list_enabled = skills_mode
         # Skills manually loaded this session (name -> loaded content, in
         # load order). Tracked by note_skill_loaded (TUI /skillname); the
         # content is re-injected by _mechanical_restart on chain restarts
@@ -408,6 +475,19 @@ class Agent:
             0  # Per-session monotonic (snapshot filenames)
         )
         self._degenerate_partial = None  # Held only while _save_degenerate_snapshot runs
+        # Idle auto-save ([auto_save] idle_seconds / --auto-save-idle):
+        # after this many seconds with nothing to do, write the daily
+        # auto-save ONCE per idle period (0 = off). _idle_since is a
+        # monotonic timestamp set on the first run-loop pass that finds
+        # nothing to do and cleared by any activity; _idle_saved marks the
+        # save as done for this period so it never repeats. The signature
+        # of the last idle save lets a period that changed nothing (e.g.
+        # only /status commands ran) skip the write entirely.
+        self.auto_save_idle_seconds = auto_save_idle_seconds
+        self.datetime_nudge_seconds = datetime_nudge_seconds
+        self._idle_since: float | None = None
+        self._idle_saved = False
+        self._last_idle_save_signature: str | None = None
         # Session-lifetime compaction total (persisted in the .ctx save).
         # Incremented on every FULL history replacement (compact_history,
         # _mechanical_restart); journal-reflection compaction is excluded
@@ -417,9 +497,30 @@ class Agent:
         # Original session start (ISO). Persisted in the .ctx save - survives
         # save/load so /status shows the session's true age across resumes.
         self._session_started_at = datetime.datetime.now().isoformat()
-        self._in_flight_user_request = (
-            ""  # Turn-start user instruction, carried across chain restarts
-        )
+        # ── Goal window (/grind) ──────────────────────────────────────────
+        # A deadline that survives turn ends: when the agent would go idle
+        # inside the window it asks itself whether it can make progress
+        # without the user, and if so starts another turn. The model never
+        # sees the remaining time - a visible budget invites "I'm running
+        # low, let me consolidate and hand back", which is the failure this
+        # exists to prevent (2026-11-02 01:53: 6h 34m of window left).
+        self._goal_text = ""  # Sticky: only /grind off clears it
+        self._goal_deadline = 0.0  # epoch; 0.0 = no window
+        self._goal_set_at = 0.0  # epoch; the window length is deadline - this
+        # A question turn is in flight / its answer is unparsed. Persisted so
+        # a restart cannot resurrect a cancelled question (load clears both).
+        self._goal_question_pending = False
+        self._goal_answer_pending = False
+        # The question turn's token cost, accumulated while a question is in
+        # flight so tps_goal_idle can report what the loop costs: prompt is the
+        # MAX seen (the context size of the round-trip) and completion is the
+        # SUM (everything generated, including a restart's continuation).
+        self._goal_question_tokens = {"prompt": 0, "completion": 0}
+        # The last continuation message the harness injected (the rendered
+        # GOAL_ITEM line). Only the misattribution detector reads it: a
+        # wrap-up that cites one of these as user direction is writing a false
+        # provenance record, and this is the instrument that says so.
+        self._goal_last_item = ""
         self._auto_context_snapshot_count = (
             0  # Per-session monotonic (snapshot filenames)
         )
@@ -438,6 +539,14 @@ class Agent:
         # (agent13.durable_records). The _focus_name / _session_*_path
         # attributes below are forwarding properties onto it.
         self.durable_records = DurableRecords()
+        # Inject a topic index of the truth file instead of the whole file
+        # ([auto_context] truth_index, default false). Read once at
+        # construction: it decides what the seed message carries.
+        from agent13.config import get_config
+
+        self.durable_records.truth_index = bool(
+            getattr(get_config(), "auto_context_truth_index", False)
+        )
         # Context gauge: single store for the grounded prompt-token value
         # and the stream cursor (agent13.context_gauge). prompt_tokens and
         # _msg_count_before_stream are forwarding properties onto it.
@@ -447,6 +556,13 @@ class Agent:
         # Used in the system prompt to prevent midnight date changes
         # from invalidating the KV cache prefix.
         self.session_date = datetime.date.today().isoformat()
+        # Wall-clock time the model was last told. Refreshed by every datetime
+        # nudge AND by the wrap-up prompt's own "Current date and time" line:
+        # telling the model the time by ANY route resets the clock, so the two
+        # routes cannot both fire minutes apart. Seeded from the session start
+        # (_session_started_at, set above), which is also what the system
+        # prompt's "Session started" line shows.
+        self._last_datetime_nudge_at = self._session_started_at
         # Available models list (populated by caller or set_client)
         self.available_models: list[str] = []
         self.response_format = response_format
@@ -495,6 +611,11 @@ class Agent:
 
         # Polite mode (multi-agent lock coordination); None = disabled.
         self.polite_lock: Optional[PoliteLock] = None
+        # Bumped by every set_polite/disable_polite. A lock captures its
+        # generation and cancels its wait when the counter moves on - that is
+        # how an in-flight acquire() learns that /polite off (or a re-key)
+        # landed while it was polling.
+        self._polite_generation = 0
 
         # Journal manager for context compaction
         self.journal = JournalManager(
@@ -629,12 +750,25 @@ class Agent:
             tools,
             tool_choice=tool_choice,
             session_date=self.session_date,
+            session_started_at=self.session_started_at,
         ):
             if event_type == "token_usage":
                 # Store as source of truth for context size
                 self.prompt_tokens = data.get("prompt_tokens", 0)
                 self.completion_tokens = data.get("completion_tokens", 0)
                 self.total_tokens = data.get("total_tokens", 0)
+                # Attribute the question turn's cost to the goal window: the
+                # flag is exactly "a question turn is in flight". Prompt is the
+                # MAX (the round-trip's context size, so a restart's second
+                # call does not double-count it) and completion is the SUM.
+                if self._goal_question_pending:
+                    self._goal_question_tokens["prompt"] = max(
+                        self._goal_question_tokens["prompt"],
+                        data.get("prompt_tokens", 0),
+                    )
+                    self._goal_question_tokens["completion"] += data.get(
+                        "completion_tokens", 0
+                    )
                 await self.emit(AgentEvent.TOKEN_USAGE, data)
                 if is_debug_enabled():
                     log_tps_event(
@@ -669,8 +803,14 @@ class Agent:
             data: Optional metadata dict (e.g. {"compact_prompt": "..."})
 
         Returns:
-            The queue item ID
+            The queue item ID, or 0 when an empty prompt was refused.
         """
+        if kind == "prompt" and not text.strip():
+            # An empty prompt has no meaning, and once injected mid-turn it
+            # becomes a blank user turn in the conversation. Refuse it here
+            # so no caller can reintroduce that (a bare "!!" used to).
+            return 0
+
         item_id = self.queue.add(
             text, priority=priority, interrupt=interrupt, kind=kind, data=data
         )
@@ -778,7 +918,7 @@ class Agent:
                     # This makes ESC work and is_queued check pass during the polite wait.
                     await self._set_status(AgentStatus.WAITING)
                     try:
-                        await self._acquire_polite()
+                        held = await self._acquire_polite()
                     except asyncio.CancelledError:
                         # ESC or task cancellation during polite wait.
                         # The item is still in the pending queue (not yet
@@ -786,15 +926,19 @@ class Agent:
                         # just break so the loop restarts fresh.
                         await self._set_status(AgentStatus.IDLE)
                         break
-                    _polite_acquired = True
+                    # None = /polite off ended the wait. The item runs now,
+                    # unlocked: the user turned politeness off, not the work.
+                    _polite_acquired = held is not None
 
                     # The item may have been removed from the queue (via
                     # /delete q N) while we were waiting for the lock.
                     # If so, release the lock and loop back — nothing to
-                    # process.
+                    # process. Release the object we HOLD, not
+                    # self.polite_lock: /polite off may have nulled that
+                    # between winning the lock and here.
                     if next_item not in self.queue.items:
-                        if self.polite_lock is not None:
-                            self.polite_lock.release()
+                        if held is not None:
+                            held.release()
                         _polite_acquired = False
                         await self._set_status(AgentStatus.IDLE)
                         continue
@@ -814,7 +958,9 @@ class Agent:
                         self._cancel_requested = False
                         break
                 else:
-                    # Nothing to do, wait briefly
+                    # Nothing to do: let the idle auto-save become due,
+                    # then wait briefly.
+                    await self._maybe_idle_save()
                     await asyncio.sleep(0.05)
         except asyncio.CancelledError:
             # CancelledError hit between items (not inside _process_item).
@@ -921,6 +1067,19 @@ class Agent:
         )
 
     @property
+    def has_pending_work(self) -> bool:
+        """True when a turn is running OR a message is queued but not started.
+
+        ``is_idle`` alone is not enough for a UI deciding whether /pause has
+        anything to pause. ``add_message`` only queues, and ``_status`` stays
+        IDLE until the run loop picks the message up - so in that window the
+        user has already sent a message while ``is_idle`` still reads True.
+        The REPL refused /pause there ("Nothing to pause") and the TUI took
+        its idle branch and stopped the agent loop outright.
+        """
+        return not self.is_idle or self.queue.pending_count > 0
+
+    @property
     def has_incomplete_turn(self) -> bool:
         """Check if the agent has an incomplete turn from a loaded context."""
         return self._incomplete_turn_loaded
@@ -976,6 +1135,9 @@ class Agent:
         # before the first LLM token arrives (mirrors _process_item).
         # Without this, /resume on a loaded incomplete turn leaves the
         # status at IDLE for the entire LLM latency window.
+        # This is a new task (the user asked to continue a loaded turn), so
+        # start the task clock - a no-op if one is somehow already running.
+        self.task_clock.start()
         await self._set_status(AgentStatus.WAITING)
 
         # Polite mode: acquire the shared lock before any work, mirroring
@@ -987,8 +1149,11 @@ class Agent:
         _polite_acquired = False
         if self.polite_lock is not None:
             try:
-                await self._acquire_polite(resume_status=AgentStatus.WAITING)
-                _polite_acquired = True
+                # None = /polite off ended the wait; continue the turn
+                # unlocked rather than blocking on a lock nobody wants.
+                _polite_acquired = (
+                    await self._acquire_polite(resume_status=AgentStatus.WAITING)
+                ) is not None
             except asyncio.CancelledError:
                 # ESC or task cancellation during the polite wait.
                 # acquire() already released any hold; just restore IDLE
@@ -1005,11 +1170,11 @@ class Agent:
             if self.history.messages and self.history.messages[-1].get("interrupt"):
                 self.history.messages.pop()
 
-            # Resume path: the restored history's last genuine user message
-            # is this turn's standing instruction (the else-branch capture
-            # is not on this path). Captured BEFORE _check_threshold_pre_turn
-            # below, which may restart (and clear) the history.
-            self._capture_in_flight_user_request()
+            # The resume path used to capture a standing instruction here and
+            # anchor it on the snapshot's saved_at, so a chain restart could
+            # re-inject the user's message verbatim. The restart message no
+            # longer quotes it (agent13/goal.py owns the continuation text), so
+            # there is nothing to capture and nothing to anchor.
 
             # Check the state of messages
             pending_tools = self.history.get_pending_tool_calls()
@@ -1083,7 +1248,9 @@ class Agent:
                 # over-threshold (a previous turn can end over-threshold
                 # without a mid-turn hit). Compact before the resumed turn's
                 # first LLM call so it starts on a compacted context.
-                await self._check_threshold_pre_turn(_polite_acquired=_polite_acquired)
+                await self._check_threshold_pre_turn(
+                    _polite_acquired=_polite_acquired, resuming=True
+                )
 
                 # Now call LLM to continue
                 await self._llm_turn(_polite_acquired=_polite_acquired)
@@ -1092,7 +1259,7 @@ class Agent:
                 # never runs for a resumed turn. Without this, the turn's
                 # tool work stays un-compacted and the NEXT turn's
                 # retrospective_compact fires the reflection before the
-                # user's new message is processed (10-06 edmac incident:
+                # user's new message is processed (observed 2026-10-06:
                 # 163k-token prefill, 10-min delay on a simple question).
                 # Internal guards make it a no-op when not applicable.
                 await self.journal.maybe_reflect_after_turn()
@@ -1101,7 +1268,9 @@ class Agent:
             elif self.history.has_incomplete_turn():
                 # Case 2: Last message is tool result, call LLM to process.
                 # Turn-start threshold check first (see case 1 above).
-                await self._check_threshold_pre_turn(_polite_acquired=_polite_acquired)
+                await self._check_threshold_pre_turn(
+                    _polite_acquired=_polite_acquired, resuming=True
+                )
                 await self._llm_turn(_polite_acquired=_polite_acquired)
                 # Post-turn journal reflection — see case 1 above.
                 await self.journal.maybe_reflect_after_turn()
@@ -1152,6 +1321,9 @@ class Agent:
         if self._pause_state == PauseState.PAUSING:
             # Transition to fully paused
             self._pause_state = PauseState.PAUSED
+            # Freeze the task clock: a pause is not time on task. No-op when
+            # no task is running (paused while idle).
+            self.task_clock.pause()
             await self._set_status(AgentStatus.PAUSED)
             await self.emit(AgentEvent.PAUSED, {})
 
@@ -1163,18 +1335,24 @@ class Agent:
                 if resume_status is not None:
                     # Mid-turn resume: the caller continues the turn, so the
                     # queue is irrelevant — report what it is about to do.
+                    self.task_clock.resume()
                     await self._set_status(resume_status)
                 elif self.queue.pending_count > 0:
                     # Skip IDLE if there are queued items — go straight to
                     # WAITING so the user never sees "ready" between resume
                     # and processing the next item.
+                    self.task_clock.resume()
                     await self._set_status(AgentStatus.WAITING)
                 else:
+                    # Nothing to continue: the task is over. Do NOT resume the
+                    # clock - _set_status(IDLE) freezes it at its banked total.
                     await self._set_status(AgentStatus.IDLE)
                 await self.emit(AgentEvent.RESUMED, {})
 
-    async def _acquire_polite(self, resume_status: AgentStatus | None = None) -> None:
-        """Acquire the polite lock, honouring a pause request while waiting.
+    async def _acquire_polite(
+        self, resume_status: AgentStatus | None = None
+    ) -> Optional[PoliteLock]:
+        """Acquire the polite lock; return the lock held, or None.
 
         /pause during a lock wait must PAUSE, not interrupt: acquire() raises
         PolitePauseRequested when the pause flag is set, so we go PAUSED and
@@ -1184,15 +1362,41 @@ class Agent:
         completion. Loop (not one-shot) because the user can pause again
         while we wait for the lock after resuming.
 
+        /polite off during a lock wait must END it: acquire() raises
+        PoliteCancelled, and we re-read ``self.polite_lock``. Gone -> return
+        None and the caller runs UNLOCKED (the user turned politeness off, not
+        the work). Replaced -> acquire the new one, so a model re-key mid-wait
+        still coordinates on the right lock.
+
+        Returns the lock actually held, not a bool: between winning it and the
+        caller using it, /polite off can null ``self.polite_lock``, and the
+        caller needs the object to release it.
+
         Pass resume_status=WAITING from mid-turn call sites (the turn
         continues immediately after the wait); omit it at the top of the run
         loop, where the queue decides the next state.
         """
         while True:
+            lock = self.polite_lock
+            if lock is None:
+                return None
             try:
-                await self.polite_lock.acquire()
-                return
+                await lock.acquire()
+                return lock
+            except PoliteCancelled:
+                # Re-read: None means disabled, a different object means the
+                # lock was re-keyed. Either way this wait is over.
+                if self.polite_lock is None:
+                    # Tell the UIs the wait is over: the "wait: Ns" overlay is
+                    # cleared by an event, and POLITE_ACQUIRED never fires on
+                    # this path - without this it stayed up for the whole turn.
+                    await self.emit(
+                        AgentEvent.POLITE_WAIT_ENDED, {"reason": "cancelled"}
+                    )
+                    return None
+                continue
             except PolitePauseRequested:
+                await self.emit(AgentEvent.POLITE_WAIT_ENDED, {"reason": "paused"})
                 await self._wait_if_paused(resume_status=resume_status)
 
     def _estimate_current_context_tokens(self) -> int:
@@ -1292,6 +1496,146 @@ class Agent:
                     self.messages.remove(partial)
                 except ValueError:
                     pass
+
+    def _mark_activity(self) -> None:
+        """Restart the idle clock (called when a queue item starts).
+
+        Any work resets the idle period: the next idle save becomes due
+        only after another full ``auto_save_idle_seconds`` of quiet.
+        """
+        self._idle_since = None
+        self._idle_saved = False
+
+    def _last_nudge_datetime(self) -> datetime.datetime | None:
+        """The stored last-nudge stamp, or None when it cannot be parsed."""
+        try:
+            return datetime.datetime.fromisoformat(self._last_datetime_nudge_at)
+        except (TypeError, ValueError):
+            return None
+
+    def _datetime_nudge_due(self) -> bool:
+        """True when the model's clock is stale enough to refresh.
+
+        Two triggers, one predicate: the day rolled over, or
+        ``datetime_nudge_seconds`` elapsed since the model was last told the
+        time. A day change ignores the threshold and resets the clock, so the
+        two can never fire back to back.
+
+        Measured from the LAST nudge, not from the turn start: the point is a
+        fresh clock, so a three-hour turn with a one-hour interval refreshes
+        three times rather than going two hours stale.
+
+        Wall clock, not monotonic: a laptop that slept for eight hours should
+        read as eight hours having passed. A backwards jump (NTP) yields a
+        negative interval, which reads as "not due" rather than as an
+        immediate nudge.
+        """
+        if self.datetime_nudge_seconds <= 0:
+            return False
+        last = self._last_nudge_datetime()
+        if last is None:
+            return False
+        now = datetime.datetime.now()
+        if now.date() != last.date():
+            return True
+        return (now - last).total_seconds() >= self.datetime_nudge_seconds
+
+    def _inject_datetime_nudge(self) -> None:
+        """Append the current datetime as an injected assistant+user pair.
+
+        The fake assistant message comes FIRST. The conversation must not end
+        on an assistant turn: providers read that as a prefill to continue, and
+        some reject it outright. This is the same ordering the ``!!`` steer uses
+        at the tool boundary, for the same reason.
+
+        Flagged ``injected``, NOT ``interrupt``. A clock refresh is not an
+        interruption: it must not emit INTERRUPT_INJECTED, flip the status bar
+        to ``stopped``, or write the history marker the turn-boundary logic
+        reads. ``injected`` also keeps the pair out of the TUI transcript - the
+        user is told nothing, because the agent simply knows the time.
+        """
+        now = datetime.datetime.now()
+        stamp = now.strftime("%Y-%m-%d %H:%M")
+        self.messages.append(
+            {"role": "assistant", "content": "[Datetime updated]", "injected": True}
+        )
+        self.messages.append(
+            {
+                "role": "user",
+                "content": f"The current datetime is: {stamp}",
+                "injected": True,
+            }
+        )
+        self._last_datetime_nudge_at = now.isoformat(timespec="seconds")
+        if is_debug_enabled():
+            log_tps_event("datetime_nudge", {"at": stamp})
+
+    def _history_signature(self) -> str:
+        """Content fingerprint of the message history (idle-save change check).
+
+        Computed only when a save is actually due (once per idle period),
+        so hashing a large history never lands on the hot path.
+        """
+        digest = hashlib.sha256()
+        for message in self.messages:
+            digest.update(json.dumps(message, sort_keys=True, default=str).encode())
+        return digest.hexdigest()
+
+    async def _maybe_idle_save(self) -> None:
+        """Write the daily auto-save after a long idle stretch (once per period).
+
+        Called by the run loop on every pass that finds nothing to do, so
+        the idle clock starts on the first such pass and the save happens
+        once ``auto_save_idle_seconds`` elapse. Skipped when disabled, when
+        there is nothing to save, or when the history is identical to the
+        last idle save (nothing happened since). Best-effort: a failed
+        write is logged and never disturbs the loop.
+        """
+        if self.auto_save_idle_seconds <= 0 or self._idle_saved:
+            return
+        if not self.messages or not self.is_idle:
+            return
+        now = time.monotonic()
+        if self._idle_since is None:
+            self._idle_since = now
+            return
+        if now - self._idle_since < self.auto_save_idle_seconds:
+            return
+
+        # Due. Mark first: a failed write must not retry on every loop pass.
+        self._idle_saved = True
+        signature = self._history_signature()
+        if signature == self._last_idle_save_signature:
+            return  # Nothing changed since the last idle save.
+
+        from agent13.persistence import get_auto_save_path, save_context
+
+        path = get_auto_save_path(session_date=self.session_date)
+        try:
+            save_context(self, path)
+        except Exception as e:
+            if is_debug_enabled():
+                log_idle_save({"error": str(e), "path": str(path)})
+            return
+
+        self._last_idle_save_signature = signature
+        if is_debug_enabled():
+            log_idle_save(
+                {
+                    "path": str(path),
+                    "messages": len(self.messages),
+                    "idle_seconds": self.auto_save_idle_seconds,
+                }
+            )
+        # NOTIFICATION (a toast in the TUI, a line in the REPL) - never a
+        # chat message: an idle save must not pollute the transcript.
+        await self.emit(
+            AgentEvent.NOTIFICATION,
+            {
+                "message": f"Session auto-saved ({len(self.messages)} messages)",
+                "level": "info",
+            },
+        )
 
     def _classify_degenerate_end(
         self, content: str, reasoning: str, finish_reason: str | None
@@ -1453,7 +1797,9 @@ class Agent:
         )
         return False
 
-    async def _check_threshold_pre_turn(self, _polite_acquired: bool = False) -> None:
+    async def _check_threshold_pre_turn(
+        self, _polite_acquired: bool = False, resuming: bool = False
+    ) -> None:
         """Turn-start threshold check.
 
         A turn can end over-threshold without the mid-turn safe point ever
@@ -1468,6 +1814,10 @@ class Agent:
         the continuation — the caller runs the turn itself after this
         returns. action=none pauses and waits for the user to intervene
         (/compact, /model, /journal all) before the turn proceeds.
+
+        resuming=True (from continue_incomplete_turn) adds one rule: when the
+        turn being resumed IS an unfinished wrap-up, do not start another one
+        (see the guard below).
         """
         estimated_context = self._estimate_current_context_tokens()
         # Publish the live context estimate so the UI can show it (with a
@@ -1478,6 +1828,19 @@ class Agent:
             {"estimated_tokens": estimated_context},
         )
         if not self._should_check_threshold(estimated_context):
+            return
+        if resuming and self._wrapup_in_progress():
+            # A pause/quit landed INSIDE the wrap-up, so the turn we are
+            # resuming is that wrap-up. Let it finish: arming the compact
+            # alone means the post-turn handler snapshots, restarts and
+            # nudges AFTER the wrap-up completes. Arming the wrap-up too
+            # would run a second one on top of the half-finished first (the
+            # model sees its own partial journal write immediately before
+            # the new instructions) and the restart would then wipe both.
+            # Measured 2026-11-01: 2 _llm_turn calls, 4 wrap-up messages in
+            # the history at the second one, and the resumed turn's
+            # instruction dropped entirely.
+            self._auto_context_triggered = True
             return
         action = await self._handle_threshold_check(estimated_context)
         if action == "pause_wait":
@@ -1511,6 +1874,11 @@ class Agent:
         threshold and set the flags again — the while picks that up; do not
         restructure into recursion.
         """
+        # Close an expired window first: the deadline is its own latch, so the
+        # chain counter is zeroed exactly once and the wind-down's budget then
+        # binds. Doing this at the top means a mid-turn restart right after
+        # expiry already sees the zeroed counter.
+        self._expire_goal()
         while self._report_and_compact_triggered or self._auto_context_triggered:
             if self._report_and_compact_triggered:
                 # Leave the flag set: _run_report_and_compact_turn checks it as
@@ -1539,6 +1907,7 @@ class Agent:
                     "stopped, context compacted. Send a message to "
                     f"continue. (session total: {self._chain_count})"
                     if restart
+                    and not self.goal_active
                     and self._auto_context_chain_used
                     >= self.auto_context_chain
                     else None
@@ -1574,25 +1943,28 @@ class Agent:
                         )
                         break
                     self._auto_context_failures = 0
-                if restart and self._auto_context_chain_used < self.auto_context_chain:
-                    self._auto_context_chain_used += 1
+                # Chain budget: ignored while a goal window is armed. Skipping
+                # only the comparison would saturate the counter at the cap and
+                # kill the budget for the rest of the session; skipping both
+                # leaves the counter where it was, and _expire_goal zeroes it
+                # on the transition so the wind-down starts from a clean slate.
+                budget_allows = (
+                    self.goal_active
+                    or self._auto_context_chain_used < self.auto_context_chain
+                )
+                if restart and budget_allows:
+                    if not self.goal_active:
+                        self._auto_context_chain_used += 1
                     if not chat_cleared:
                         await self.emit(AgentEvent.CHAT_CLEAR, {})
-                    # Nudge the model to continue. The durable records
+                    # The continuation message. The durable records
                     # (mechanical path) or the compact summary's embedded
                     # pointer block (compact-only path) carry the file
-                    # orientation — no redundant cues here. When the turn
-                    # carries a captured user instruction (set at turn
-                    # start), re-inject it VERBATIM: the user's standing
-                    # instruction is the intent source across chains (a
-                    # mid-turn question must not be wiped out by the
-                    # restart).
-                    if self._in_flight_user_request:
-                        nudge = AUTO_CONTEXT_CARRY_HINT.format(
-                            instruction=self._in_flight_user_request
-                        )
-                    else:
-                        nudge = AUTO_CONTEXT_CONTINUE_HINT
+                    # orientation; when a goal window is armed its text is
+                    # prepended, because that is what the window is for. The
+                    # message no longer quotes the user's last message - see
+                    # agent13/goal.py and prompts.AUTO_CONTEXT_RECORD_FRESH_HINT.
+                    nudge = self._goal_restart_message()
                     # "injected" keeps the nudge inside the turn it lands in
                     # (is_turn_start) and off the API wire (LOCAL_MSG_KEYS) -
                     # it carries no user intent. The TUI's chain-restart
@@ -1672,7 +2044,13 @@ class Agent:
                 "report_and_compact": True,
             }
         )
-        now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+        now_dt = datetime.datetime.now()
+        now = now_dt.strftime("%Y-%m-%d %H:%M")
+        # Telling the model the time here counts as a nudge: refresh the clock,
+        # or the next tool boundary injects the same information minutes later.
+        # This does NOT suppress the nudge for the rest of the turn - a wrap-up
+        # that runs past the interval still gets a refresh.
+        self._last_datetime_nudge_at = now_dt.isoformat(timespec="seconds")
         parts = [self.report_and_compact_prompt]
         if self._focus_name:
             parts.append(
@@ -1690,6 +2068,10 @@ class Agent:
             }
         )
         start_len = len(self.messages)
+        # Snapshot the ranked ticket order BEFORE the turn: the wrap-up rewrites
+        # section 6, and the delta is what the detector reports. [] when the
+        # truth path is not yet known (see _check_ticket_rerank).
+        before_order = self._ticket_order()
         self._suppress_auto_context = True
         try:
             await self._llm_turn(_polite_acquired=_polite_acquired)
@@ -1697,8 +2079,172 @@ class Agent:
             # call) so the continuation nudge can carry it into every chain
             # restart.
             self._capture_session_journal_path(self.messages[start_len:])
+            # Capture the handoff block AFTER the journal path is known (the
+            # append needs the path) and after the turn has finished, so the
+            # block carries the summarising that produced it.
+            self._capture_handoff(self.messages[start_len:])
+            # Enforce the truth-file size invariant AFTER the capture: with no
+            # explicit focus the path is only known from the wrap-up's own
+            # file writes, and capture_paths is what records it. Running this
+            # before the capture would make the check a silent no-op on the
+            # first handoff of a focus-less session.
+            await self._check_truth_file_size(_polite_acquired=_polite_acquired)
+            self._check_ticket_rerank(before_order)
+            self._check_rerank_misattribution()
         finally:
             self._suppress_auto_context = False
+
+    async def _check_truth_file_size(self, _polite_acquired: bool = False) -> None:
+        """Log the truth file's size after a wrap-up turn. Never acts.
+
+        The invariant this used to enforce - "the reconcile read is never
+        truncated" - is satisfied upstream: the post-compaction rebuild injects
+        the file whole via DurableRecords._record_parts() (Path.read_text, no
+        bounder). Verified 2026-10-27 with a 64,103-char file. The event stays
+        as the growth instrument; the nudge was the only agent in this system
+        that ever deleted a fact (six on 2026-10-27 10:08, one at 11:47) and it
+        is gone.
+
+        The truncation test is still tied to bound_tool_result on purpose: it
+        is what would tell us the upstream guarantee had broken.
+        """
+        path = self._session_truth_path
+        if not path:
+            return
+        text = self.durable_records.read_record_file(path)
+        if not text:
+            return
+
+        from agent13.tool_output_bound import bound_tool_result
+
+        cap = self._tool_result_cap("read_file")
+        bounded, _spill = bound_tool_result(text, cap, "read_file")
+        truncated = bounded is not text  # a marker was inserted
+        lines = text.count("\n") + 1
+        items = count_facts(text)
+        if not truncated and lines <= 150:
+            return
+
+        if is_debug_enabled():
+            log_tps_event(
+                "wrapup_truth_oversize",
+                {
+                    "lines": lines,
+                    "chars": len(text),
+                    "items": items,
+                    "cap": cap,
+                    "truncated": truncated,
+                    "nudged": False,
+                },
+            )
+
+    def _ticket_order(self) -> list[tuple[str, int | None, int]]:
+        """The ranked ticket order now, or [] when the truth path is unknown."""
+        path = self._session_truth_path
+        if not path:
+            return []
+        text = self.durable_records.read_record_file(path)
+        if not text:
+            return []
+        return ticket_order(text)
+
+    def _check_ticket_rerank(
+        self, before_order: list[tuple[str, int | None, int]]
+    ) -> None:
+        """Log a rank change the wrap-up did not report. Never acts.
+
+        The instrument is one boolean: ``moved`` non-empty with
+        ``reported: False`` is a wrap-up that re-ranked the work queue and did
+        not say so in ``h.`` - the 2026-10-30 16:40 failure, mechanically.
+
+        Blind spots, by design:
+
+        - ``truth_path`` is empty until ``--focus`` sets it or a captured write
+          records it, so the first handoff of a focus-less session has no
+          ``before_order`` and this is a silent no-op that run. That handoff is
+          usually the one that seeds section 6.
+        - A ticket parked IN PLACE still counts as ranked (see
+          ``truth_format.ticket_order``).
+        - It logs and stops: no nudge, no rewrite. A post-wrap-up agent that
+          rewrote the record deleted six verified facts on 2026-10-27.
+        """
+        if not before_order:
+            return
+        path = self._session_truth_path
+        if not path:
+            return
+        text = self.durable_records.read_record_file(path)
+        if not text:
+            return
+        after_order = ticket_order(text)
+        moves = rank_moves(before_order, after_order)
+        if not moves:
+            return
+        if is_debug_enabled():
+            log_tps_event(
+                "wrapup_rank_changed",
+                {
+                    "moved": [
+                        {"ticket": t, "from": old, "to": new}
+                        for t, old, new in moves
+                    ],
+                    "reported": self._rerank_reported(),
+                    "encoding_before": encoding_of(before_order),
+                    "encoding_after": encoding_of(after_order),
+                    "before_n": len(before_order),
+                    "after_n": len(after_order),
+                },
+            )
+
+    def _rerank_reported(self) -> bool:
+        """True when the journal entry this turn appended reports a re-rank in h."""
+        path = self._session_journal_path
+        if not path:
+            return False
+        entry = self.durable_records.read_last_journal_entry(path)
+        if not entry:
+            return False
+        return h_block_reports_rerank(entry)
+
+    # Phrases a wrap-up uses when it attributes a decision to the user. Matched
+    # case-insensitively; "by user" covers "by user direction".
+    _USER_ATTRIBUTION = ("by user direction", "by user", "user agreed")
+
+    def _check_rerank_misattribution(self) -> None:
+        """Log an h. block that cites the harness's own step as user direction.
+
+        The instrument for the 2026-11-06 06:20 failure: the wrap-up wrote
+        "RE-RANKED ... by user direction at 06:09" quoting the continuation
+        message, while the history file has no user message before 18:23 that
+        day. The prompt fix (GOAL_ITEM's parenthetical + the h. rule) is the
+        deliverable; this says whether it held.
+
+        Log-only, never acts - the same shape as ``wrapup_rank_changed``. It
+        fires on the FIRST 40 CHARACTERS of the last injected step appearing
+        in the same h. block as an attribution phrase: the model paraphrases
+        the tail, and a false positive costs one log line while a false
+        negative costs the failure above.
+        """
+        if not self._goal_last_item:
+            return
+        path = self._session_journal_path
+        if not path:
+            return
+        entry = self.durable_records.read_last_journal_entry(path)
+        block = h_block_text(entry) if entry else ""
+        if not block:
+            return
+        lowered = block.lower()
+        if not any(phrase in lowered for phrase in self._USER_ATTRIBUTION):
+            return
+        prefix = self._goal_last_item[:40]
+        if prefix not in block:
+            return
+        if is_debug_enabled():
+            log_tps_event(
+                "wrapup_rerank_misattributed",
+                {"step_prefix": prefix, "h_excerpt": block[:400]},
+            )
 
     # ── Durable records (agent13.durable_records) ─────────────────────────
     #
@@ -1742,11 +2288,12 @@ class Agent:
         """Set the explicit focus name; the record paths derive from it."""
         self.durable_records.set_focus_name(name)
 
-    async def apply_focus_name(self, name: str) -> tuple[str, str]:
-        """Apply /focus [NAME] immediately (the UI command path).
+    def apply_focus_name(self, name: str) -> tuple[str, str]:
+        """Apply /focus [NAME] immediately (the shared command handler).
 
-        Thin async forward onto DurableRecords.apply_focus - see there for
-        the semantics and the (message, level) contract the UIs present.
+        Sync forward onto DurableRecords.apply_focus - it does no I/O, so the
+        shared handler in agent13.commands can call it directly. See there
+        for the semantics and the (message, level) contract.
         """
         return self.durable_records.apply_focus(name, self.messages)
 
@@ -1762,6 +2309,14 @@ class Agent:
         """True when the durable record is still current (no tool calls
         since the last wrap-up completed)."""
         return self.durable_records.is_wrapup_current(self.messages)
+
+    def _wrapup_in_progress(self) -> bool:
+        """True when a wrap-up started but never produced its final response.
+
+        The resume-path twin of _wrapup_is_current: an interrupted wrap-up
+        must be finished, not restarted.
+        """
+        return self.durable_records.wrapup_in_progress(self.messages)
 
     async def _mechanical_restart(
         self, carry_skills: bool = True, system_line: str | None = None
@@ -1865,6 +2420,8 @@ class Agent:
         """Start a new session identity: compaction total to 0, start to now."""
         self._chain_count = 0
         self._session_started_at = datetime.datetime.now().isoformat()
+        # /new_session ends the current task: no duration to carry over.
+        self.task_clock.reset()
 
     def _should_check_threshold(self, estimated_context: int) -> bool:
         """Gate for the auto-context threshold check at a safe point.
@@ -1879,28 +2436,6 @@ class Agent:
             and not self._suppress_auto_context
         )
 
-    def _capture_in_flight_user_request(self) -> str:
-        """Store this turn's user instruction from the current history.
-
-        Used by the resume path, where the turn-start user message comes
-        from the restored history (the normal path captures item.text
-        explicitly where it is appended). Scans for the last genuine user
-        message (is_turn_start — excludes injected nudges, interrupt
-        markers, wrap-up prompts) and stores it as the standing
-        instruction re-injected verbatim at each chain restart. A no-op
-        when an instruction is already stored (the turn-start capture
-        wins). Cleared by _reset_auto_context_turn_state at each
-        user-turn start, so a manual /chain while idle carries nothing
-        stale (falls back to the bare nudge).
-        """
-        if self._in_flight_user_request:
-            return self._in_flight_user_request
-        for msg in reversed(self.messages):
-            if is_turn_start(msg):
-                self._in_flight_user_request = str(msg.get("content", ""))
-                break
-        return self._in_flight_user_request
-
     def _reset_auto_context_turn_state(self) -> None:
         """Reset per-turn auto-context state at the start of each user turn.
 
@@ -1913,8 +2448,352 @@ class Agent:
         self._auto_context_chain_used = 0
         self._auto_context_triggered = False
         self._report_and_compact_triggered = False
-        self._in_flight_user_request = ""
         self._degenerate_streak = 0
+
+    # ── Goal window (/grind) ────────────────────────────────────────────────
+    #
+    # The window is a deadline, not a turn: it survives turn ends, so a turn
+    # that ends below the threshold is restarted instead of leaving the agent
+    # idle. The rules that can be decided without an Agent live in
+    # agent13/goal.py; this section owns the state and the two injection
+    # points (the chain restart and the idle hook).
+
+    @property
+    def goal_active(self) -> bool:
+        """True while a goal window is open. Deadline-only: the text is
+        optional, so an empty text must not disarm the window."""
+        return self._goal_deadline > 0 and time.time() < self._goal_deadline
+
+    @property
+    def goal_remaining(self) -> float:
+        """Seconds left in the window (0.0 when none). User-facing only."""
+        if not self.goal_active:
+            return 0.0
+        return max(0.0, self._goal_deadline - time.time())
+
+    @property
+    def goal_window(self) -> float:
+        """The window's length in seconds (0.0 once it has expired)."""
+        if self._goal_deadline <= 0 or self._goal_set_at <= 0:
+            return 0.0
+        return self._goal_deadline - self._goal_set_at
+
+    def set_goal(self, seconds: float, text: str | None = None) -> None:
+        """Arm (or re-arm) the window, keeping the text unless one is given.
+
+        Sticky text is what removes the need for a sentinel: there is no empty
+        state to fill, and a sentinel such as "continue towards your goal"
+        would refer to a goal the model cannot see.
+        """
+        now = time.time()
+        self._goal_deadline = now + seconds
+        self._goal_set_at = now
+        if text is not None:
+            self._goal_text = text
+
+    def stop_goal(self) -> None:
+        """`/grind off`: close the window, KEEPING the goal text.
+
+        Everything the window owns except the text: the deadline, the window
+        length, the chain counter and both question flags. The text survives
+        because it is what a later bare ``/grind 4h`` re-arms - "off" stops the
+        clock, it does not forget what the user asked for. Only
+        :meth:`clear_goal` forgets.
+        """
+        self._goal_deadline = 0.0
+        self._goal_set_at = 0.0
+        self._auto_context_chain_used = 0
+        self._goal_question_pending = False
+        self._goal_answer_pending = False
+
+    def clear_goal(self) -> None:
+        """`/grind clear`: stop the window AND forget the goal text.
+
+        The only path that empties the text. Stopping is part of it: a window
+        with no goal would keep grinding toward the record's ticket list, which
+        is not what a user who just asked to forget is asking for. The current
+        turn is untouched either way - the window bounds the decision to keep
+        going, not the work in flight.
+        """
+        self.stop_goal()
+        self._goal_text = ""
+
+    def _expire_goal(self) -> None:
+        """Close an expired window, once.
+
+        The deadline is its own latch: clearing it makes the transition
+        one-shot without a new field, so the chain counter is zeroed exactly
+        once and then accumulates again - the budget binds for the wind-down.
+        Zeroing "wherever the budget is evaluated while expired" would zero on
+        every evaluation, so the budget would never bind again.
+
+        _goal_set_at goes too: it feeds only the window length, and leaving it
+        would make deadline - set_at negative (a window that reads backwards).
+        The goal TEXT survives - it is what /grind re-arms and what the status
+        line shows.
+
+        The two question flags go with it, for the same reason load_context
+        clears them: a question whose window has closed is not resumable, and
+        leaving the flag set would let the NEXT window consume the old answer
+        as if it had just been given.
+        """
+        if self._goal_deadline and time.time() >= self._goal_deadline:
+            window = self._goal_deadline - self._goal_set_at
+            chain_before = self._auto_context_chain_used
+            question_was_pending = self._goal_question_pending
+            self._goal_deadline = 0.0
+            self._goal_set_at = 0.0
+            self._auto_context_chain_used = 0
+            self._goal_question_pending = False
+            self._goal_answer_pending = False
+            if is_debug_enabled():
+                # The wind-down boundary: the one place the chain budget is
+                # handed back. Logged because "the budget never bound again"
+                # is invisible in the transcript and only shows here.
+                log_tps_event(
+                    "goal_expired",
+                    {
+                        "window_s": round(window, 1),
+                        "chain_used_before": chain_before,
+                        "chain_used_after": 0,
+                        "had_goal_text": bool(self._goal_text),
+                        "question_was_pending": question_was_pending,
+                    },
+                )
+
+    def _goal_restart_message(self) -> str:
+        """The user message injected after a chain restart.
+
+        Three cases, one text each: the goal line plus the record pointer when
+        a window with text is armed, the record pointer alone otherwise, and
+        the generic continue hint when there is no record at all.
+        """
+        if self.durable_records.records_mtime() <= 0:
+            return AUTO_CONTEXT_CONTINUE_HINT
+        if self.goal_active and self._goal_text:
+            return f"Goal: {self._goal_text}\n{AUTO_CONTEXT_RECORD_FRESH_HINT}"
+        return AUTO_CONTEXT_RECORD_FRESH_HINT
+
+    def _goal_ticket_counts(self) -> tuple[int, int, bool]:
+        """(unblocked, blocked, has_record) from the current-truth record."""
+        text = self.durable_records.read_record_file(self.durable_records.truth_path)
+        return goal_rules.ticket_counts(text)
+
+    def _unresolved_for_user(self) -> list[str]:
+        """The carried for_user items, capped. [] when none.
+
+        Read from the journal, not held in memory: the block is persisted
+        append-only, so a chain restart or a resume sees the same list.
+        """
+        return self.durable_records.unresolved_for_user()
+
+    def _unresolved_for_user_state(self) -> tuple[list[str], str]:
+        """(items, source heading) - the same call the seed makes.
+
+        One function for both readers, so the seed and the question cannot
+        disagree about which entry the carried list came from.
+        """
+        return self.durable_records.for_user_state()
+
+    def _capture_handoff(self, turn_messages: list[dict]) -> None:
+        """Append the wrap-up's handoff block to the journal entry.
+
+        The final message is discarded at rebuild, so the block is captured
+        when the turn completes - after the model has done its summarising,
+        which is what makes it carry the insight the summary produced.
+        """
+        text = ""
+        for message in reversed(turn_messages):
+            if message.get("role") != "assistant":
+                continue
+            content = message.get("content")
+            if isinstance(content, str) and content.strip():
+                text = content
+                break
+        if text:
+            self.durable_records.capture_handoff(text)
+
+    def _goal_last_answer(self) -> tuple[str, bool]:
+        """(text, carried_tool_calls) for the last assistant message."""
+        for msg in reversed(self.messages):
+            if msg.get("role") == "assistant":
+                return str(msg.get("content") or ""), bool(msg.get("tool_calls"))
+        return "", False
+
+    def _goal_delete_pair(self) -> None:
+        """Drop the question message and the answer that followed it.
+
+        Matched by the local `goal_question` flag rather than by text: the
+        question is rebuilt from the mechanical check each time, so its text
+        can differ from the one in history. The answer is the first assistant
+        message after the question.
+        """
+        start = None
+        for i, msg in enumerate(self.messages):
+            if msg.get("goal_question"):
+                start = i
+        if start is None:
+            return
+        end = start
+        for j in range(start + 1, len(self.messages)):
+            if self.messages[j].get("role") == "assistant":
+                end = j
+                break
+        del self.messages[start:end + 1]
+
+    async def _goal_ask(self) -> None:
+        """Ask the progress question as its own turn.
+
+        The mechanical check shapes the preamble and never stops the run: the
+        record is only rewritten at a wrap-up, so "all blocked" can be hours
+        stale, and ending a live window on a snapshot would be this mechanism
+        causing the failure it exists to prevent.
+
+        The tps_goal_ask event is the record of what was asked and why: the
+        mechanical counts, the preamble they selected, and the question text.
+        """
+        unblocked, blocked, has_record = self._goal_ticket_counts()
+        pending, for_user_source = self._unresolved_for_user_state()
+        text = goal_rules.question_text(unblocked, blocked, has_record, pending)
+        if is_debug_enabled():
+            log_tps_event(
+                "goal_ask",
+                {
+                    "unblocked": unblocked,
+                    "blocked": blocked,
+                    "has_record": has_record,
+                    # The mechanical PREDICTION, not the decision: the record
+                    # can be hours stale, so this never ends the run.
+                    "would_continue": bool(unblocked) or not has_record,
+                    "preamble": goal_rules.preamble_name(unblocked, blocked),
+                    "for_user": pending,
+                    # Which entry the list came from, and how old it is: the
+                    # source is the newest entry WITH a block, so it can be
+                    # hours behind the last entry. A carried item is then a
+                    # line in the log, not an invisible assumption.
+                    "for_user_source": for_user_source,
+                    "for_user_source_age_s": heading_age_seconds(for_user_source),
+                    "question": text,
+                    "goal_text": self._goal_text,
+                    "goal_window_s": round(self.goal_window, 1),
+                    "goal_remaining_s": round(self.goal_remaining, 1),
+                },
+            )
+        self._goal_question_tokens = {"prompt": 0, "completion": 0}
+        self._goal_question_pending = True
+        self.queue.add(text, kind="goal_question")
+
+    async def _goal_handle_answer(self) -> None:
+        """Parse the answer and either continue or stop.
+
+        The log is the rollout's evidence, so the three shapes that used to
+        collapse into "next is empty" are recorded separately: a parse failure,
+        an answer with no step, and an answer that carried tool calls. A high
+        rate of any one of them is the evidence for adding a retry (work order
+        section 4 step 3), and they need different fixes.
+        """
+        self._goal_answer_pending = False
+        answer_text, carried_tools = self._goal_last_answer()
+        answer = goal_rules.parse_answer(answer_text)
+        proceed = goal_rules.can_progress(answer)
+        step = goal_rules.next_step(answer)
+        tokens = dict(self._goal_question_tokens)
+        if carried_tools:
+            # A tool call means the model kept working instead of answering;
+            # the pair stays (it is part of that work) and the run continues.
+            proceed, step = True, ""
+        if not proceed:
+            waiting = goal_rules.waiting_on(answer)
+            detail = f" (waiting on: {', '.join(waiting)})" if waiting else ""
+            await self.emit(
+                AgentEvent.NOTIFICATION,
+                {
+                    "message": f"Goal window: no progress without you{detail}",
+                    "level": "info",
+                },
+            )
+            if is_debug_enabled():
+                log_tps_event(
+                    "goal_idle",
+                    {
+                        "decision": "stop",
+                        "parse_ok": answer is not None,
+                        "carried_tools": carried_tools,
+                        "waiting_on_user": waiting,
+                        "answer": answer_text,
+                        "question_prompt_tokens": tokens["prompt"],
+                        "question_completion_tokens": tokens["completion"],
+                        "goal_remaining_s": round(self.goal_remaining, 1),
+                    },
+                )
+            return  # the pair stays in history
+        if not self.goal_active:
+            # /grind off or clear (or the deadline) landed while the answer
+            # was being handled: a cancelled window must not start a goal
+            # turn. The flags are already cleared by stop_goal/_expire_goal;
+            # the pair stays in history, as it does for a load.
+            if is_debug_enabled():
+                log_tps_event(
+                    "goal_idle",
+                    {"decision": "cancelled", "goal_remaining_s": 0.0},
+                )
+            return
+        if not carried_tools:
+            # A tool call means the model kept working instead of answering;
+            # the pair is part of that work and stays in history.
+            self._goal_delete_pair()
+        unblocked, blocked, has_record = self._goal_ticket_counts()
+        text = goal_rules.goal_item(self._goal_text, step, has_record)
+        if step:
+            source = "step"
+        elif has_record:
+            source = "record"
+        else:
+            source = "continue_hint"
+        if not text:
+            text = AUTO_CONTEXT_CONTINUE_HINT
+        # Remember what the harness put in the transcript: the wrap-up quotes
+        # this line when it writes h., and the detector needs to know it.
+        self._goal_last_item = text
+        if is_debug_enabled():
+            log_tps_event(
+                "goal_idle",
+                {
+                    "decision": "continue",
+                    "parse_ok": answer is not None,
+                    "carried_tools": carried_tools,
+                    "next": step,
+                    "source": source,
+                    "item": text,
+                    "unblocked": unblocked,
+                    "blocked": blocked,
+                    "has_record": has_record,
+                    "question_prompt_tokens": tokens["prompt"],
+                    "question_completion_tokens": tokens["completion"],
+                    "goal_remaining_s": round(self.goal_remaining, 1),
+                },
+            )
+        self.queue.add(text, kind="goal")
+
+    async def _goal_check(self) -> None:
+        """The idle hook's body: continue the window, or let the agent idle.
+
+        The hook only runs with an EMPTY queue, so a question flag reaching
+        here means the question turn has ended - completed, or cancelled by
+        ESC - and its answer is in history, unparsed. That is the
+        question->answer transition, and it lives here rather than in
+        process_item so a cancelled question turn cannot leave the flag
+        reading "in flight" forever: the hook would then do nothing at every
+        turn end and the window would stop silently, which is the failure the
+        window exists to prevent.
+        """
+        if self._goal_question_pending:
+            self._goal_question_pending = False
+            self._goal_answer_pending = True
+        if self._goal_answer_pending:
+            await self._goal_handle_answer()
+            return
+        await self._goal_ask()
 
     async def _handle_threshold_check(self, estimated_context: int) -> str:
         """Handle the auto-context threshold being hit at a safe point.
@@ -2042,6 +2921,25 @@ class Agent:
                 None, lambda: self.execute_tool(name, arguments)
             )
 
+    @staticmethod
+    def _tool_result_cap(tool_name: str) -> int:
+        """Per-tool cap if declared, else the global [tools] max_result_chars.
+
+        The single source of the cap-resolution rule. Both the read path
+        (_bound_tool_result_text) and the wrap-up truth-size check
+        (_check_truth_file_size) call it, so a change to the fallback can
+        never apply to only one of them.
+        """
+        from agent13.tools import get_tool_max_result_chars
+        from agent13.config import get_config
+
+        cap = get_tool_max_result_chars(tool_name)
+        if cap is None:
+            # The real Config always sets this (default 30000); fall back to
+            # the design cap if the object lacks it (a minimal test mock).
+            cap = getattr(get_config(), "tools_max_result_chars", 30_000)
+        return cap
+
     def _bound_tool_result_text(self, text: str, tool_name: str) -> str:
         """Bound a tool result's text per [tools] max_result_chars.
 
@@ -2053,14 +2951,8 @@ class Agent:
         if not text:
             return text
         from agent13.tool_output_bound import bound_tool_result
-        from agent13.tools import get_tool_max_result_chars
-        from agent13.config import get_config
 
-        cap = get_tool_max_result_chars(tool_name)
-        if cap is None:
-            # The real Config always sets this (default 30000); fall back to
-            # the design cap if the object lacks it (a minimal test mock).
-            cap = getattr(get_config(), "tools_max_result_chars", 30_000)
+        cap = self._tool_result_cap(tool_name)
         bounded, _spill = bound_tool_result(text, cap, tool_name)
         if bounded is not text:
             # bound_tool_result returns the input object unchanged when no
@@ -2214,50 +3106,6 @@ class Agent:
                 [],
             )
 
-    def _strip_images_from_messages(self) -> None:
-        """Remove image_url blocks from messages after the model has seen them.
-
-        Replaces each image_url content block with a text placeholder
-        (e.g. "[image: screenshot.png]"). This prevents base64 image data
-        from accumulating in context across turns. The model already
-        processed the image in the current turn; future turns reference
-        the text description in the tool result.
-
-        Only affects user messages with list content (the pattern used
-        by native vision injection). Tool messages and plain-string
-        user messages are untouched.
-        """
-        for msg in self.messages:
-            if msg.get("role") != "user":
-                continue
-            content = msg.get("content")
-            if not isinstance(content, list):
-                continue
-            # Check if this message has any image_url blocks
-            has_image = any(
-                isinstance(block, dict) and block.get("type") == "image_url"
-                for block in content
-            )
-            if not has_image:
-                continue
-            # Replace image_url blocks with text placeholders
-            new_content = []
-            for block in content:
-                if isinstance(block, dict) and block.get("type") == "image_url":
-                    # Extract a short label from the data URI if possible
-                    url = block.get("image_url", {}).get("url", "")
-                    if url.startswith("data:image/"):
-                        # e.g. "data:image/png;base64,..." → "png"
-                        media_type = url.split("/")[1].split(";")[0]
-                        new_content.append(
-                            {"type": "text", "text": f"[image: {media_type}]"}
-                        )
-                    else:
-                        new_content.append({"type": "text", "text": "[image]"})
-                else:
-                    new_content.append(block)
-            msg["content"] = new_content
-
     def set_mcp_servers(self, server_configs: list) -> None:
         """Set MCP server configurations (does not connect).
 
@@ -2353,6 +3201,9 @@ class Agent:
         # One queue item = one user turn: reset the per-turn tool-call
         # numbering so each turn's calls number from 1.
         self._turn_tool_seq = 0
+
+        # Any work restarts the idle clock (idle auto-save, core._maybe_idle_save).
+        self._mark_activity()
 
         # Clear and load are instant housekeeping operations — skip
         # WAITING status so the bell doesn't arm/ring for them.
@@ -2562,6 +3413,11 @@ class Agent:
                 )
             else:
                 # Normal prompt processing
+                # A new user turn = a new task: restart the task clock. It is a
+                # no-op while a task is already running, so a queued message
+                # arriving mid-task does not reset it - and the wrap-up/chain
+                # restarts inside this turn never pass through a frozen clock.
+                self.task_clock.start()
                 # Retrospective compaction: journal was off during the previous
                 # turn, but user has now turned it on. Apply compaction now so
                 # the tool calls get summarized before the new turn starts.
@@ -2585,12 +3441,22 @@ class Agent:
                 # the whole history and would swallow it.
                 await self._check_threshold_pre_turn(_polite_acquired=_polite_acquired)
 
-                # Add user message to history
-                self.messages.append({"role": "user", "content": item.text})
-                # This message is the turn's standing instruction: carried
-                # verbatim into every chain restart's nudge so intent
-                # survives the restarts (cleared at the next turn start).
-                self._in_flight_user_request = item.text
+                # Refresh the model's clock if it went stale while the session
+                # sat idle. Injected BEFORE the user's message so the model
+                # reads the time first, and as a SEPARATE message so item.text
+                # stays exactly what the user typed - the display, the saved
+                # session and the shared history store all stay clean.
+                if self._datetime_nudge_due():
+                    self._inject_datetime_nudge()
+
+                # Add user message to history. A goal question is flagged so
+                # the answer handler can delete the pair afterwards without
+                # matching on text (the question is rebuilt from the record
+                # each time, so its wording can differ).
+                message = {"role": "user", "content": item.text}
+                if item.kind == "goal_question":
+                    message["goal_question"] = True
+                self.messages.append(message)
 
                 # Process with LLM (may include multiple tool call rounds)
                 await self._llm_turn(_polite_acquired=_polite_acquired)
@@ -2678,6 +3544,19 @@ class Agent:
                     # Must not mask the original exception that triggered this
                     # finally block.
                     pass
+
+        # A turn that ends is not the end of the work when a goal window is
+        # open. Expire first (the deadline is its own latch), then let the
+        # goal check enqueue the next turn; the queue decision below then
+        # sees it and goes WAITING instead of IDLE.
+        self._expire_goal()
+        if not self.queue.pending_count and self.goal_active:
+            try:
+                await self._goal_check()
+            except BaseException:
+                # The window must never take down the run loop: a failed
+                # check just ends the window's turn here.
+                pass
 
         # Skip IDLE if there are queued items — go straight to WAITING
         # so the TUI (and bell) never sees "ready" between queue items.
@@ -3175,6 +4054,13 @@ class Agent:
                         # cache because reasoning tokens are not stripped.
                         continue
 
+                    # Refresh the model's clock at the same boundary. Not a
+                    # queue item: a queued nudge would become its own turn if
+                    # the agent went idle first, and it would race the steer
+                    # above for the last word before the LLM call.
+                    if self._datetime_nudge_due():
+                        self._inject_datetime_nudge()
+
                     # Auto-context threshold check at safe point.
                     # Use the estimated CURRENT context (prompt_tokens is stale
                     # here - it predates the tool results just added). If over
@@ -3380,7 +4266,6 @@ class Agent:
                         continue
                     # Stop: turn given up (the apply set the incomplete-turn
                     # marker; /resume retries it from the history tail).
-                    self._strip_images_from_messages()
                     break
 
                 # No tool calls - add final response to history
@@ -3407,10 +4292,15 @@ class Agent:
                         },
                     )
 
-                # Strip image data from messages — the model has already
-                # processed them this turn. Replaces image_url blocks with
-                # a text placeholder to prevent context bloat on future turns.
-                self._strip_images_from_messages()
+                # Images are NOT stripped here. Rewriting messages in place
+                # at turn end breaks the provider's prefix cache for every
+                # message after the oldest image, forcing a full re-prefill
+                # on the next request (measured: 415.9s first token vs a
+                # 6.8s warm median, to save 3.5% of context). Images are
+                # discarded wholesale by the history-replacement paths
+                # instead (compact_history, _mechanical_restart, journal
+                # compact), where the prefix changes by design and the
+                # re-prefill is paid regardless.
 
                 break
 
@@ -3431,6 +4321,11 @@ class Agent:
 
     async def _set_status(self, status: AgentStatus) -> None:
         """Set the agent status and emit event if changed."""
+        if status == AgentStatus.IDLE:
+            # The task is over: bank its total and freeze it so the status
+            # bar keeps showing how long the task took (rather than dropping
+            # to the last turn's duration). A no-op when no task is running.
+            self.task_clock.stop()
         if self._status != status:
             self._status = status
             await self.emit(
@@ -3622,6 +4517,10 @@ class Agent:
         ):
             self.polite_lock.interval = interval
             return
+        # A different key: the lock is replaced, so any wait on the old one
+        # must end rather than win a lock this agent no longer tracks.
+        self._polite_generation += 1
+        generation = self._polite_generation
         self.polite_lock = PoliteLock(
             provider=key,
             interval=interval,
@@ -3631,6 +4530,12 @@ class Agent:
             # backs off (PolitePauseRequested) so the turn/queue state
             # survives and /resume re-enters the wait.
             pause_check=lambda: self._pause_state != PauseState.RUNNING,
+            # /polite off (or a re-key) during a lock wait must END the wait:
+            # otherwise the agent blocks until the lock frees, wins it, and
+            # runs a turn holding a lock it no longer tracks - nothing then
+            # releases it, because every release guard tests
+            # `polite_lock is not None`.
+            cancel_check=lambda: self._polite_generation != generation,
         )
 
     def _model_base_name(self) -> str:
@@ -3665,9 +4570,14 @@ class Agent:
         """Disable polite mode. Releases the lock if currently held.
 
         Safe to call when polite mode was never enabled (silent no-op).
-        Takes effect on the next ``_process_item`` (a turn in flight is
-        unaffected).
+
+        A turn in flight is unaffected - it keeps running, unlocked. A turn
+        WAITING for the lock is released immediately: bumping the generation
+        makes the in-flight ``acquire()`` raise ``PoliteCancelled`` within one
+        poll interval, so the queued item runs now instead of blocking until
+        the lock frees and then running while holding a lock nobody tracks.
         """
+        self._polite_generation += 1
         if self.polite_lock is not None:
             self.polite_lock.release()
             self.polite_lock = None

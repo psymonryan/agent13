@@ -157,6 +157,35 @@ class TestBellManagerTurnLifecycle:
         assert called == []
 
     @pytest.mark.asyncio
+    async def test_paused_rings_regardless_of_threshold(self):
+        """/pause announces itself: the bell rings when the agent ACTUALLY
+        pauses, whatever the turn-completion threshold is."""
+        called = []
+        bm = BellManager(threshold=100, fallback_ring=lambda: called.append(True))
+        bm.on_turn_start()
+        bm.on_paused()
+        assert called == [True]
+
+    def test_paused_respects_disabled(self):
+        """/bell off must silence the pause announcement too."""
+        called = []
+        bm = BellManager(
+            enabled=False, threshold=100, fallback_ring=lambda: called.append(True)
+        )
+        bm.on_paused()
+        assert called == []
+
+    @pytest.mark.asyncio
+    async def test_paused_cancels_pending_timer(self):
+        """A threshold bell scheduled for the turn must not also fire."""
+        bm = BellManager(threshold=100)
+        bm.on_turn_start()
+        assert bm._task is not None
+        bm.on_paused()
+        assert bm._task is None
+        assert bm._armed is False
+
+    @pytest.mark.asyncio
     async def test_cancel_clears_timer(self):
         """cancel() should cancel any pending timer."""
         bm = BellManager(threshold=100)

@@ -40,7 +40,11 @@ import asyncio
 import base64
 from typing import Optional
 
-from agent13.sandbox import _decode_output, _kill_process_tree
+from agent13.sandbox import (
+    MAX_COMMAND_TIMEOUT,
+    _decode_output,
+    _kill_process_tree,
+)
 
 # Session cache: host -> "posix" | "powershell"
 _remote_shell_cache: dict[str, str] = {}
@@ -494,8 +498,11 @@ def _remote_timeout_result(
 
     message = (
         f"Remote command timed out after {timeout} seconds on {host}. "
-        "If the script is interactive (reads stdin, prompts), it was "
-        "blocked - the script's stdin is the base64 payload, not a tty."
+        f"If it legitimately needs longer, re-run with a larger timeout "
+        f"(timeout is in SECONDS: max {MAX_COMMAND_TIMEOUT:g}) or "
+        "mode='detach' for jobs past that. If the script is interactive "
+        "(reads stdin, prompts), it was blocked - the script's stdin is "
+        "the base64 payload, not a tty."
     )
     stderr = (stderr + "\n" if stderr else "") + message
 

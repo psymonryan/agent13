@@ -15,7 +15,6 @@ Usage:
 import asyncio
 import os
 import sys
-from pathlib import Path
 import time
 from typing import Optional
 
@@ -38,87 +37,57 @@ from agent13.timing import TokenTimingTracker
 from agent13.durable_records import startup_focus
 from agent13.file_injection import expand_file_mentions
 from agent13.bell import BellManager
-from agent13.models import fetch_models, resolve_model_selection
-from agent13.config import (
-    resolve_provider_arg,
-    resolve_provider_selection,
-    create_client,
-    get_provider_names,
-)
+from agent13.models import fetch_models, format_model_list
 from agent13.commands import (
-    execute_save,
-    execute_delete,
-    execute_retry,
-    execute_prioritise,
-    execute_deprioritise,
+    command_names,
     execute_collapse,
-    list_save_names,
-    format_queue_items,
-    format_history_groups,
+    execute_pretty,
+    format_help_sections,
+    get_command,
+    promote_latest,
+    run_command,
+    run_mcp_action,
 )
 from agent13.message_history import content_to_text
-from agent13.status import get_tool_stats_summary, parse_token_count
-from agent13.sandbox import (
-    parse_sandbox_mode,
-    get_default_sandbox_mode,
-    get_pinned_sandbox_mode,
-    pin_sandbox_mode,
-    unpin_sandbox_mode,
-)
-from agent13.pins import (
-    get_pinned_devel,
-    pin_devel,
-    unpin_devel,
-)
-from tools.security import (
-    set_session_sandbox_mode,
-    get_session_sandbox_mode,
-    get_current_sandbox_mode,
-)
-from ui.display import format_mcp_servers
 
 
-# Slash commands available in REPL mode
+# Commands the REPL implements itself (the dispatch chain in run_repl).
+# Shared commands come from the registry in agent13.commands.
+_REPL_LOCAL_COMMANDS = frozenset(
+    {
+        "exit",
+        "help",
+        "multi",
+        "pause",
+        "pretty",
+        "reasoning",
+        "resume",
+        "stop",
+        "toolview",
+        "upgrade",
+    }
+)
+
+# Catalogue entries the REPL deliberately does not offer - their work is about
+# the TUI's own widgets (spinner, clipboard, chat rebuild, display wipe).
+#
+# /clear is listed here but still has a branch in the dispatch chain: it used
+# to do something in the REPL, so typing it earns a pointer at /new_session
+# rather than "Unknown command".
+_NOT_IN_REPL = frozenset(
+    {
+        "clear",
+        "clipboard",
+        "rebuild",
+        "spinner",
+    }
+)
+
+# Slash commands available in REPL mode, derived from the shared registry.
 COMMANDS = {
-    "/quit": "Exit the REPL",
-    "/exit": "Exit the REPL",
-    "/help": "Show available commands",
-    "/status": "Show agent status and session info",
-    "/pause": "Pause agent processing",
-    "/resume": "Resume agent processing",
-    "/stop": "Interrupt current response",
-    "/save": "Save session (e.g. /save mysession)",
-    "/load": "Load session (e.g. /load mysession)",
-    "/multi": "Enter multi-line mode (end with . on its own line) or just put a \\ on the end of the line",
-    "/clear": "No display in the REPL - history untouched. Use /new_session to wipe history and start fresh",
-    "/new_session": "Wipe message history and start a new session (compaction total + start time reset)",
-    "/history": "Show message history (grouped)",
-    "/queue": "Show queued messages",
-    "/retry": "Retry the last message",
-    "/prioritise": "Mark queue item as priority: /prioritise N",
-    "/deprioritise": "Remove priority from queue item: /deprioritise N",
-    "/delete": "Delete items: /delete h N (history group), /delete q N (queue item), /delete s NAME (save)",
-    "/journal": "Control journal mode: /journal [on|off|last|all|status]",
-    "/compact": "Compact history: /compact [next-task focus] | /compact --prompt <name>",
-    "/wrapup": "Update journal + current-truth files now, then idle: /wrapup [name]",
-    "/focus": "Set the focus name: /focus [name] (no args shows current; empty history loads its records)",
-    "/model": "Switch model: /model [name|number] (no args lists available models)",
-    "/provider": "Switch provider: /provider <name|url>",
-    "/sandbox": "Sandbox mode: /sandbox [mode|pin|unpin] (no args shows status)",
-    "/bell": "Bell on idle: /bell [N|off] (0=always, N=threshold seconds)",
-    "/bell-command": "Set external bell command: /bell-command [cmd|off]",
-    "/devel": "Devel mode: /devel [on|off|status|pin|unpin] (no args shows status)",
-    "/reasoning": "Fold reasoning widgets: /reasoning [hide|show|pin|unpin] (display only)",
-    "/toolview": "Fold tool call/result widgets: /toolview [hide|show|pin|unpin] (display only)",
-    "/tools": "Show tool usage statistics",
-    "/mcp": "Show MCP server status: /mcp [connect|disconnect|reload]",
-    "/cwd": "Show or change working directory: /cwd [path]",
-    "/upgrade": "Check for and apply updates",
-    "/polite": "Multi-agent lock coordination: /polite N | /polite off",
-    "/auto_context_threshold": "Auto-context threshold: /auto_context_threshold [N|0] (supports k suffix)",
-    "/auto_context_action": "Auto-context action: /auto_context_action [compact|report_and_compact|none]",
-    "/auto_context_chain": "Auto-context chain (restarts per turn): /auto_context_chain [N]",
-    "/auto_context_nudge_cap": "Degeneration guard cap: /auto_context_nudge_cap [N] (0 = guard off)",
+    f"/{name}": get_command(name).description
+    for name in command_names()
+    if get_command(name).handler is not None or name in _REPL_LOCAL_COMMANDS
 }
 
 
@@ -281,6 +250,8 @@ async def run_repl(
     devel_mode: bool = False,
     skills_mode: bool = False,
     skill_manager=None,
+    skills_notice: Optional[str] = None,
+    snippet_manager=None,
     continue_session: bool = False,
     output_path: Optional[str] = None,
     model_names: Optional[list[str]] = None,
@@ -297,6 +268,8 @@ async def run_repl(
     auto_context_action: str = "report_and_compact",
     auto_context_chain: int = 3,
     auto_context_nudge_cap: int = 2,
+    auto_save_idle_seconds: int = 300,
+    datetime_nudge_seconds: int = 3600,
     report_and_compact_prompt: str = "",
 ):
     """Run the agent in interactive REPL mode.
@@ -418,11 +391,25 @@ async def run_repl(
         auto_context_action=auto_context_action,
         auto_context_chain=auto_context_chain,
         auto_context_nudge_cap=auto_context_nudge_cap,
+        auto_save_idle_seconds=auto_save_idle_seconds,
+        datetime_nudge_seconds=datetime_nudge_seconds,
         report_and_compact_prompt=report_and_compact_prompt,
     )
 
     # Store available models on agent
     agent.available_models = model_names or []
+    # Provider name for /status - the agent owns it so /provider can change it
+    # without leaving a stale copy in this scope.
+    agent.provider_name = provider
+    # Managers the shared command handlers read (/prompt, /skills, /snippet,
+    # /compact, /status). cli.py constructs them once for every mode.
+    agent.prompt_manager = prompt_manager
+    agent.skill_manager = skill_manager
+    agent.snippet_manager = snippet_manager
+    # Display flags /status reports. The REPL has no /spinner or /clipboard,
+    # so those keep the agent's defaults.
+    agent.reasoning_collapsed = reasoning_collapsed
+    agent.toolview_collapsed = toolview_collapsed
 
     # Focus name from --focus: authoritative state; on a fresh session the
     # records become the first turn - the model reads them and replies a
@@ -457,6 +444,9 @@ async def run_repl(
         command=bell_command,
         fallback_ring=_ring_terminal_bell,
     )
+    # The shared /bell and /bell-command handlers reach the manager through
+    # the agent, so the same code serves both front-ends.
+    agent.bell = bell
 
     # Load previous session if --continue
     if continue_session:
@@ -472,6 +462,11 @@ async def run_repl(
         else:
             print("No saved session found, starting fresh")
 
+    # Startup notice from the default-skills sync (cli.py runs it before any
+    # front-end exists, so it hands the report over instead of printing).
+    if skills_notice:
+        print(skills_notice)
+
     # ── State tracking ───────────────────────────────────────────────
     # Note: agent.is_idle, agent.status, agent.pause_state are the
     # single source of truth — same as TUI. No duplicate flags.
@@ -480,36 +475,56 @@ async def run_repl(
     in_multi_mode = False
     multi_buffer: list[str] = []
 
-    # TPS / timing tracking (delegated to TokenTimingTracker)
-    tracker = TokenTimingTracker()
+    # TPS / timing tracking (delegated to TokenTimingTracker). The tracker,
+    # the session clock and the last-turn stamps live on the agent so the
+    # shared /status can read them.
+    agent.tracker = TokenTimingTracker()
+    agent.session_start_time = time.time()
+    agent.last_turn_duration = None  # seconds
+    agent.last_turn_end_time = None  # epoch
     _processing_start_time: Optional[float] = None
-    _session_start_time: float = time.time()
-    _last_turn_duration: Optional[float] = None  # seconds
-    _last_turn_end_time: Optional[float] = None  # epoch
 
     # ── Event handlers ───────────────────────────────────────────────
     # Wire agent events to RichDisplay (chat content) and OutputController
     # (status notifications). Status goes through output_ctrl so it buffers
     # when the user is in input mode.
 
+    def _print_above_prompt(write) -> None:
+        """Run *write* and, if the user is at the prompt, redraw it after.
+
+        A deferred action (/load, /new_session) completes in the agent loop
+        while the REPL is parked at the ``> `` prompt. Printing there would
+        leave the text glued to the prompt with no new one after it, so
+        release the buffer, print, then redraw. Mid-turn the output is
+        already streaming, so just print.
+        """
+        if not output_ctrl.frozen:
+            write()
+            return
+        output_ctrl.unfreeze()
+        write()
+        sys.__stdout__.write("\n> ")
+        sys.__stdout__.flush()
+        output_ctrl.freeze()
+
     @agent.on_event
     async def on_status_change(event):
         if event.event != AgentEvent.STATUS_CHANGE or shutting_down:
             return
-        nonlocal _processing_start_time, _last_turn_duration, _last_turn_end_time
+        nonlocal _processing_start_time
         status = event.data.get("status", "")
         if status == "paused":
             output_ctrl.write("[paused]\n")
-            bell.on_pause()
+            bell.on_paused()
             return
         if status == "idle" and agent.messages:
-            tracker.turn_end()
+            agent.tracker.turn_end()
             bell.on_turn_end()
             # Duration notification
             if _processing_start_time:
                 elapsed = time.time() - _processing_start_time
-                _last_turn_duration = elapsed
-                _last_turn_end_time = time.time()
+                agent.last_turn_duration = elapsed
+                agent.last_turn_end_time = time.time()
                 # Unfreeze before writing — output may be frozen if we're
                 # resuming from pause (read_no_prompt/with_prompt froze it).
                 # Without this, completion message buffers forever.
@@ -520,7 +535,7 @@ async def run_repl(
                 sys.__stdout__.flush()
                 output_ctrl.freeze()
         elif status in ("waiting", "thinking", "processing", "tooling"):
-            tracker.turn_start()
+            agent.tracker.turn_start()
             bell.on_turn_start()
 
     @agent.on_event
@@ -532,16 +547,16 @@ async def run_repl(
     async def on_stream_start(event):
         if event.event != AgentEvent.STREAM_START or shutting_down:
             return
-        tracker.reset_stream()
+        agent.tracker.reset_stream()
 
     @agent.on_event
     async def on_token(event):
         if event.event != AgentEvent.ASSISTANT_TOKEN or shutting_down:
             return
         now = time.time()
-        if tracker.is_first_token:
+        if agent.tracker.is_first_token:
             display.start_response()
-        tracker.record_token(now)
+        agent.tracker.record_token(now)
         display.add_token(event.text or "")
 
     @agent.on_event
@@ -607,7 +622,7 @@ async def run_repl(
     async def on_token_usage(event):
         if event.event != AgentEvent.TOKEN_USAGE or shutting_down:
             return
-        result = tracker.compute_tps(event.data)
+        result = agent.tracker.compute_tps(event.data)
         if result is not None:
             output_ctrl.write(
                 f"  ({result.tps:.0f} tok/s,"
@@ -622,13 +637,31 @@ async def run_repl(
         success = event.data.get("success", False)
         message = event.data.get("message", "")
         incomplete = event.data.get("incomplete", False)
-        if success:
-            print(f"\n  {message}")
-            if incomplete:
-                print("  Warning: Incomplete turn detected. Use /resume to continue.")
-            _display_loaded_messages(agent)
-        else:
-            print(f"  Error: {message}")
+
+        def _show() -> None:
+            if success:
+                print(f"\n  {message}")
+                if incomplete:
+                    print(
+                        "  Warning: Incomplete turn detected. Use /resume to continue."
+                    )
+                _display_loaded_messages(agent)
+            else:
+                print(f"  Error: {message}")
+
+        # /load is deferred, so this lands while the user may be at the prompt.
+        _print_above_prompt(_show)
+
+    @agent.on_event
+    async def on_messages_cleared(event):
+        if event.event != AgentEvent.MESSAGES_CLEARED or shutting_down:
+            return
+        # A deferred clear (/new_session) landed at a safe boundary. The user
+        # is usually sitting at the prompt, so print above it and redraw -
+        # the same dance the turn-complete line does. Mid-turn the output is
+        # already streaming, so just write.
+        count = event.data.get("count", 0)
+        _print_above_prompt(lambda: print(f"  Cleared {count} messages"))
 
     @agent.on_event
     async def on_journal_result(event):
@@ -826,150 +859,83 @@ async def run_repl(
                 args_parts = user_input.split(maxsplit=1)
                 cmd_arg = args_parts[1] if len(args_parts) > 1 else ""
 
+                # Shared commands run from the registry. The chain below
+                # covers the ones this front-end implements itself.
+                shared = run_command(cmd.lstrip("/"), agent, cmd_arg)
+                if shared is not None:
+                    for line in shared.message.splitlines():
+                        # Indent the text, but leave blank lines blank rather
+                        # than emitting two spaces of trailing whitespace.
+                        print(f"  {line}" if line else "")
+                    # /provider leaves the async tail to the front-end: fetch
+                    # the new provider's models and show them.
+                    base_url = shared.data.get("base_url")
+                    if base_url:
+                        try:
+                            models = await fetch_models(agent.client)
+                            agent.available_models = models
+                            for line in format_model_list(models).splitlines():
+                                print(f"  {line}")
+                            print("  Use /model <name|number> to select")
+                        except Exception as e:
+                            print(f"  Warning: Could not fetch models: {e}")
+                    # /retry leaves its tail here too: the REPL re-queues the
+                    # text at once, where the TUI loads it into the input.
+                    user_text = shared.data.get("user_text")
+                    if user_text is not None:
+                        await agent.add_message(user_text)
+                    # /wrapup, /chain, /journal last|all queue an agent turn
+                    # the same way. Track the turn start so the idle handler
+                    # prints "[complete]" and re-shows the prompt.
+                    agent_message = shared.data.get("agent_message")
+                    if agent_message:
+                        text, kind, data = agent_message
+                        _processing_start_time = time.time()
+                        await agent.add_message(text, kind=kind, data=data)
+                    # /mcp connect|disconnect|reload: the action is async.
+                    mcp_action = shared.data.get("mcp_action")
+                    if mcp_action:
+                        _ok, mcp_message = await run_mcp_action(agent, mcp_action)
+                        print(f"  {mcp_message}")
+                    # /new_session: always deferred through the queue. The
+                    # confirmation comes from the MESSAGES_CLEARED handler
+                    # below, so the wording matches the TUI's.
+                    clear_mode = shared.data.get("clear_mode")
+                    if clear_mode:
+                        await agent.request_clear(mode=clear_mode)
+                    # /load: deferred through the queue; on_context_loaded
+                    # prints the result and re-displays the loaded messages.
+                    load_path = shared.data.get("load_path")
+                    if load_path:
+                        await agent.request_load(load_path)
+                    user_input = await loop.run_in_executor(None, read_with_prompt)
+                    continue
+
                 if cmd in ("/quit", "/exit"):
                     break
 
                 elif cmd == "/help":
-                    print("\n  Commands:")
-                    for c, desc in COMMANDS.items():
-                        print(f"    {c:12s}  {desc}")
+                    for section in format_help_sections(_REPL_LOCAL_COMMANDS):
+                        print(f"\n  {section.title}:")
+                        for entry in section.entries:
+                            print(f"    /{entry.name:22s} {entry.description}")
+                            for detail in entry.detail:
+                                print(f"      {detail}")
                     print("\n  Press Enter (empty line) to switch between modes.")
                     print("  - Streaming mode: output flows, no prompt.")
                     print(
                         "  - Input mode: prompt shown, output pauses, type your message."
                     )
 
-                elif cmd == "/status":
-                    from agent13.status import gather_status, format_duration
-                    import time as _time
-                    from datetime import datetime as _dt
-
-                    # Build last-turn info if available
-                    sd = gather_status(
-                        agent,
-                        provider,
-                        model,
-                        _session_start_time,
-                        prompt_manager,
-                        tracker,
-                    )
-                    # Add last-turn data from local tracking
-                    if _last_turn_duration is not None:
-                        sd.last_turn_duration = format_duration(_last_turn_duration)
-                        if _last_turn_end_time is not None:
-                            ago = format_duration(_time.time() - _last_turn_end_time)
-                            sd.last_turn_ago = f"{ago} ago"
-
-                    print()
-                    print("  Session")
-                    print(f"    status:    {sd.agent_status}")
-                    print(f"    run time:  {sd.run_time}")
-                    # Session age: original start (persisted in saves,
-                    # survives resume) + lifetime compaction total. Both
-                    # reset only on /new_session.
-                    if sd.session_started_at:
-                        try:
-                            _start = _dt.fromisoformat(sd.session_started_at)
-                            _age = format_duration(
-                                _time.time() - _start.timestamp()
-                            )
-                            print(
-                                f"    session:   "
-                                f"{_start.strftime('%Y-%m-%d %H:%M')} "
-                                f"({_age} ago) | chains: {sd.chain_count}"
-                            )
-                        except (ValueError, OSError):
-                            print(f"    chains:    {sd.chain_count}")
-                    else:
-                        print(f"    chains:    {sd.chain_count}")
-                    print(f"    cwd:       {sd.cwd}")
-                    if sd.focus_name:
-                        print(f"    focus:     {sd.focus_name}")
-                    if sd.last_turn_duration:
-                        print(
-                            f"    last turn: {sd.last_turn_duration} (completed {sd.last_turn_ago})"
-                        )
-                    if sd.turn_count > 0:
-                        print(
-                            f"    turns:     {sd.turn_count} | total processing: {sd.total_processing}"
-                        )
-                    print()
-                    print("  Provider")
-                    print(f"    provider:  {sd.provider}")
-                    print(f"    model:     {sd.model}")
-                    print(f"    prompt:    {sd.active_prompt}")
-                    print()
-                    print("  Context")
-                    print(f"    prompt tokens:       {sd.prompt_tokens_fmt}")
-                    print(f"    completion tokens:   {sd.completion_tokens_fmt}")
-                    print(f"    total tokens:        {sd.total_tokens_fmt}")
-                    print(f"    queue: {sd.queue_count}  messages: {sd.message_count}")
-                    print()
-                    print("  Connectivity")
-                    print(f"    mcp: {sd.mcp_status}")
-                    tools_str = (
-                        f"{sd.tool_successes}/{sd.tool_calls}"
-                        if sd.tool_calls > 0
-                        else "0"
-                    )
-                    print()
-                    print("  Tools")
-                    print(f"    success/calls: {tools_str}")
-                    print(f"    bounded: {sd.bounded_count}")
-                    print()
-                    print("  Settings")
-                    sandbox_suffix = (
-                        f" (pinned: {sd.sandbox_pinned})"
-                        if sd.sandbox_pinned is not None
-                        else ""
-                    )
-                    devel_suffix = (
-                        f" (pinned: {'on' if sd.devel_pinned else 'off'})"
-                        if sd.devel_pinned is not None
-                        else ""
-                    )
-                    print(f"    sandbox:           {sd.sandbox_mode}{sandbox_suffix}")
-                    print(
-                        f"    remove-api-reasoning: {'on' if sd.remove_reasoning else 'off'}"
-                    )
-                    print(
-                        f"    reasoning widgets: {'collapsed' if display.reasoning_collapsed else 'expanded'}"
-                    )
-                    print(
-                        f"    tool widgets:    {'collapsed' if display.toolview_collapsed else 'expanded'}"
-                    )
-                    print(
-                        f"    devel:             {'on' if sd.devel_mode else 'off'}{devel_suffix}"
-                    )
-                    print(f"    skills:            {'on' if sd.skills_mode else 'off'}")
-                    print(
-                        f"    journal:           {'on' if sd.journal_mode else 'off'}"
-                    )
-                    auto_ctx = (
-                        "off"
-                        if sd.auto_context_threshold == 0
-                        else f"{sd.auto_context_threshold:,} tokens"
-                    )
-                    print(f"    auto-context:      {auto_ctx}")
-                    print(f"    auto-action:       {sd.auto_context_action}")
-                    print(f"    auto-chain:        {sd.auto_context_chain}")
-                    print(
-                        f"    chains:            "
-                        f"{sd.auto_context_chain_used}/{sd.auto_context_chain}"
-                    )
-                    print(f"    nudges:            {sd.nudges}")
-                    print(f"    bell:              {bell.status_text()}")
-                    print(
-                        f"    bell-cmd:          {bell.command if bell.command else '(terminal bell)'}"
-                    )
-                    print()
-
                 elif cmd == "/pause":
                     if agent.is_paused:
                         print("  Already paused")
                     elif agent.is_pausing:
                         print("  Already pausing")
-                    elif agent.is_idle:
+                    elif not agent.has_pending_work:
+                        # has_pending_work, not is_idle: a message that was
+                        # just sent is queued but not yet started, and the
+                        # agent still reads idle for that window.
                         print("  Nothing to pause (agent is idle)")
                     else:
                         agent.pause()
@@ -1013,60 +979,6 @@ async def run_repl(
                     else:
                         print("  Nothing to stop")
 
-                elif cmd == "/save":
-                    result = execute_save(agent, cmd_arg)
-                    if result.success:
-                        print(f"  {result.message}")
-                    else:
-                        print(f"  {result.message}")
-
-                elif cmd == "/load":
-                    if not cmd_arg:
-                        # Show available saves
-                        names = list_save_names()
-                        if names:
-                            print("  Available saves:")
-                            for name in names:
-                                print(f"    {name}")
-                        else:
-                            print("  No saves found")
-                        print("  Usage: /load <name>")
-                    else:
-                        from agent13.persistence import (
-                            load_context,
-                            resolve_save_path,
-                        )
-
-                        path = resolve_save_path(cmd_arg)
-                        if not path.exists():
-                            print(f"  Not found: {path}")
-                            print(f"  Use /save {cmd_arg} to create it")
-                        else:
-                            # Check if agent is busy
-                            if not agent.is_idle:
-                                # Defer the load to a safe boundary
-                                await agent.request_load(str(path))
-                                print(
-                                    "  Load queued (will take effect after current response)"
-                                )
-                            else:
-                                # Load immediately
-                                try:
-                                    success, msg, incomplete = load_context(
-                                        agent, str(path)
-                                    )
-                                    if success:
-                                        print(f"  {msg}")
-                                        if incomplete:
-                                            print(
-                                                "  Warning: Incomplete turn. Use /resume to continue."
-                                            )
-                                        _display_loaded_messages(agent)
-                                    else:
-                                        print(f"  Error: {msg}")
-                                except Exception as e:
-                                    print(f"  Error loading: {e}")
-
                 elif cmd == "/multi":
                     in_multi_mode = True
                     multi_buffer = []
@@ -1096,486 +1008,35 @@ async def run_repl(
                             "Use /new_session to wipe."
                         )
 
-                elif cmd == "/new_session":
-                    # Destructive: wipe history + reset session identity
-                    # (compaction total + start time). Idle fast path is
-                    # immediate; mid-turn goes through the queue dispatch
-                    # (which resets the counters at the safe boundary).
-                    if agent.is_idle:
-                        count = agent.clear_messages()
-                        agent.reset_session_counters()
-                        print(f"  New session (cleared {count} messages)")
-                    else:
-                        await agent.request_clear(mode="all")
-                        print(
-                            "  New session queued (history + counters reset "
-                            "after current response)"
-                        )
+                elif cmd == "/pretty":
+                    def _set_pretty(value: bool) -> None:
+                        display.pretty = value
 
-                elif cmd == "/history":
-                    if not agent.messages:
-                        print("  No messages in history")
-                    else:
-                        groups = format_history_groups(agent)
-                        print(f"\n  Message history ({len(groups)} groups):\n")
-                        for g in groups:
-                            first_content = _sanitize(g.first_content)
-                            print(f"  {g.number:3d}. {g.first_role}: {first_content}")
-                            for entry in g.entries:
-                                if entry.role == "tool":
-                                    print(
-                                        f"         tool result: {_sanitize(entry.content, 80)}"
-                                    )
-                                elif entry.role == "assistant":
-                                    if entry.content:
-                                        print(
-                                            f"         assistant: {_sanitize(entry.content, 80)}"
-                                        )
-                                    for tc in entry.tool_calls:
-                                        print(
-                                            f"         tool call: {tc['name']}({_sanitize(tc['arguments'], 60)})"
-                                        )
-                                elif entry.is_interrupt:
-                                    print(
-                                        f"         interrupt: {_sanitize(entry.content)}"
-                                    )
-                                elif entry.is_injected:
-                                    print(
-                                        f"         injected: {_sanitize(entry.content)}"
-                                    )
-                                elif entry.content:
-                                    print(
-                                        f"         {entry.role}: {_sanitize(entry.content)}"
-                                    )
-                        print("\n  Use /delete h N to delete group N")
-
-                elif cmd == "/queue":
-                    items = format_queue_items(agent.queue)
-                    if not items:
-                        print("  Queue is empty")
-                    else:
-                        pending_count = sum(1 for it in items if not it.running)
-                        print(f"\n  Queue ({pending_count} pending):")
-                        for item in items:
-                            marker = ""
-                            if item.interrupt:
-                                marker = "!! "
-                            elif item.priority:
-                                marker = "!  "
-                            if item.running:
-                                # Running item: header line, no index number
-                                print(
-                                    f"  {marker}→ {_sanitize(item.text, 80)} (running)"
-                                )
-                            else:
-                                print(
-                                    f"  {marker}{item.index}. {_sanitize(item.text, 80)}"
-                                )
-
-                elif cmd == "/retry":
-                    result = execute_retry(agent)
-                    if result.success:
-                        await agent.add_message(result.data["user_text"])
-                    else:
-                        print(f"  {result.message}")
-
-                elif cmd == "/prioritise":
-                    result = execute_prioritise(agent, cmd_arg)
-                    print(f"  {result.message}")
-
-                elif cmd == "/deprioritise":
-                    result = execute_deprioritise(agent, cmd_arg)
-                    print(f"  {result.message}")
-
-                elif cmd == "/delete":
-                    result = execute_delete(agent, cmd_arg)
-                    if result.success:
-                        print(f"  {result.message}")
-                    else:
-                        print(f"  {result.message}")
-
-                elif cmd == "/journal":
-                    args = cmd_arg.strip().lower()
-                    if args == "on":
-                        agent.journal_mode = True
-                        print("  Journal mode enabled")
-                        print(
-                            "  Context will be compacted via reflection before each new message."
-                        )
-                    elif args == "off":
-                        agent.journal_mode = False
-                        print("  Journal mode disabled")
-                    elif args == "last":
-                        await agent.add_message("/journal last", kind="journal_last")
-                    elif args == "all":
-                        await agent.add_message("/journal all", kind="journal_all")
-                    elif args == "status" or not args:
-                        status = "on" if agent.journal_mode else "off"
-                        print(f"  Journal mode: {status}")
-                    else:
-                        print("  Usage: /journal [on|off|last|all|status]")
-                        print("    /journal on      - Enable context compaction")
-                        print("    /journal off     - Disable context compaction")
-                        print(
-                            "    /journal last    - Journal the most recent tool-using turn"
-                        )
-                        print(
-                            "    /journal all     - Journal all tool-using turns iteratively"
-                        )
-                        print("    /journal status  - Show current state")
-
-                elif cmd == "/compact":
-                    from agent13.prompts import resolve_compact_prompt
-
-                    arg = cmd_arg.strip()
-                    compact_prompt_text, error = resolve_compact_prompt(
-                        prompt_manager, arg
-                    )
-                    if error:
-                        for error_line in error.splitlines():
-                            print(f"  {error_line}")
-                    else:
-                        # Track turn start so the idle handler prints
-                        # "[complete]" and re-shows the prompt (same as the
-                        # normal message dispatch below).
-                        _processing_start_time = time.time()
-                        queued_text = f"/compact {arg}" if arg else "/compact"
-                        await agent.add_message(
-                            queued_text,
-                            kind="compact",
-                            data={
-                                "compact_prompt": compact_prompt_text,
-                                "user_specified_prompt": bool(arg),
-                            },
-                        )
-
-                elif cmd == "/wrapup":
-                    # Track turn start so the idle handler prints
-                    # "[complete]" and re-shows the prompt. Optional arg:
-                    # focus name (rest of line), becomes the authoritative
-                    # focus name for the {focus} files.
-                    _processing_start_time = time.time()
-                    arg = cmd_arg.strip()
-                    if arg:
-                        await agent.add_message(
-                            f"/wrapup {arg}",
-                            kind="wrapup",
-                            data={"focus_name": arg},
-                        )
-                    else:
-                        await agent.add_message("/wrapup", kind="wrapup")
-
-                elif cmd == "/focus":
-                    # /focus [NAME] - set the authoritative focus name
-                    # immediately (not queued): the name must land before
-                    # a threshold-triggered wrap-up builds its prompt, so
-                    # record targeting follows a mid-turn /focus. On an
-                    # empty history the durable records are seeded in;
-                    # no arg shows the current name. Unfreeze so the
-                    # notification is visible at the input prompt (output
-                    # is frozen there); re-freeze only if we were - a
-                    # mid-turn /focus must not freeze streaming output.
-                    was_frozen = output_ctrl.frozen
-                    output_ctrl.unfreeze()
-                    message, level = await agent.apply_focus_name(
-                        cmd_arg.strip()
-                    )
-                    color = {"warning": "yellow", "error": "red"}.get(
-                        level, "bright_blue"
-                    )
-                    output_ctrl.write(f"[{color}]{message}[/]\n")
-                    if was_frozen:
-                        output_ctrl.freeze()
-
-                elif cmd == "/chain":
-                    # /chain - manual chain restart: wrap-up (if stale)
-                    # → clear history → inject records. No AI calls when
-                    # the wrap-up is already current. "no-skills" drops
-                    # manually-loaded skills from this restart and forgets
-                    # them (the REPL has no /skillname, so it is a no-op
-                    # there today; kept for parity with the TUI).
-                    _processing_start_time = time.time()
-                    no_skills = (
-                        cmd_arg.strip().lower()
-                        .lstrip("-")
-                        .replace("-", "")
-                        .replace("_", "")
-                        == "noskills"
-                    )
-                    data = {"no_skills": True} if no_skills else {}
-                    await agent.add_message("/chain", kind="chain", data=data)
-                elif cmd == "/model":
-                    if not cmd_arg:
-                        # List available models
-                        if agent.available_models:
-                            print("\nAvailable models:")
-                            for i, name in enumerate(agent.available_models, 1):
-                                marker = " *" if name == agent.model else ""
-                                print(f"  {i}. {name}{marker}")
-                            print()
-                        else:
-                            print(
-                                "  No models loaded. Use /provider to switch providers."
-                            )
-                    else:
-                        model = resolve_model_selection(agent.available_models, cmd_arg)
-                        if model:
-                            agent.set_model(model)
-                            print(f"  Model set to: {model}")
-                        # resolve_model_selection prints its own error
-
-                elif cmd == "/provider":
-                    if not cmd_arg:
-                        names = get_provider_names()
-                        if not names:
-                            print("  No providers configured in ~/.agent13/config.toml")
-                            user_input = await loop.run_in_executor(
-                                None, read_with_prompt
-                            )
-                            continue
-                        # Determine current provider from client base_url
-                        current = ""
-                        try:
-                            current_url = str(agent.client.base_url)
-                            for name in names:
-                                prov = get_config().get_provider(name)
-                                if prov and prov.api_base.rstrip("/") in current_url:
-                                    current = name
-                                    break
-                        except Exception:
-                            pass
-                        print("\nAvailable providers:")
-                        for i, name in enumerate(names, 1):
-                            marker = " *" if name == current else ""
-                            print(f"  {i}. {name}{marker}")
-                        print()
-                        print("  Use /provider <name> to switch")
-                        user_input = await loop.run_in_executor(None, read_with_prompt)
-                        continue
-                    # Resolve numeric selection to provider name
-                    resolved = resolve_provider_selection(cmd_arg)
-                    if resolved is None:
-                        # resolve_provider_selection prints its own error
-                        user_input = await loop.run_in_executor(None, read_with_prompt)
-                        continue
-                    try:
-                        base_url, api_key, read_timeout, connect_timeout = (
-                            resolve_provider_arg(resolved)
-                        )
-                    except ValueError as e:
-                        print(f"  Error: {e}")
-                        user_input = await loop.run_in_executor(None, read_with_prompt)
-                        continue
-                    new_client = create_client(
-                        base_url,
-                        api_key,
-                        read_timeout=read_timeout,
-                        connect_timeout=connect_timeout,
-                    )
-                    agent.set_client(new_client)
-                    provider = (
-                        ""
-                        if resolved.startswith("http://")
-                        or resolved.startswith("https://")
-                        else resolved
-                    )
-                    print(f"  Provider changed to: {base_url}")
-                    # Fetch and display models
-                    try:
-                        models = await fetch_models(new_client)
-                        agent.available_models = models
-                        print("  Available models:")
-                        for i, name in enumerate(models, 1):
-                            print(f"    {i}. {name}")
-                        print()
-                        print("  Use /model <name|number> to select")
-                    except Exception as e:
-                        print(f"  Warning: Could not fetch models: {e}")
-
-                elif cmd == "/sandbox":
-                    args = cmd_arg.strip().lower()
-                    if not args:
-                        current = get_current_sandbox_mode()
-                        session = get_session_sandbox_mode()
-                        config_default = get_default_sandbox_mode()
-                        pinned = get_pinned_sandbox_mode()
-                        print("\n  Sandbox Configuration:")
-                        print(f"    Current mode: {current.value}")
-                        if session:
-                            print(f"    Session override: {session.value}")
-                        else:
-                            print("    Session override: none (using config default)")
-                        print(f"    Config default: {config_default.value}")
-                        if pinned:
-                            print(f"    Pinned: {pinned.value}")
-                        else:
-                            print("    Pinned: no")
-                        print()
-                        from agent13.sandbox import SandboxMode
-
-                        for mode in SandboxMode:
-                            print(f"    - {mode.value}")
-                        print()
-                        print("  /sandbox <mode>  set session mode")
-                        print("  /sandbox pin     pin current mode for this project")
-                        print("  /sandbox unpin   remove pin for this project")
-                    elif args == "pin":
-                        current = get_current_sandbox_mode()
-                        pin_sandbox_mode(current)
-                        print(
-                            f"  Pinned sandbox mode '{current.value}' for this project"
-                        )
-                        print(
-                            "  This mode will auto-apply on startup in this directory."
-                        )
-                    elif args == "unpin":
-                        if unpin_sandbox_mode():
-                            print("  Removed sandbox pin for this project")
-                        else:
-                            print("  No sandbox pin exists for this project")
-                    else:
-                        try:
-                            mode = parse_sandbox_mode(args)
-                            set_session_sandbox_mode(mode)
-                            print(f"  Sandbox mode set to: {mode.value}")
-                        except ValueError as e:
-                            print(f"  Error: {e}")
+                    result = execute_pretty(cmd_arg, display.pretty, _set_pretty)
+                    for line in result.message.splitlines():
+                        print(f"  {line}")
 
                 elif cmd in ("/reasoning", "/toolview"):
                     kind = cmd[1:]
                     current = (
-                        display.reasoning_collapsed
+                        agent.reasoning_collapsed
                         if kind == "reasoning"
-                        else display.toolview_collapsed
+                        else agent.toolview_collapsed
                     )
 
                     def _set_collapse(value: bool, _kind=kind) -> None:
+                        # The agent owns the value (/status reads it); the
+                        # display keeps the copy its renderers consult.
                         if _kind == "reasoning":
+                            agent.reasoning_collapsed = value
                             display.reasoning_collapsed = value
                         else:
+                            agent.toolview_collapsed = value
                             display.toolview_collapsed = value
 
                     result = execute_collapse(kind, cmd_arg, current, _set_collapse)
                     for line in result.message.splitlines():
                         print(f"  {line}")
-
-                elif cmd == "/devel":
-                    args = cmd_arg.strip().lower()
-                    if args == "on":
-                        agent.set_devel_mode(True)
-                        print("  Devel mode enabled")
-                        print("  Devel-group tools are now visible to the AI.")
-                    elif args == "off":
-                        agent.set_devel_mode(False)
-                        print("  Devel mode disabled")
-                        print("  Devel-group tools are now hidden from the AI.")
-                    elif args == "pin":
-                        enabled = agent.devel_mode
-                        pin_devel(enabled)
-                        state = "on" if enabled else "off"
-                        print(f"  Pinned devel mode '{state}' for this project")
-                        print(
-                            "  Devel mode will auto-apply on startup in this directory."
-                        )
-                    elif args == "unpin":
-                        if unpin_devel():
-                            print("  Removed devel pin for this project")
-                        else:
-                            print("  No devel pin exists for this project")
-                    elif args == "status" or not args:
-                        status = "on" if agent.devel_mode else "off"
-                        pinned = get_pinned_devel()
-                        print(f"  Devel mode: {status}")
-                        if pinned is not None:
-                            print(f"  Pinned: {'on' if pinned else 'off'}")
-                        else:
-                            print("  Pinned: no")
-                    else:
-                        status = "on" if agent.devel_mode else "off"
-                        print("  Usage: /devel [on|off|status|pin|unpin]")
-                        print("    /devel on      - Show devel-group tools to the AI")
-                        print("    /devel off     - Hide devel-group tools from the AI")
-                        print("    /devel status  - Show current state")
-                        print("    /devel pin     - Pin current state for this project")
-                        print("    /devel unpin   - Remove pin for this project")
-                        print(f"  Current: {status}")
-
-                elif cmd == "/tools":
-                    summary = get_tool_stats_summary(agent)
-                    if summary["total_calls"] == 0:
-                        print("  No tool calls yet this session")
-                    else:
-                        rate = summary["success_rate"]
-                        print(
-                            f"\n  Tool Usage  {summary['total_successes']}/{summary['total_calls']} successful ({rate:.0f}%)"
-                        )
-                        print()
-                        for tool in summary["per_tool"]:
-                            print(
-                                f"    {tool['name']}  {tool['successes']}/{tool['calls']}"
-                            )
-
-                elif cmd == "/mcp":
-                    args = cmd_arg.strip().lower()
-                    if args == "connect":
-                        if not agent._mcp_server_configs:
-                            print("  No MCP servers configured")
-                        else:
-                            try:
-                                mcp = await agent._ensure_mcp()
-                                if mcp:
-                                    info = await mcp.connect_all()
-                                    print(f"  MCP connected: {list(info.keys())}")
-                            except Exception as e:
-                                print(f"  MCP connect error: {e}")
-                    elif args == "disconnect":
-                        if not agent.mcp:
-                            print("  MCP not connected")
-                        else:
-                            await agent.disconnect_mcp()
-                            print("  MCP servers disconnected")
-                    elif args == "reload":
-                        if not agent.mcp:
-                            print("  MCP not initialized (no servers configured)")
-                        else:
-                            servers = await agent.mcp.reload()
-                            print(f"  MCP reconnected: {list(servers.keys())}")
-                    else:
-                        # List MCP servers
-                        if not agent.mcp:
-                            configured = len(agent._mcp_server_configs)
-                            print("\n  MCP Status:")
-                            print("    Status: Not initialized")
-                            print(f"    Configured servers: {configured}")
-                            print()
-                            print("  Use /mcp connect to connect to MCP servers.")
-                        else:
-                            servers = agent.mcp.get_server_info()
-                            if not servers:
-                                configured = len(agent._mcp_server_configs)
-                                print("\n  MCP Status:")
-                                print(f"    Configured servers: {configured}")
-                                print()
-                                print("  Use /mcp connect to connect to servers.")
-                            else:
-                                print(format_mcp_servers(servers, use_rich=False))
-
-                elif cmd == "/cwd":
-                    if cmd_arg:
-                        path_str = cmd_arg.strip().lstrip("@")
-                        path = os.path.abspath(os.path.expanduser(path_str))
-                        if not os.path.exists(path):
-                            print(f"  Path does not exist: {path}")
-                        elif not os.path.isdir(path):
-                            print(f"  Not a directory: {path}")
-                        else:
-                            try:
-                                os.chdir(path)
-                                print(f"  Changed directory: {path}")
-                            except OSError as e:
-                                print(f"  Cannot change directory: {e}")
-                    else:
-                        print(f"  {Path.cwd()}")
 
                 elif cmd == "/upgrade":
                     try:
@@ -1619,187 +1080,27 @@ async def run_repl(
                     except Exception as e:
                         print(f"  Update check failed: {e}")
 
-                elif cmd == "/polite":
-                    from agent13.commands import execute_polite
-
-                    result = execute_polite(agent, cmd_arg)
-                    if result.success:
-                        print(f"  {result.message}")
-                    else:
-                        # Usage/error — print multi-line message indented
-                        for line in result.message.splitlines():
-                            print(f"  {line}")
-
-                elif cmd == "/bell":
-                    args = cmd_arg.strip().lower()
-                    if not args:
-                        st = bell.status_text()
-                        if st == "off":
-                            print("  Bell: off")
-                        elif st == "always":
-                            print("  Bell: on (always)")
-                        else:
-                            print(f"  Bell: on ({st})")
-                    elif args == "off":
-                        bell.disable()
-                        print("  Bell: off")
-                    else:
-                        try:
-                            val = float(args)
-                            if val < 0:
-                                raise ValueError("negative")
-                            bell.set_threshold(val)
-                            if val == 0:
-                                print("  Bell: on (always)")
-                            else:
-                                print(f"  Bell: on ({val:.0f}s)")
-                        except ValueError:
-                            print("  Usage: /bell [N|off]")
-                            print("    /bell 30  - Ring bell after 30s")
-                            print("    /bell 0   - Always ring on idle")
-                            print("    /bell off - Disable bell")
-                            print("    /bell     - Show current status")
-
-                elif cmd == "/bell-command":
-                    args = cmd_arg.strip()
-                    if not args:
-                        if bell.command:
-                            print(f"  Bell command: {bell.command}")
-                        else:
-                            print("  Bell command: (terminal bell)")
-                    elif args.lower() == "off":
-                        bell.clear_command()
-                        print("  Bell command: cleared (terminal bell)")
-                    else:
-                        # Strip surrounding quotes if present
-                        if len(args) >= 2 and args[0] in "\"'" and args[-1] == args[0]:
-                            args = args[1:-1]
-                        if not bell.set_command(args):
-                            print(f"  Error: '{args.split()[0]}' is not executable")
-                            print("  The first token must be found in PATH.")
-                            print("  /bell-command off - Revert to terminal bell")
-                            print("  /bell-command     - Show current status")
-                        else:
-                            print(f"  Bell command: {args}")
-
-                elif cmd == "/auto_context_threshold":
-                    args = cmd_arg.strip()
-                    if not args:
-                        if agent.auto_context_threshold > 0:
-                            print(
-                                f"  Auto-context: on ({agent.auto_context_threshold:,} tokens)"
-                            )
-                            if agent.auto_context_action == "none":
-                                print("  Action: none (chain ignored)")
-                            else:
-                                print(
-                                    f"  Action: {agent.auto_context_action} "
-                                    f"(chain: {agent.auto_context_chain})"
-                                )
-                        else:
-                            print("  Auto-context: off (threshold 0)")
-                    else:
-                        try:
-                            threshold = parse_token_count(args)
-                            agent.auto_context_threshold = threshold
-                            if threshold == 0:
-                                print("  Auto-context: off")
-                            else:
-                                print(f"  Auto-context: on ({threshold:,} tokens)")
-                        except ValueError:
-                            print("  Usage: /auto_context_threshold [N|0]")
-                            print(
-                                "    /auto_context_threshold 150k - Compact at 150,000 tokens"
-                            )
-                            print("    /auto_context_threshold 0    - Disable")
-                            print(
-                                "    /auto_context_threshold      - Show current status"
-                            )
-
-                elif cmd == "/auto_context_action":
-                    args = cmd_arg.strip()
-                    if not args:
-                        print(
-                            f"  Auto-context action: {agent.auto_context_action} "
-                            "(valid: compact | report_and_compact | none)"
-                        )
-                    elif args in ("compact", "report_and_compact", "none"):
-                        agent.auto_context_action = args
-                        print(f"  Auto-context action: {args}")
-                    else:
-                        print(
-                            "  Usage: /auto_context_action "
-                            "[compact|report_and_compact|none]"
-                        )
-                        print(
-                            "    /auto_context_action compact - Full compact at the threshold"
-                        )
-                        print(
-                            "    /auto_context_action report_and_compact - Wrap up, report, then compact"
-                        )
-                        print(
-                            "    /auto_context_action none - Pause at the threshold (no action)"
-                        )
-                        print("    /auto_context_action - Show current value")
-
-                elif cmd == "/auto_context_chain":
-                    args = cmd_arg.strip()
-                    if not args:
-                        print(
-                            f"  Auto-context chain: {agent.auto_context_chain} "
-                            "(restarts per turn; 0 = stop after the action)"
-                        )
-                    else:
-                        try:
-                            chain = int(args)
-                            if chain < 0:
-                                raise ValueError("must be >= 0")
-                            agent.auto_context_chain = chain
-                            print(f"  Auto-context chain: {chain}")
-                        except ValueError:
-                            print("  Usage: /auto_context_chain [N]")
-                            print(
-                                "    /auto_context_chain 2 - Restart the turn up to 2 times per turn"
-                            )
-                            print("    /auto_context_chain   - Show current value")
-
-                elif cmd == "/auto_context_nudge_cap":
-                    args = cmd_arg.strip()
-                    if not args:
-                        cap = agent.auto_context_nudge_cap
-                        if cap > 0:
-                            print(
-                                f"  Degeneration guard: on (cap {cap} consecutive "
-                                "degenerate ends; nudges: "
-                                f"{agent.degenerate_nudges})"
-                            )
-                        else:
-                            print("  Degeneration guard: off (nudge cap 0)")
-                    else:
-                        try:
-                            nudge_cap = int(args)
-                            if nudge_cap < 0:
-                                raise ValueError("must be >= 0")
-                            agent.auto_context_nudge_cap = nudge_cap
-                            if nudge_cap == 0:
-                                print("  Degeneration guard: off (nudge cap 0)")
-                            else:
-                                print(f"  Degeneration guard cap: {nudge_cap}")
-                        except ValueError:
-                            print("  Usage: /auto_context_nudge_cap [N]")
-                            print(
-                                "    /auto_context_nudge_cap 2 - Stop after 2 consecutive degenerate ends"
-                            )
-                            print(
-                                "    /auto_context_nudge_cap 0 - Disable the guard"
-                            )
-                            print(
-                                "    /auto_context_nudge_cap   - Show current value"
-                            )
-
                 else:
-                    print(f"  Unknown command: {user_input}")
-                    print("  Type /help for available commands")
+                    # Dynamic /skillname: the shared helper loads the skill,
+                    # ratchets the tool on and queues the turn.
+                    from agent13.commands import execute_skill_invocation
+
+                    cmd_name = cmd[1:]
+                    cmd_args = user_input.split(maxsplit=1)
+                    cmd_args = cmd_args[1] if len(cmd_args) > 1 else ""
+                    skill_result = execute_skill_invocation(
+                        agent, cmd_name, cmd_args
+                    )
+                    if skill_result is not None:
+                        print(f"  {skill_result.message}")
+                        agent_message = skill_result.data.get("agent_message")
+                        if agent_message:
+                            text, kind, data = agent_message
+                            _processing_start_time = time.time()
+                            await agent.add_message(text, kind=kind, data=data)
+                    else:
+                        print(f"  Unknown command: {user_input}")
+                        print("  Type /help for available commands")
 
                 # Stay in input mode unless entering streaming mode
                 if not enter_streaming:
@@ -1827,6 +1128,14 @@ async def run_repl(
                 message_text = user_input
 
             if not message_text:
+                # A bare "!"/"!!" promotes the most recently queued item.
+                # It is a control, not a message: nothing is queued and
+                # nothing enters history.
+                if interrupt or priority:
+                    # print, not output_ctrl.write: the controller BUFFERS
+                    # while the user is at the prompt, and nothing unfreezes
+                    # it before the next turn - the hint would never appear.
+                    print(promote_latest(agent, interrupt))
                 user_input = await loop.run_in_executor(None, read_with_prompt)
                 continue
 
@@ -1841,7 +1150,7 @@ async def run_repl(
                 )
                 if interrupt:
                     output_ctrl.write(
-                        "[interrupt] Sent \u2014 will take over"
+                        "[steer] Sent \u2014 will take over"
                         " at next natural boundary\n"
                     )
                 else:

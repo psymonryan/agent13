@@ -90,7 +90,10 @@ def resolve_from_list(
 
 
 def resolve_model_selection(
-    model_names: list[str], choice: str, use_stderr: bool = False
+    model_names: list[str],
+    choice: str,
+    use_stderr: bool = False,
+    output=None,
 ) -> str | None:
     """Resolve a model selection by number or name, with optional alias.
 
@@ -107,12 +110,15 @@ def resolve_model_selection(
         model_names: List of available model names
         choice: User's choice (number, name, or name:alias)
         use_stderr: If True, print errors to stderr instead of stdout
+        output: File-like object for error messages. Overrides use_stderr -
+            pass a StringIO to capture the message instead of printing it.
 
     Returns:
         Selected model name (with alias re-attached if given), or None
         if ambiguous/not found
     """
-    output = sys.stderr if use_stderr else sys.stdout
+    if output is None:
+        output = sys.stderr if use_stderr else sys.stdout
 
     # No colon — resolve as before (unchanged behaviour)
     if ":" not in choice:
@@ -175,6 +181,19 @@ async def select_model(model_names: list[str], model_arg: str = None) -> str:
                 return model
         except EOFError:
             sys.exit(0)
+
+
+def format_model_list(model_names: list[str], current: str = "") -> str:
+    """Numbered model list as plain text, '*' marking the current model.
+
+    Both front-ends render this: the REPL prints it, the TUI shows it in the
+    info pane after a provider switch.
+    """
+    lines = ["Available models:"]
+    for i, name in enumerate(model_names, 1):
+        marker = " *" if name == current else ""
+        lines.append(f"  {i}. {name}{marker}")
+    return "\n".join(lines)
 
 
 def print_model_list(model_names: list[str], current: str = None):

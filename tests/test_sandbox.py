@@ -3,6 +3,7 @@
 import os
 import sys
 import asyncio
+import shlex
 import subprocess
 import tempfile
 import pytest
@@ -26,6 +27,19 @@ from agent13.sandbox import (
     get_temp_dir,
     _kill_process_tree,
 )
+
+
+def _invoke(exe, script):
+    """Build a shell command string that runs ``script`` with ``exe``.
+
+    run_sandboxed wraps the string in /bin/sh on POSIX and in PowerShell on
+    Windows, and the two need different quoting: two adjacent quoted strings
+    are a valid command in sh but a syntax error in PowerShell, which needs
+    the call operator (``&``).
+    """
+    if sys.platform == "win32":
+        return f'& "{exe}" "{script}"'
+    return f"{shlex.quote(str(exe))} {shlex.quote(str(script))}"
 
 
 class TestSandboxMode:
@@ -290,6 +304,53 @@ class TestRunSandboxed:
         """Should include sandbox mode in result."""
         result = run_sandboxed("echo test", SandboxMode.OFF)
         assert result["sandbox_mode"] == "off"
+
+    def test_undecodable_output_degrades_instead_of_erroring(self, tmp_path):
+        """Bytes the code page cannot map must not destroy the whole result.
+
+        The sync path used text=True, which decodes with the *locale* code
+        page (cp1252 on Windows, utf-8 elsewhere) and raises
+        UnicodeDecodeError on any byte it cannot map. The generic handler then
+        replaced the command's entire output with "Error running command: ..."
+        - the model saw an error instead of the output. The async path already
+        decoded with _decode_output (errors="replace"); the sync path now
+        matches it.
+        """
+        script = tmp_path / "emit_bad.py"
+        script.write_text(
+            "import sys\nsys.stdout.buffer.write(b'A\\xff\\xfeB\\n')\n",
+            encoding="utf-8",
+        )
+        result = run_sandboxed(_invoke(sys.executable, script), SandboxMode.OFF)
+
+        assert result["status"] == "completed"
+        assert result["success"] is True
+        assert "Error running command" not in result["stderr"]
+        # The ASCII around the undecodable bytes must survive
+        assert result["stdout"].startswith("A")
+        assert "B" in result["stdout"]
+
+    @pytest.mark.skipif(
+        sys.platform == "win32",
+        reason="PowerShell re-encodes native output through the console code "
+        "page, so exact UTF-8 text does not survive the wrapper",
+    )
+    def test_non_ascii_output_decodes_and_normalizes_newlines(self, tmp_path):
+        """UTF-8 output decodes correctly and CRLF becomes LF.
+
+        Same decode path as the async version, so tool output is
+        platform-consistent LF text.
+        """
+        script = tmp_path / "emit_utf8.py"
+        script.write_text(
+            "import sys\n"
+            "sys.stdout.buffer.write('caf\\u00e9 \\u2713 done\\r\\n'.encode('utf-8'))\n",
+            encoding="utf-8",
+        )
+        result = run_sandboxed(_invoke(sys.executable, script), SandboxMode.OFF)
+
+        assert result["success"] is True
+        assert result["stdout"] == "caf\u00e9 \u2713 done\n"
 
 
 class TestFormatFunctions:
@@ -721,9 +782,20 @@ class TestBashToolUseCases:
     @pytest.mark.skipif(
         sys.platform == "win32", reason="POSIX shell command (sleep)"
     )
-    async def test_timeout_message_reports_timeout_and_stdin_hint(self):
-        """Timeout message should report the actual timeout and hint at stdin."""
-        from agent13.sandbox import run_sandboxed_async, SandboxMode
+    async def test_timeout_message_reports_timeout_and_raise_hint(self):
+        """Timeout message reports the actual timeout and teaches the fix.
+
+        The message is deliberately short (the model pays for every token):
+        it names the timeout that fired, the unit (seconds) and the enforced
+        max, so the model can re-run with a larger value instead of
+        guessing. The stdin hint it used to carry was dropped on purpose -
+        don't re-add it here expecting the message to grow.
+        """
+        from agent13.sandbox import (
+            MAX_COMMAND_TIMEOUT,
+            run_sandboxed_async,
+            SandboxMode,
+        )
 
         result = await run_sandboxed_async(
             "sleep 10",
@@ -732,7 +804,10 @@ class TestBashToolUseCases:
         )
         assert result["timed_out"] is True
         assert "timed out after 0.5 seconds" in result["stderr"]
-        assert "stdin" in result["stderr"]
+        assert "larger timeout" in result["stderr"]
+        assert "SECONDS" in result["stderr"]
+        # The taught max must match the enforced max (one shared constant).
+        assert f"max {MAX_COMMAND_TIMEOUT:g}" in result["stderr"]
 
     @pytest.mark.asyncio
     @pytest.mark.skipif(
@@ -944,16 +1019,14 @@ class TestBashToolUseCases:
         assert result["stderr"] == "e\nf\n"
 
     @pytest.mark.asyncio
-    @pytest.mark.skipif(
-        sys.platform != "win32",
-        reason="Windows-only: the Windows spawn passes stdin=DEVNULL",
-    )
-    async def test_windows_child_stdin_is_devnull(self, tmp_path):
-        """The child's stdin is DEVNULL, not the harness's stdin pipe.
+    async def test_child_stdin_is_devnull(self, tmp_path):
+        """The child's stdin is DEVNULL, not the caller's stdin.
 
         A stdin-reading child must get an immediate EOF (fast, actionable
-        failure) - inheriting the REPL's stdin pipe stalled Windows children
-        in C-level startup (120 s tool timeout inside the REPL).
+        failure). On Windows, inheriting the REPL's stdin pipe stalled
+        children in C-level startup (120 s tool timeout inside the REPL); on
+        POSIX, inheriting a *tty* is worse - see
+        ``test_async_spawn_keeps_caller_stdio``.
         """
         from agent13.sandbox import SandboxMode, run_sandboxed_async
 
@@ -971,6 +1044,87 @@ class TestBashToolUseCases:
         assert result["success"] is True
         assert result["timed_out"] is False
         assert result["stdout"] == "got:''"
+
+    @pytest.mark.skipif(
+        sys.platform == "win32", reason="POSIX-only: needs a real PTY"
+    )
+    def test_async_spawn_keeps_caller_stdio(self, tmp_path):
+        """Spawning a command must not close the caller's fds 0/1/2.
+
+        Regression test for the TUI wedge. The child is a session leader
+        (start_new_session) with the caller's tty on stdin, so the /bin/sh it
+        runs adopts that tty as its controlling terminal; when it exits, macOS
+        revokes the tty and the PARENT's fds 0/1/2 are closed. Textual writes
+        the UI to fd 2, so its writer thread died on the next write, its
+        bounded queue filled, and the event loop blocked forever in
+        queue.put - a frozen TUI at ~100% CPU, on the first `command` tool
+        call. Fixed by stdin=DEVNULL.
+
+        The check has to run in a process whose stdio IS a tty: with a pipe
+        or /dev/null on stdin the child cannot take the terminal away, so the
+        bug is invisible (which is why the whole suite was green).
+        """
+        import pty  # POSIX-only: imported here so Windows collection works
+
+        repo_root = Path(__file__).resolve().parents[1]
+        helper = tmp_path / "stdio_helper.py"
+        report = tmp_path / "stdio_report.txt"
+        # The helper reports to a FILE: once the bug bites, its own stdout is
+        # gone, so a print-based report would be silently lost.
+        helper.write_text(
+            "import asyncio, os, sys\n"
+            f"sys.path.insert(0, {str(repo_root)!r})\n"
+            "from agent13.sandbox import run_sandboxed_async, SandboxMode\n"
+            "\n"
+            "REPORT = sys.argv[1]\n"
+            "\n"
+            "def state():\n"
+            "    out = []\n"
+            "    for fd in (0, 1, 2):\n"
+            "        try:\n"
+            "            os.fstat(fd)\n"
+            "            out.append(f'{fd}=ok')\n"
+            "        except OSError:\n"
+            "            out.append(f'{fd}=closed')\n"
+            "    return ' '.join(out)\n"
+            "\n"
+            "with open(REPORT, 'a') as f:\n"
+            "    f.write('before ' + state() + '\\n')\n"
+            "asyncio.run(run_sandboxed_async('echo hi', SandboxMode.OFF,"
+            " timeout=30))\n"
+            "with open(REPORT, 'a') as f:\n"
+            "    f.write('after ' + state() + '\\n')\n",
+            encoding="utf-8",
+        )
+
+        master_fd, slave_fd = pty.openpty()
+        try:
+            proc = subprocess.Popen(
+                [sys.executable, str(helper), str(report)],
+                stdin=slave_fd,
+                stdout=slave_fd,
+                stderr=slave_fd,
+                start_new_session=True,
+                close_fds=True,
+            )
+            os.close(slave_fd)
+            slave_fd = -1
+            # Drain the PTY so the helper never blocks writing to it.
+            while True:
+                try:
+                    if not os.read(master_fd, 4096):
+                        break
+                except OSError:
+                    break
+            proc.wait(timeout=60)
+        finally:
+            if slave_fd != -1:
+                os.close(slave_fd)
+            os.close(master_fd)
+
+        text = report.read_text(encoding="utf-8")
+        assert "before 0=ok 1=ok 2=ok" in text, text
+        assert "after 0=ok 1=ok 2=ok" in text, text
 
 
 class TestDecodeOutput:
@@ -1095,6 +1249,8 @@ class TestKillProcessTree:
             [sys.executable, "-c", script],
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             env=env,
         )
         assert r.returncode == 0, (

@@ -7,7 +7,9 @@ from pathlib import Path
 import pytest
 
 from agent13.config import Config
+from agent13.config_paths import get_records_dir
 from agent13.durable_records import DurableRecords
+from agent13.timing import TaskClock
 from agent13.persistence import (
     _ensure_ctx_stem,
     _is_incomplete_turn,
@@ -23,6 +25,11 @@ from agent13.persistence import (
     resolve_save_path,
     save_context,
 )
+
+
+def _mem(filename: str) -> str:
+    """The absolute path of a record file in the project's records directory."""
+    return str((get_records_dir() / filename).resolve())
 
 
 # ---------------------------------------------------------------------------
@@ -64,6 +71,9 @@ def _make_agent_stub(messages=None, model="test-model", system_prompt=""):
             self.durable_records = DurableRecords()
             self._chain_count = 0
             self._session_started_at = ""
+            # load_context resets the task clock (a loaded context is a new
+            # conversation); the real object, not a mirror.
+            self.task_clock = TaskClock()
 
         def mark_incomplete_turn(self, val):
             self._incomplete = val
@@ -666,8 +676,9 @@ class TestSaveLoadContext:
         assert agent2.prompt_tokens == 1234
         assert agent2.completion_tokens == 5678
 
-    def test_focus_name_round_trip(self, tmp_path):
+    def test_focus_name_round_trip(self, tmp_path, monkeypatch):
         """Save then load restores the explicit focus name + derived paths."""
+        monkeypatch.chdir(tmp_path)
         path = tmp_path / "focus.ctx"
         agent = _make_agent_stub(
             messages=[{"role": "user", "content": "hello"}],
@@ -679,11 +690,8 @@ class TestSaveLoadContext:
         ok, _, _ = load_context(agent2, path)
         assert ok is True
         assert agent2.durable_records.focus_name == "auto_context"
-        assert (
-            agent2.durable_records.truth_path
-            == "docs_archive/auto_context_current_truth.md"
-        )
-        assert agent2.durable_records.journal_path == "docs_archive/auto_context_journal.md"
+        assert agent2.durable_records.truth_path == _mem("auto_context_current_truth.md")
+        assert agent2.durable_records.journal_path == _mem("auto_context_journal.md")
 
     def test_focus_name_missing_in_old_save(self, tmp_path):
         """Old save files without focus_name don't break load."""
@@ -730,9 +738,10 @@ class TestSaveLoadContext:
         # No saved start -> the agent keeps its own (fresh) value
         assert agent._session_started_at == "2026-10-07T09:00:00"
 
-    def test_saved_focus_loses_to_explicit_focus(self, tmp_path):
+    def test_saved_focus_loses_to_explicit_focus(self, tmp_path, monkeypatch):
         """A focus already on the agent (e.g. --focus CLI flag) wins over the
         saved value - explicit user input is authoritative."""
+        monkeypatch.chdir(tmp_path)
         path = tmp_path / "saved_focus.ctx"
         agent = _make_agent_stub(
             messages=[{"role": "user", "content": "hello"}],
@@ -745,7 +754,7 @@ class TestSaveLoadContext:
         ok, _, _ = load_context(agent2, path)
         assert ok is True
         assert agent2.durable_records.focus_name == "cli_focus"
-        assert agent2.durable_records.truth_path == "docs_archive/cli_focus_current_truth.md"
+        assert agent2.durable_records.truth_path == _mem("cli_focus_current_truth.md")
 
     def test_no_saved_focus_keeps_agent_focus(self, tmp_path):
         """Loading a save without a focus name leaves an existing agent focus
@@ -1089,7 +1098,7 @@ class TestResolveSavePathSanitization:
     """resolve_save_path must never create subdirectories from bare names."""
 
     def test_bare_name_with_slash_stays_flat(self, monkeypatch, tmp_path):
-        """The c122 landmine: slash in name → single flat file, no subdir."""
+        """The slash landmine: slash in name → single flat file, no subdir."""
         monkeypatch.setenv("AGENT13_SAVES_DIR", str(tmp_path / "saves"))
         _patch_save_dirs(monkeypatch, tmp_path)
         path = resolve_save_path("glm5.3 flash fixes for pause / resume")

@@ -7,10 +7,17 @@ agent instance. Persistence is handled via atomic append to the dated file.
 
 import os
 import re
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 from agent13.config_paths import get_history_path as _get_history_path
+
+# How many dated history files to load at startup. Bounded by COUNT, not by
+# age: a fixed day window meant a project returned to after a longer gap had
+# no file inside the window, so its history silently vanished (edmac, an
+# 11-day gap, 2026-11-22). Files are small - the largest on a real machine
+# is ~87 KB, and a typical day is a few KB.
+HISTORY_LOAD_FILES = 20
 
 
 def _pid_alive(pid: int) -> bool:
@@ -157,26 +164,46 @@ class History:
 
         return str(_get_history_path(self.project_name, suffix))
 
-    def _get_path_for_date(self, date: datetime) -> str:
-        """Get the history file path for a specific date.
+    def _recent_paths(self, limit: int) -> list[str]:
+        """The most recent *limit* history files for this project, oldest first.
 
-        Uses _get_path() to get the base path format, then replaces the date.
+        Sorted on the date in the FILENAME, not on mtime: the name is the
+        authoritative day, so a file touched later (a restore, a clock
+        change) cannot reorder the history.
 
-        Args:
-            date: The date to get the path for.
-
-        Returns:
-            Path in format ~/.agent13/history/history-{project}[-test]-{YYYY-MM-DD}
+        The prefix is derived from ``_get_path()``, which already carries the
+        ``_test`` suffix when running under pytest - so a test run and a real
+        session never read each other's files.
         """
-        base_path = self._get_path()
-        # Replace the date portion (last 10 chars before extension if present,
-        # or just the last 10 chars if they match YYYY-MM-DD format)
-        date_str = date.strftime("%Y-%m-%d")
-        # The base path ends with -YYYY-MM-DD, find and replace that pattern
-        return re.sub(r"-\d{4}-\d{2}-\d{2}$", f"-{date_str}", base_path)
+        base = self._get_path()
+        directory = os.path.dirname(base)
+        # "history-edmac-2026-11-22"      -> "history-edmac-"
+        # "history-edmac_test-2026-11-22" -> "history-edmac_test-"
+        prefix = re.sub(r"\d{4}-\d{2}-\d{2}$", "", os.path.basename(base))
+        try:
+            names = os.listdir(directory)
+        except OSError:
+            return []
+
+        dated = []
+        for name in names:
+            if not name.startswith(prefix):
+                continue
+            date_part = name[len(prefix):]
+            if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", date_part):
+                continue
+            dated.append((date_part, name))
+
+        dated.sort()
+        return [os.path.join(directory, name) for _, name in dated[-limit:]]
 
     def _load_file(self) -> None:
-        """Load history from the last 7 days into file_items."""
+        """Load the most recent history files into file_items.
+
+        Bounded by COUNT, not by age (see HISTORY_LOAD_FILES): a fixed day
+        window meant a project returned to after a longer gap had no file
+        inside the window, so its history silently vanished.
+        """
         # If an explicit file path is set, only load from that single file
         if self._file_path:
             self._load_single_file(self._file_path)
@@ -187,15 +214,8 @@ class History:
             self._index = len(self.session_items)
             return
 
-        today = datetime.now()
-
-        # Load from oldest to newest day (6 days ago to today)
-        # This way items are added in chronological order
-        for days_ago in range(6, -1, -1):
-            date = today - timedelta(days=days_ago)
-            path = self._get_path_for_date(date)
-            if not os.path.exists(path):
-                continue
+        # Oldest first, so items are added in chronological order
+        for path in self._recent_paths(HISTORY_LOAD_FILES):
             self._load_single_file(path)
 
         # Reverse to get newest-first (file_items is now oldest-first)

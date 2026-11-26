@@ -162,6 +162,21 @@ def _build_manual_command(wheel_url: str) -> str:
     return f"uv tool install --force {wheel_url}"
 
 
+def _text(data) -> str:
+    """Decode captured subprocess bytes from uv.
+
+    uv writes UTF-8. Capturing with ``text=True`` decodes with the *locale*
+    code page instead (cp1252 on Windows) and raises UnicodeDecodeError on any
+    byte it cannot map - which turns a reportable failure into an unhandled
+    exception, or silently loses the installer's message.
+    """
+    if not data:
+        return ""
+    if isinstance(data, str):
+        return data
+    return data.decode("utf-8", errors="replace")
+
+
 def _find_scripts_dir() -> Optional[str]:
     """Find the Scripts directory containing the agent13 executables.
 
@@ -302,6 +317,16 @@ def _log(msg):
     except Exception:
         pass
 
+def _text(data):
+    # uv writes UTF-8. Decoding with the locale code page (the text=True
+    # default) raises UnicodeDecodeError on any byte it cannot map, which
+    # turns a reportable failure into an unhandled exception.
+    if not data:
+        return ""
+    if isinstance(data, str):
+        return data
+    return data.decode("utf-8", errors="replace")
+
 def _alive(pid):
     # Use tasklist (not ctypes OpenProcess, which returns stale handles in
     # detached processes) to check if the PID is alive.
@@ -309,9 +334,13 @@ def _alive(pid):
         try:
             result = subprocess.run(
                 ["tasklist", "/FI", "PID eq %d" % pid],
-                capture_output=True, text=True, timeout=5,
+                capture_output=True, timeout=5,
             )
-            return str(pid) in result.stdout
+            # Bytes, not text: tasklist writes the OEM code page and a
+            # locale-code-page decode raises UnicodeDecodeError on any byte it
+            # cannot map. The PID is ASCII, so search the raw bytes and skip
+            # the encoding question entirely.
+            return str(pid).encode("ascii") in (result.stdout or b"")
         except Exception:
             return True  # assume alive on error (keep waiting)
     try:
@@ -375,10 +404,10 @@ def main():
         try:
             result = subprocess.run(
                 [uv, "tool", "install", "--force", wheel],
-                capture_output=True, text=True, timeout=300,
+                capture_output=True, timeout=300,
             )
             ok = result.returncode == 0
-            detail = (result.stderr or result.stdout or "").strip()
+            detail = (_text(result.stderr) or _text(result.stdout)).strip()
         except Exception as e:  # noqa: BLE001 - report any failure
             ok = False
             detail = str(e)
@@ -479,11 +508,11 @@ def _find_helper_python() -> str:
         result = subprocess.run(
             ["uv", "python", "find"],
             capture_output=True,
-            text=True,
             timeout=15,
         )
-        if result.returncode == 0 and result.stdout.strip():
-            candidates.append(result.stdout.strip())
+        found = _text(result.stdout).strip()
+        if result.returncode == 0 and found:
+            candidates.append(found)
     except (OSError, subprocess.SubprocessError):
         pass
     # 2. System python on PATH
@@ -649,8 +678,7 @@ def format_update_notice(info: dict) -> str:
     lines = [
         f">> Update available: {remote_tag} (you have {local_version})",
         "",
-        "  From TUI use:  /upgrade",
-        "  Or run:        agent13 --upgrade",
+        "  Run:           agent13 --upgrade",
     ]
     if manual_cmd:
         lines.append(f"  Or run:        {manual_cmd}")
@@ -965,7 +993,6 @@ def perform_update(
         result = subprocess.run(
             ["uv", "tool", "install", "--force", tmp_path],
             capture_output=True,
-            text=True,
             timeout=120,
         )
         if result.returncode == 0:
@@ -982,7 +1009,7 @@ def perform_update(
         # process.  The packages are already installed at this point --
         # only the tiny launcher exe wasn't refreshed.  Since the
         # launcher is version-agnostic, the old one works fine.
-        stderr = result.stderr.strip()
+        stderr = _text(result.stderr).strip()
         if os.name == "nt" and "Failed to install entrypoint" in stderr:
             # Packages installed successfully, entrypoint just wasn't
             # refreshed.  Clean up old Scripts dir and report success.

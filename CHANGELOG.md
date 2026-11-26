@@ -5,6 +5,43 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.0] - 2026-11-26
+
+### Added
+
+- **Factory mode** - `/grind <duration> [goal]` arms a goal window. The agent keeps working instead of idling, and asks you only when a decision is yours. `/grind off` stops the window and keeps the goal text; `/grind clear` forgets the text.
+- **Mind-map tools** - `read_map`, `edit_map`, `create_map` and `check_map` read, edit, create and validate `.itmz` (iThoughtsX) mind maps. Topics have short addresses; long text is paged with `text_offset`.
+- **Default-skills sync** - new and updated bundled skills install at startup. Skills you modified are never overwritten. `/skills refresh` re-syncs on demand; add `-y` to overwrite your changes.
+- **Five new default skills** - grilling, retro, project-cleanup-audit, project-folder-structure and project-improve-architecture. Updated: create-agents-md, deep-researcher, get-new-skill and manage-skills. (some adapted from Matt Pockocks skills)
+- **Queue promotion** - an empty `!` or `!!` promotes the newest queued message to a steer.
+- **Pause bell** - a pause now rings the terminal bell (respects `--bell off`).
+- **Mid-session clock** - the model learns the current time during the session, not only at startup.
+- **Task clock** - the status bar shows the task duration (`dur:`). It survives wrap-ups and excludes pause time.
+- **Status bar colours from config** - `[ui]` keys set the bar and context-warning colours. The context segment turns yellow at 80% and red at 90% of the threshold.
+- **Auto-save on idle** - `[auto_save] idle_seconds` (or `--auto-save-idle`) writes the daily save once after an idle period.
+
+### Fixed
+
+- Terminal focus: the input cursor hides when the terminal loses focus, and the TUI skips the blur repaint if you are using tmux. 
+- `@path` completion keeps the directory level when you cycle, and typing a directory name no longer drops it from the path.
+- The total processing time in `/status` is now correct across status changes.
+- The context estimate in the status bar is now correct after `/load` and `/clear`.
+- Polite mode: `/polite off` ends a lock wait instead of winning it later, and the TUI clears its wait overlay when a wait ends without the lock.
+- `/pause` now works while a message is queued but not yet started.
+- Windows: the updater and the sandbox decode subprocess output as UTF-8 or the OEM code page, not the locale code page.
+- The command tool no longer gives its child process the TUI's stdin. A child could close the TUI's file descriptors.
+- Auto-context always points the agent at its records after a restart.
+- The startup record now carries every topic the last handoff named, and a wrap-up can no longer quote the agent's own next step as a user instruction.
+- Batch mode (`-p`) now honours `--journal` and the `--auto-context-*` flags.
+
+### Changed
+
+- The truth file has a new format: topics with numbered addresses, a cap of 48 topics, and an Open tickets section the agent re-ranks (a line starting `h.` records its own re-rank decisions). A wrap-up ends with a machine-readable handoff, and the next session loads a topic index plus the tickets instead of the whole record.
+- The word "Interrupt" is now "Steer" in the interface text.
+- The TUI keeps at most 40 chat messages as live widgets, so long sessions stay fast. You can always bring them all into the chat with a `/rebuild` command.
+- All slash commands share one registry, so each command behaves the same in the TUI and the REPL. `/pretty` is removed from the TUI (markdown always renders), and `/upgrade` is removed from the TUI (use `agent13 --upgrade`).
+- The command tool accepts timeouts up to 1200 seconds and explains the seconds unit in its errors.
+
 ## [0.6.0] - 2026-10-11
 
 ### Added

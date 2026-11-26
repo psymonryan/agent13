@@ -470,8 +470,8 @@ class TestContinueIncompleteJournalReflection:
     (journal.maybe_reflect_after_turn) never runs for a resumed turn.
     Without the equivalent call here, a resumed turn's tool work stays
     un-compacted and the NEXT turn's retrospective_compact fires the
-    reflection before the user's new message is processed (10-06 edmac
-    incident: 163k-token prefill, 10-min delay on a simple question).
+    reflection before the user's new message is processed (observed
+    2026-10-06: 163k-token prefill, 10-min delay on a simple question).
     The call is unconditional — maybe_reflect_after_turn's internal
     guards (journal mode, tool calls, interrupt) make it a no-op when
     not applicable.

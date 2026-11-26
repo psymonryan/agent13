@@ -10,7 +10,7 @@ if TYPE_CHECKING:
 
 from agent13.skills.models import SkillInfo, SkillMetadata
 from agent13.skills.parser import parse_frontmatter
-from agent13.config_paths import _ensure_dir, get_skills_dir
+from agent13.config_paths import get_skills_dir
 
 logger = getLogger(__name__)
 
@@ -18,42 +18,22 @@ logger = getLogger(__name__)
 PROJECT_SKILLS_DIR = Path.cwd() / ".agent13" / "skills"
 GLOBAL_SKILLS_DIR = get_skills_dir()
 
-# Default skills bundled with the package
-DEFAULT_SKILLS_DIR = Path(__file__).parent.parent / "default_skills"
+# Default skills bundled with the package. The constant's home is
+# skills/defaults.py (the sync lives there); re-exported here so any
+# importer of manager.DEFAULT_SKILLS_DIR keeps working.
+from agent13.skills.defaults import DEFAULT_SKILLS_DIR  # noqa: E402, F401
+from agent13.skills.defaults import sync_default_skills  # noqa: E402, F401
 
 
 def ensure_default_skills() -> None:
-    """Copy default skills to user's skills directory if it's empty.
+    """Deprecated alias for sync_default_skills() (report ignored).
 
-    This provides starter skills for new users.
+    The old seed-into-empty-dir rule is gone: the sync installs new
+    defaults even when the user has skills, updates bundled ones whose
+    bytes still match the manifest, and never touches locally-modified
+    copies. See skills/defaults.py.
     """
-    # Check if user's skills directory exists and has content
-    if GLOBAL_SKILLS_DIR.exists():
-        existing_skills = list(GLOBAL_SKILLS_DIR.glob("*/SKILL.md"))
-        if existing_skills:
-            return  # User already has skills
-
-    # Check if we have default skills to copy
-    if not DEFAULT_SKILLS_DIR.exists():
-        return
-
-    # Create user's skills directory
-    _ensure_dir(GLOBAL_SKILLS_DIR)
-
-    # Copy each skill directory
-    for skill_dir in DEFAULT_SKILLS_DIR.iterdir():
-        if skill_dir.is_dir():
-            dest = GLOBAL_SKILLS_DIR / skill_dir.name
-            if not dest.exists():
-                try:
-                    import shutil
-
-                    shutil.copytree(skill_dir, dest)
-                    logger.info("Copied default skill: %s", skill_dir.name)
-                except OSError as e:
-                    logger.warning(
-                        "Failed to copy default skill %s: %s", skill_dir.name, e
-                    )
+    sync_default_skills()
 
 
 # Files/directories to exclude from bundled files listing
@@ -125,6 +105,16 @@ class SkillManager:
     def get_skill(self, name: str) -> SkillInfo | None:
         """Get a skill by name, or None if not found."""
         return self._skills.get(name)
+
+    def rescan(self) -> None:
+        """Re-discover skills from the search paths.
+
+        Skills are cached at construction, so /skills refresh calls this
+        after changing files on disk - otherwise the session keeps serving
+        the pre-refresh content until restart.
+        """
+        self._search_paths = self._compute_search_paths()
+        self._skills = self._discover_skills()
 
     def load_skill_content(self, name: str) -> str | None:
         """Load the full SKILL.md content for a skill."""

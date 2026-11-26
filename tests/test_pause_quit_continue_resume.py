@@ -305,6 +305,7 @@ class TestJITRepair:
             tools,
             tool_choice=None,
             session_date=None,
+            session_started_at=None,
         ):
             seen["messages"] = [dict(m) for m in messages]
             seen["tool_choice"] = tool_choice
@@ -372,6 +373,7 @@ class TestJITRepair:
             tools,
             tool_choice=None,
             session_date=None,
+            session_started_at=None,
         ):
             seen["messages"] = [dict(m) for m in messages]
             yield "content", "ok"
@@ -416,6 +418,7 @@ class TestJITRepair:
             tools,
             tool_choice=None,
             session_date=None,
+            session_started_at=None,
         ):
             seen["messages"] = [dict(m) for m in messages]
             yield "content", "ok"
@@ -459,6 +462,7 @@ class TestJITRepair:
             tools,
             tool_choice=None,
             session_date=None,
+            session_started_at=None,
         ):
             seen["messages"] = [dict(m) for m in messages]
             yield "content", "ok"
@@ -510,6 +514,7 @@ class TestContinueUserTail:
             tools,
             tool_choice=None,
             session_date=None,
+            session_started_at=None,
         ):
             seen["messages"] = [dict(m) for m in messages]
             yield "content", "ok"

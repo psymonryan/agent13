@@ -319,6 +319,131 @@ class TestGetSkillsSection:
         assert alpha_pos < middle_pos < zebra_pos
 
 
+class TestDisableModelInvocation:
+    """Tests for the disable-model-invocation frontmatter field.
+
+    A flagged skill is excluded from get_skills_section() (the model never
+    sees it) but stays fully resolvable for explicit invocation: the /name
+    slash command and the skill(name) tool call both still load it.
+    """
+
+    def _make_flagged_manager(self, tmp_path):
+        """Fixture skill with disable-model-invocation: true, via config
+        skill_paths (not the live global dir)."""
+        skill_dir = tmp_path / "flagged-skill"
+        skill_dir.mkdir()
+        (skill_dir / "SKILL.md").write_text(
+            "---\n"
+            "name: flagged-skill\n"
+            "description: A user-invoked only skill\n"
+            "disable-model-invocation: true\n"
+            "---\n"
+            "\n"
+            "## Flagged skill body\n"
+        )
+
+        def mock_config():
+            class MockConfig:
+                skill_paths = [tmp_path]
+                include_skills = False
+
+            return MockConfig()
+
+        return SkillManager(mock_config)
+
+    def test_metadata_default_false(self):
+        """Field is optional; absent key parses to False."""
+        meta = SkillMetadata(name="x-skill", description="d")
+        assert meta.disable_model_invocation is False
+
+    def test_metadata_hyphenated_alias_binds(self):
+        """The hyphenated YAML key binds via alias."""
+        meta = SkillMetadata.model_validate(
+            {
+                "name": "x-skill",
+                "description": "d",
+                "disable-model-invocation": True,
+            }
+        )
+        assert meta.disable_model_invocation is True
+
+    def test_from_metadata_passes_through(self, tmp_path):
+        """SkillInfo mirrors the field via from_metadata()."""
+        skill_path = tmp_path / "x-skill" / "SKILL.md"
+        skill_path.parent.mkdir(parents=True)
+        meta = SkillMetadata.model_validate(
+            {
+                "name": "x-skill",
+                "description": "d",
+                "disable-model-invocation": True,
+            }
+        )
+        info = SkillInfo.from_metadata(meta, skill_path)
+        assert info.disable_model_invocation is True
+
+    def test_discovery_sets_field(self, tmp_path):
+        """Discovery via SkillManager picks the flag up from frontmatter."""
+        manager = self._make_flagged_manager(tmp_path)
+        assert "flagged-skill" in manager.skills
+        assert manager.skills["flagged-skill"].disable_model_invocation is True
+
+    def test_flagged_absent_from_skills_section(self, tmp_path):
+        """Flagged skill is omitted from get_skills_section() output."""
+        from agent13.prompts import get_skills_section
+
+        manager = self._make_flagged_manager(tmp_path)
+        result = get_skills_section(manager.skills)
+        assert "flagged-skill" not in result
+        assert "A user-invoked only skill" not in result
+
+    def test_unflagged_skills_unchanged(self, tmp_path):
+        """Without the flag, section output is byte-identical to the
+        pre-field behaviour (name + description rendered)."""
+        from agent13.prompts import get_skills_section
+
+        skill_dir = tmp_path / "plain-skill"
+        skill_dir.mkdir()
+        (skill_dir / "SKILL.md").write_text(
+            "---\nname: plain-skill\ndescription: A plain skill\n---\n"
+        )
+
+        def mock_config():
+            class MockConfig:
+                skill_paths = [tmp_path]
+                include_skills = False
+
+            return MockConfig()
+
+        manager = SkillManager(mock_config)
+        result = get_skills_section(manager.skills)
+        assert "<name>plain-skill</name>" in result
+        assert "<description>A plain skill</description>" in result
+
+    def test_flagged_still_resolvable(self, tmp_path):
+        """Flagged skill resolves via get_skill() and load_skill_content()."""
+        manager = self._make_flagged_manager(tmp_path)
+        info = manager.get_skill("flagged-skill")
+        assert info is not None
+        content = manager.load_skill_content("flagged-skill")
+        assert content is not None
+        assert "## Flagged skill body" in content
+
+    def test_flagged_active_skill_carried_across_restart(self, tmp_path):
+        """A flagged skill loaded explicitly is re-injected on chain restart
+        (_format_active_skills_section is untouched by the filter)."""
+        from agent13.core import Agent
+
+        manager = self._make_flagged_manager(tmp_path)
+        content = manager.format_skill_content("flagged-skill")
+        assert content is not None
+
+        agent = Agent.__new__(Agent)  # avoid full init; only need _active_skills
+        agent._active_skills = {}
+        agent.note_skill_loaded("flagged-skill", content)
+        section = agent._format_active_skills_section()
+        assert "## Flagged skill body" in section
+
+
 class TestSkillTool:
     """Tests for the skill tool."""
 

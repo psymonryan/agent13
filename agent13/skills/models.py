@@ -26,6 +26,12 @@ class SkillMetadata(BaseModel):
     license: str | None = Field(default=None)
     compatibility: str | None = Field(default=None, max_length=500)
     metadata: dict[str, Any] = Field(default_factory=dict)
+    disable_model_invocation: bool = Field(
+        default=False,
+        alias="disable-model-invocation",
+        description="Exclude from the system-prompt skills list; still "
+        "loadable via /name or skill(name).",
+    )
 
 
 class SkillInfo(BaseModel):
@@ -36,6 +42,7 @@ class SkillInfo(BaseModel):
     license: str | None = None
     compatibility: str | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
+    disable_model_invocation: bool = False
     skill_path: Path  # Path to SKILL.md file
 
     model_config = {"arbitrary_types_allowed": True}
@@ -53,5 +60,6 @@ class SkillInfo(BaseModel):
             license=meta.license,
             compatibility=meta.compatibility,
             metadata=meta.metadata,
+            disable_model_invocation=meta.disable_model_invocation,
             skill_path=skill_path.resolve(),
         )

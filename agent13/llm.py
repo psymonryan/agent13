@@ -166,6 +166,7 @@ async def stream_response(
     system_prompt: str = None,
     response_format: dict = None,
     session_date: str | None = None,
+    session_started_at: str | None = None,
 ) -> AsyncGenerator[tuple[str, str], None]:
     """Stream a response from the model.
 
@@ -183,7 +184,9 @@ async def stream_response(
         Tuples of (token_type, content)
     """
     # Build messages with system prompt
-    api_messages = build_messages_with_system(messages, system_prompt, session_date)
+    api_messages = build_messages_with_system(
+        messages, system_prompt, session_date, session_started_at
+    )
 
     api_params = {"model": model, "messages": api_messages, "stream": True}
 
@@ -192,7 +195,7 @@ async def stream_response(
 
     # Log API request with structural fingerprint
     api_messages_built = build_messages_with_system(
-        messages, system_prompt, session_date
+        messages, system_prompt, session_date, session_started_at
     )
     role_sequence = "".join(m.get("role", "?")[0] for m in api_messages_built)
     log_api_request(
@@ -236,6 +239,7 @@ async def stream_response_complete(
     system_prompt: str = None,
     response_format: dict = None,
     session_date: str | None = None,
+    session_started_at: str | None = None,
 ) -> tuple[str, str]:
     """Stream a response and return the complete content and reasoning.
 
@@ -253,7 +257,13 @@ async def stream_response_complete(
     reasoning = ""
 
     async for token_type, token in stream_response(
-        client, model, messages, system_prompt, response_format, session_date
+        client,
+        model,
+        messages,
+        system_prompt,
+        response_format,
+        session_date,
+        session_started_at,
     ):
         if token_type == "content":
             content += token
@@ -270,6 +280,7 @@ async def get_initial_response(
     system_prompt: str = None,
     tools: list[dict] = None,
     session_date: str | None = None,
+    session_started_at: str | None = None,
 ) -> tuple[ChatCompletionMessage, dict | None]:
     """Get initial response from model (non-streaming).
 
@@ -284,7 +295,9 @@ async def get_initial_response(
         Tuple of (response message, token usage dict or None)
         Token usage dict contains: prompt_tokens, completion_tokens, total_tokens
     """
-    api_messages = build_messages_with_system(messages, system_prompt, session_date)
+    api_messages = build_messages_with_system(
+        messages, system_prompt, session_date, session_started_at
+    )
 
     params = {
         "model": model,
@@ -314,10 +327,25 @@ async def get_initial_response(
     return response.choices[0].message, tokens
 
 
+def _format_started_at(value: str) -> str:
+    """``%Y-%m-%d %H:%M`` for an ISO datetime; the value unchanged otherwise.
+
+    The wrap-up prompt already stamps ``now`` in this format
+    (``Agent._report_and_compact``), so the model sees ONE time format
+    everywhere. A value that does not parse is passed through rather than
+    raising: the system prompt is not worth failing a turn over.
+    """
+    try:
+        return datetime.datetime.fromisoformat(value).strftime("%Y-%m-%d %H:%M")
+    except (TypeError, ValueError):
+        return str(value)
+
+
 def build_messages_with_system(
     messages: list[dict],
     system_prompt: str = None,
     session_date: str | None = None,
+    session_started_at: str | None = None,
 ) -> list[dict]:
     """Build messages list with system prompt prepended.
 
@@ -327,6 +355,12 @@ def build_messages_with_system(
         session_date: ISO date string for the session start date.
             If None, defaults to today. Using a stable session date
             prevents midnight date changes from invalidating the KV cache.
+        session_started_at: ISO datetime for the session start. Takes
+            precedence over ``session_date`` and is shown with the time.
+            The prompt's clock is FROZEN here for the whole session: a
+            mid-session rewrite would invalidate the KV-cache prefix, so
+            "now" is refreshed by injected messages instead (see
+            ``Agent._inject_datetime_nudge``).
 
     Returns:
         New list with system message first, followed by conversation
@@ -334,12 +368,15 @@ def build_messages_with_system(
     if system_prompt is None:
         system_prompt = DEFAULT_PROMPT
 
-    # Inject session date and working directory at the start of the system prompt.
-    # Uses session_date (stable for the session) instead of today() to avoid
-    # midnight date changes that would invalidate the KV cache prefix.
-    date_str = session_date or datetime.date.today().isoformat()
+    # Inject session start and working directory at the start of the system
+    # prompt. Uses the session's start stamp (stable for the session) instead of
+    # today() to avoid midnight changes that would invalidate the KV cache prefix.
+    if session_started_at:
+        started = _format_started_at(session_started_at)
+    else:
+        started = session_date or datetime.date.today().isoformat()
     cwd = str(Path.cwd())
-    system_prompt = f"Session started {date_str}\nWorking directory: {cwd}\n\n{system_prompt}"
+    system_prompt = f"Session started {started}\nWorking directory: {cwd}\n\n{system_prompt}"
 
     # Append cached AGENTS.md content if available
     if _AGENTS_MD_CACHE:
@@ -547,6 +584,7 @@ async def stream_response_with_tools(
     tools: list[dict] = None,
     tool_choice: str = "auto",
     session_date: str | None = None,
+    session_started_at: str | None = None,
 ) -> AsyncGenerator[tuple[str, str | dict], None]:
     """Stream a response from the model, handling tool calls.
 
@@ -571,7 +609,9 @@ async def stream_response_with_tools(
     Yields:
         Tuples of (event_type, data)
     """
-    api_messages = build_messages_with_system(messages, system_prompt, session_date)
+    api_messages = build_messages_with_system(
+        messages, system_prompt, session_date, session_started_at
+    )
 
     api_params = {
         "model": model,

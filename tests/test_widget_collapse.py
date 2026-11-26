@@ -19,7 +19,7 @@ from unittest.mock import patch
 import pytest
 
 from agent13.cli import _resolve_widget_collapse
-from agent13.commands import execute_collapse
+from agent13.commands import execute_collapse, execute_pretty
 from agent13.config import Config
 from agent13.pins import (
     SECTION_REASONING,
@@ -291,6 +291,54 @@ class TestCollapseStatus:
         with patch("agent13.config.get_config", return_value=Config()):
             execute_collapse("reasoning", "", True, s.set)
         assert s.set_calls == []
+
+
+# =============================================================================
+# execute_pretty - the shared /pretty implementation
+# =============================================================================
+
+
+class TestPrettyVerbs:
+    def test_bare_toggles_on_to_off(self):
+        s = _Session(True)
+        result = execute_pretty("", s.collapsed, s.set)
+        assert result.success is True
+        assert s.collapsed is False
+        assert result.data["pretty"] is False
+        assert "Pretty mode: off" in result.message
+
+    def test_bare_toggles_off_to_on(self):
+        s = _Session(False)
+        result = execute_pretty("", s.collapsed, s.set)
+        assert s.collapsed is True
+        assert "Pretty mode: on" in result.message
+
+    def test_on_and_off_are_absolute(self):
+        s = _Session(False)
+        execute_pretty("on", s.collapsed, s.set)
+        assert s.collapsed is True, "on must not toggle an already-on setting"
+
+        s = _Session(True)
+        execute_pretty("off", s.collapsed, s.set)
+        assert s.collapsed is False, "off must not toggle an already-off setting"
+
+    def test_args_are_case_and_space_insensitive(self):
+        s = _Session(True)
+        assert execute_pretty("  OFF ", s.collapsed, s.set).success
+        assert s.collapsed is False
+
+    def test_unknown_arg_fails_with_usage(self):
+        s = _Session(True)
+        result = execute_pretty("maybe", s.collapsed, s.set)
+        assert result.success is False
+        assert s.set_calls == [], "a rejected arg must not change the setting"
+        assert "/pretty on" in result.message
+        assert "/pretty off" in result.message
+        assert "Current: on" in result.message
+
+    def test_message_is_plain_text(self):
+        s = _Session(True)
+        assert "[" not in execute_pretty("", s.collapsed, s.set).message
 
 
 if __name__ == "__main__":

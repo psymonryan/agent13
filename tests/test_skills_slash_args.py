@@ -86,6 +86,12 @@ def _make_app(skill_manager):
         )
     agent = MagicMock()
     agent.durable_records = DurableRecords()
+    # The status bar reads model/provider from the agent (single source
+    # of truth), so the stub must carry real strings, not MagicMocks.
+    agent.model = "test-model"
+    agent.provider_name = "test"
+    # The shared /skillname helper reads the manager from the agent.
+    agent.skill_manager = skill_manager
     agent.add_message = AsyncMock()
 
     async def _run_forever():

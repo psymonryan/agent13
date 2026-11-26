@@ -33,6 +33,25 @@ def _events():
     return [json.loads(line) for line in dl._log_file.read_text().splitlines() if line.strip()]
 
 
+def test_log_tps_event_keeps_a_callers_source():
+    """The envelope used to OVERWRITE `source` with "tps_debug".
+
+    That silently erased the seed's json|matched|floor field - the one
+    instrument the handoff rollout is judged by - and the event looked
+    complete, so nothing failed. Nothing reads the marker (the event name
+    already carries the tps_ prefix), so an explicit value wins.
+    """
+    dl.log_tps_event("truth_seed", {"source": "json", "nominated": ["3.2"]})
+    event = [e for e in _events() if e["event"] == "tps_truth_seed"][0]
+    assert event["data"]["source"] == "json"
+
+
+def test_log_tps_event_defaults_the_source_marker():
+    dl.log_tps_event("token_usage", {"prompt_tokens": 1})
+    event = [e for e in _events() if e["event"] == "tps_token_usage"][0]
+    assert event["data"]["source"] == "tps_debug"
+
+
 @skip_windows
 def test_log_rss_writes_mem_rss_event():
     dl.log_rss(note="t1")

@@ -1,6 +1,10 @@
 """Tests for the self-update checker."""
 
+import ast
 import json
+import subprocess
+import time
+import types
 from datetime import datetime, timezone, timedelta
 from unittest.mock import patch, MagicMock, mock_open
 
@@ -19,6 +23,8 @@ from agent13.updater import (
     _is_process_alive,
     _find_helper_python,
     _spawn_detached_updater,
+    _text,
+    _HELPER_SCRIPT,
     check_last_update_result,
     check_for_update,
     check_and_apply_update,
@@ -778,6 +784,100 @@ class TestFindHelperPython:
         ):
             result = _find_helper_python()
         assert result == r"C:\Scripts\python.exe"
+
+
+def _load_helper_function(name):
+    """Pull a function out of the embedded _HELPER_SCRIPT for testing.
+
+    The helper is a standalone program shipped as a string, so it cannot be
+    imported. Extracting the single function keeps the test honest about
+    exercising the code that actually runs in the detached process.
+    """
+    tree = ast.parse(_HELPER_SCRIPT)
+    node = next(
+        n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == name
+    )
+    namespace = {
+        # _alive branches on os.name; the Windows branch is the one under test
+        "os": types.SimpleNamespace(name="nt"),
+        "subprocess": subprocess,
+        "time": time,
+    }
+    exec(
+        compile(ast.Module(body=[node], type_ignores=[]), "<helper>", "exec"),
+        namespace,
+    )
+    return namespace[name]
+
+
+class TestSubprocessOutputDecoding:
+    """Captured subprocess output must not be decoded with the locale code page.
+
+    ``text=True`` decodes with the locale encoding (cp1252 on Windows), which
+    raises UnicodeDecodeError on any byte it cannot map. In the updater that
+    turned a reportable failure into an unhandled exception, or silently lost
+    the installer's message.
+    """
+
+    def test_text_decodes_utf8(self):
+        assert _text("café ✓".encode("utf-8")) == "café ✓"
+
+    def test_text_replaces_undecodable_bytes(self):
+        # No exception: the surrounding ASCII survives, bad bytes become U+FFFD
+        assert _text(b"A\xff\xfeB") == "A\ufffd\ufffdB"
+
+    def test_text_handles_empty_and_str(self):
+        assert _text(None) == ""
+        assert _text(b"") == ""
+        assert _text("already text") == "already text"
+
+    def test_find_helper_python_decodes_a_non_ascii_path(self):
+        """A uv-managed python under a non-ASCII path must come back intact."""
+        expected = "C:\\Users\\José\\AppData\\uv\\python\\python.exe"
+        with (
+            patch("agent13.updater._find_scripts_dir", return_value=r"C:\Scripts"),
+            patch("agent13.updater.subprocess.run") as mock_run,
+            patch("agent13.updater.shutil.which", return_value=None),
+            patch("agent13.updater.os.path.isfile", return_value=True),
+        ):
+            # capture_output without text=True yields bytes
+            mock_run.return_value = MagicMock(
+                returncode=0, stdout=(expected + "\n").encode("utf-8")
+            )
+            result = _find_helper_python()
+        assert result == expected
+
+    def test_perform_update_reports_a_non_ascii_installer_error(self):
+        """The installer's message must reach the user, not become a crash."""
+        with (
+            patch("agent13.updater.fetch_latest_release") as mock_fetch,
+            patch("agent13.updater.__version__", "0.1.8"),
+            patch("agent13.updater.httpx.stream", _mock_stream_factory()),
+            patch("agent13.updater.subprocess.run") as mock_run,
+            patch("agent13.updater._find_scripts_dir", return_value=None),
+        ):
+            mock_fetch.return_value = {
+                "tag_name": "0.1.9", "html_url": "",
+                "wheel_url": "https://example.com/wheel.whl",
+            }
+            mock_run.return_value = MagicMock(
+                returncode=1, stderr="échec: accès refusé\n".encode("utf-8")
+            )
+            success, msg = perform_update()
+        assert success is False
+        assert "échec: accès refusé" in msg
+
+    def test_helper_alive_searches_raw_bytes(self):
+        """tasklist writes the OEM code page - the PID check must not decode it."""
+        alive = _load_helper_function("_alive")
+        # 0x90 is undefined in cp1252, so a locale decode would raise
+        tasklist_output = b"Image Name   PID\r\npython.exe  4242\r\n\x90\x90\r\n"
+        with patch("agent13.updater.subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(stdout=tasklist_output)
+            assert alive(4242) is True
+        with patch("agent13.updater.subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(stdout=tasklist_output)
+            assert alive(9999) is False
 
 
 class TestCheckLastUpdateResult:

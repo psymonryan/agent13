@@ -33,6 +33,29 @@ from agent13.config_paths import (
 DEFAULT_CONFIG_FILE = Path(__file__).parent / "default_config.toml"
 
 
+def _validate_colour_name(value: str, key: str) -> None:
+    """Reject a colour name the TUI cannot render, at config-load time.
+
+    Textual is imported lazily: it is only needed when a colour key is
+    actually set, so batch/REPL startup pays nothing for a TUI-only feature.
+
+    Validation cannot be deferred to render time - an exception raised inside
+    the TUI's update_status hangs the app rather than failing it - so a typo
+    here must produce the same clean ``error: ...`` line as any other bad
+    config value.
+    """
+    from textual.color import Color  # lazy, see docstring
+
+    try:
+        Color.parse(value)
+    except Exception:
+        raise ConfigFileError(
+            f"[ui] '{key}' is not a colour the terminal can render: {value!r}. "
+            "Use a name like 'red', 'yellow', 'orange', 'black', a hex value "
+            "like '#ff8800', or \"\" for no colour."
+        )
+
+
 def ensure_default_config() -> None:
     """Copy default config to user's config directory if it doesn't exist.
 
@@ -262,6 +285,16 @@ class Config:
     cursor_blink: bool = False  # Whether input cursor blinks (false = tmux-friendly)
     reasoning_collapsed: bool = True  # Reasoning widgets start folded (display)
     toolview_collapsed: bool = True  # Tool call/result widgets start folded
+    # Status-bar Ctx segment: text/background colour per pressure band.
+    # "" = no colour (fg falls back to the bar's text colour, bg to its own).
+    ctx_warn_fg: str = "yellow"  # At 80% of auto_context_threshold
+    ctx_warn_bg: str = ""
+    ctx_crit_fg: str = "red"  # At 90% of auto_context_threshold
+    ctx_crit_bg: str = ""
+    # The status bar's own colours. "" = the theme's (white on the primary
+    # colour, which is the shipped look).
+    status_fg: str = ""
+    status_bg: str = ""
     auto_context_threshold: int = (
         220000  # Token threshold for auto-context (0 = disabled)
     )
@@ -272,7 +305,21 @@ class Config:
     auto_context_nudge_cap: int = (
         2  # Consecutive degenerate ends before the guard gives up (0 = off)
     )
+    auto_context_truth_index: bool = (
+        False  # Inject a topic index instead of the whole truth file
+    )
+    auto_save_idle_seconds: int = (
+        300  # Idle seconds before one auto-save of the daily file (0 = off)
+    )
+    datetime_nudge_seconds: int = 3600  # Refresh the model's clock in a long turn (0 = off)
     tools_max_result_chars: int = 30000  # Tool result text cap; 0 = off
+    # Refuse a mind-map write when the file was written this recently: the
+    # iThoughts app autosaves 10-20 s after an edit, so a fresh mtime means the
+    # user may be typing in the map. 0 disables the guard.
+    tools_mindmap_quiet_seconds: int = 20
+    # An .itmz whose style.xml is used for maps made by create_map. Empty =
+    # the bundled outline style (agent13/mindmap_styles/outline.style.xml).
+    tools_mindmap_style_template: str = ""
     vision: Optional[VisionConfig] = None  # Vision/image routing config
 
     @classmethod
@@ -505,6 +552,63 @@ class Config:
                         f"[auto_context] 'nudge_cap' must be >= 0, got {nudge_cap}"
                     )
                 config.auto_context_nudge_cap = int(nudge_cap)
+            if "truth_index" in auto_context_data:
+                truth_index = auto_context_data["truth_index"]
+                # isinstance(True, int) is True, so a bool must be checked
+                # BEFORE any int branch - otherwise a typo like `truth_index
+                # = 1` would be silently accepted as True.
+                if not isinstance(truth_index, bool):
+                    raise ConfigFileError(
+                        f"[auto_context] 'truth_index' must be true or false, "
+                        f"got {truth_index!r}. Use e.g. truth_index = false."
+                    )
+                config.auto_context_truth_index = truth_index
+
+        # Parse [auto_save] section. Fail fast on a bad value, like
+        # [auto_context] - a typo must surface at startup, never be
+        # silently dropped. Absent keys fall back to the dataclass default.
+        if "auto_save" in data:
+            auto_save_data = data["auto_save"]
+            if not isinstance(auto_save_data, dict):
+                raise ConfigFileError("[auto_save] must be a table")
+            if "idle_seconds" in auto_save_data:
+                idle_seconds = auto_save_data["idle_seconds"]
+                if isinstance(idle_seconds, bool) or not isinstance(
+                    idle_seconds, (int, float)
+                ):
+                    raise ConfigFileError(
+                        f"[auto_save] 'idle_seconds' must be an integer number "
+                        f"of seconds, got {idle_seconds!r}. "
+                        f"Use e.g. idle_seconds = 300 (or 0 to disable)."
+                    )
+                if idle_seconds < 0:
+                    raise ConfigFileError(
+                        f"[auto_save] 'idle_seconds' must be >= 0, got {idle_seconds}"
+                    )
+                config.auto_save_idle_seconds = int(idle_seconds)
+
+        # Parse [datetime] section. Same fail-fast rule as [auto_save]: a typo
+        # must surface at startup, never be silently dropped.
+        if "datetime" in data:
+            datetime_data = data["datetime"]
+            if not isinstance(datetime_data, dict):
+                raise ConfigFileError("[datetime] must be a table")
+            if "nudge_seconds" in datetime_data:
+                nudge_seconds = datetime_data["nudge_seconds"]
+                if isinstance(nudge_seconds, bool) or not isinstance(
+                    nudge_seconds, (int, float)
+                ):
+                    raise ConfigFileError(
+                        f"[datetime] 'nudge_seconds' must be an integer number "
+                        f"of seconds, got {nudge_seconds!r}. "
+                        f"Use e.g. nudge_seconds = 3600 (or 0 to disable)."
+                    )
+                if nudge_seconds < 0:
+                    raise ConfigFileError(
+                        f"[datetime] 'nudge_seconds' must be >= 0, "
+                        f"got {nudge_seconds}"
+                    )
+                config.datetime_nudge_seconds = int(nudge_seconds)
 
         # Parse [tools] section. Fail fast on a bad value, like
         # [auto_context] - a typo must surface at startup, never be silently
@@ -526,6 +630,29 @@ class Config:
                         f"[tools] 'max_result_chars' must be >= 0, got {mrc}"
                     )
                 config.tools_max_result_chars = int(mrc)
+            if "mindmap_quiet_seconds" in tools_data:
+                quiet = tools_data["mindmap_quiet_seconds"]
+                if isinstance(quiet, bool) or not isinstance(quiet, (int, float)):
+                    raise ConfigFileError(
+                        f"[tools] 'mindmap_quiet_seconds' must be an integer "
+                        f"number of seconds, got {quiet!r}. Use e.g. "
+                        "mindmap_quiet_seconds = 20 (or 0 to disable the guard)."
+                    )
+                if quiet < 0:
+                    raise ConfigFileError(
+                        f"[tools] 'mindmap_quiet_seconds' must be >= 0, got {quiet}"
+                    )
+                config.tools_mindmap_quiet_seconds = int(quiet)
+            if "mindmap_style_template" in tools_data:
+                template = tools_data["mindmap_style_template"]
+                if not isinstance(template, str):
+                    raise ConfigFileError(
+                        f"[tools] 'mindmap_style_template' must be a path to an "
+                        f".itmz file, got {template!r}. Use e.g. "
+                        'mindmap_style_template = "~/maps/journal.itmz" '
+                        "(or \"\" for the bundled default style)."
+                    )
+                config.tools_mindmap_style_template = template.strip()
 
         # Parse [ui] section
         ui_data = data.get("ui", {})
@@ -549,6 +676,31 @@ class Config:
                         f"false = start expanded), got {value!r}."
                     )
                 setattr(config, attr, value)
+
+            # Status-bar colours (the bar itself and its Ctx segment).
+            # Validated HERE, not at render: an exception inside the TUI's
+            # update_status hangs the app instead of failing it, so a typo
+            # must surface as a config error.
+            for key in (
+                "ctx_warn_fg",
+                "ctx_warn_bg",
+                "ctx_crit_fg",
+                "ctx_crit_bg",
+                "status_fg",
+                "status_bg",
+            ):
+                if key not in ui_data:
+                    continue
+                value = ui_data[key]
+                if not isinstance(value, str):
+                    raise ConfigFileError(
+                        f"[ui] '{key}' must be a string colour name (\"\" = no "
+                        f"colour), got {value!r}."
+                    )
+                value = value.strip()
+                if value:
+                    _validate_colour_name(value, key)
+                setattr(config, key, value)
 
         # Parse [vision] section
         vision_data = data.get("vision")
@@ -812,12 +964,16 @@ def create_client(
     )
 
 
-def resolve_provider_selection(choice: str, use_stderr: bool = False) -> str | None:
+def resolve_provider_selection(
+    choice: str, use_stderr: bool = False, output=None
+) -> str | None:
     """Resolve a provider selection by number, name, or URL.
 
     Args:
         choice: User's choice (number like "1", name/partial name, or URL)
         use_stderr: If True, print errors to stderr instead of stdout
+        output: File-like object for error messages. Overrides use_stderr -
+            pass a StringIO to capture the message instead of printing it.
 
     Returns:
         Resolved provider name/URL, or None if ambiguous/not found
@@ -830,7 +986,8 @@ def resolve_provider_selection(choice: str, use_stderr: bool = False) -> str | N
 
     import sys
 
-    output = sys.stderr if use_stderr else sys.stdout
+    if output is None:
+        output = sys.stderr if use_stderr else sys.stdout
     names = get_provider_names()
     return resolve_from_list(names, choice, label="provider", output=output)
 
@@ -842,6 +999,44 @@ def get_provider_names() -> list[str]:
         Sorted list of provider names from config.
     """
     return sorted(p.name for p in get_config().providers)
+
+
+def format_provider_list(current: str = "") -> str:
+    """Numbered provider list as plain text, '*' marking the active one."""
+    names = get_provider_names()
+    if not names:
+        return "No providers configured in ~/.agent13/config.toml"
+    lines = ["Available providers:"]
+    for i, name in enumerate(names, 1):
+        marker = " *" if name == current else ""
+        lines.append(f"  {i}. {name}{marker}")
+    lines.append("")
+    lines.append("Use /provider <name> to switch")
+    return "\n".join(lines)
+
+
+def current_provider_name(agent) -> str:
+    """Name of the configured provider this session is using.
+
+    The name the front-end recorded wins (it is what the user chose). Failing
+    that, match the client's base_url against the config - two entries can
+    share one URL, so the recorded name is the reliable answer.
+
+    Empty when the client points at a raw URL, or when no configured
+    provider's api_base matches it.
+    """
+    recorded = getattr(agent, "provider_name", "")
+    if recorded:
+        return recorded
+    try:
+        current_url = str(agent.client.base_url)
+    except Exception:
+        return ""
+    for name in get_provider_names():
+        provider = get_provider(name)
+        if provider and provider.api_base.rstrip("/") in current_url:
+            return name
+    return ""
 
 
 def print_provider_list(current: str = "") -> None:

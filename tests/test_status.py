@@ -3,12 +3,21 @@
 import os
 import time
 from enum import Enum
+from types import SimpleNamespace
 from unittest import mock
 
 import pytest
 
+from agent13 import Agent
+from agent13.core import AgentStatus, PauseState, ToolStats
+from agent13.queue import AgentQueue
 from agent13.status import (
+    CTX_CRIT_RATIO,
+    CTX_WARN_RATIO,
     StatusData,
+    StatusSource,
+    build_status,
+    ctx_alert_style,
     format_duration,
     fmt_tokens,
     gather_status,
@@ -16,91 +25,80 @@ from agent13.status import (
     toggle_enum,
     get_tool_stats_summary,
 )
+from agent13.timing import TokenTimingTracker
 
 
-# ── Mock helpers ──
+# ── Test doubles ──
+#
+# There is deliberately no fake Agent here. ``StatusSource.from_agent`` is the
+# ONE place that reads the Agent's shape, so its tests use a REAL one: a fake
+# would keep passing after the Agent renamed an attribute, which is exactly the
+# drift this file exists to catch. Construction is ~26 ms and touches no network.
+#
+# The doubles below stand in for COLLABORATORS (LLM client, MCP manager, prompt
+# manager), never for the Agent.
 
 
-class MockToolStats:
-    """Minimal tool stats mock."""
-
-    def __init__(self, successes=0, calls=0, bounded=0):
-        self.total_successes = successes
-        self.total_calls = calls
-        self.bounded = bounded
+class _Client:
+    """Stands in for the LLM client - Agent construction never touches it."""
 
 
-class MockMCP:
-    """Minimal MCP mock."""
+class _MCPStub:
+    """Only ``is_connected`` is read from the MCP manager."""
 
-    def __init__(self, connected=False):
+    def __init__(self, connected: bool):
         self._connected = connected
 
-    def is_connected(self):
+    def is_connected(self) -> bool:
         return self._connected
 
 
-class MockQueue:
-    """Minimal queue mock."""
+class _PromptManagerStub:
+    """Only ``active_prompt`` is read from the prompt manager."""
 
-    def __init__(self, pending=0):
-        self.pending_count = pending
-
-
-class MockAgent:
-    """Minimal agent mock for status gathering."""
-
-    def __init__(self, **kwargs):
-        self.messages = kwargs.get("messages", [])
-        self.queue = MockQueue(kwargs.get("pending", 0))
-        self.is_pausing = kwargs.get("is_pausing", False)
-        self.is_paused = kwargs.get("is_paused", False)
-        self.mcp = kwargs.get("mcp", None)
-        self.tool_stats = kwargs.get("tool_stats", MockToolStats())
-        self.journal_mode = kwargs.get("journal_mode", False)
-        self.devel_mode = kwargs.get("devel_mode", False)
-        self.skills_mode = kwargs.get("skills_mode", False)
-        self.remove_reasoning = kwargs.get("remove_reasoning", False)
-        self.auto_context_threshold = kwargs.get("auto_context_threshold", 220000)
-        self.auto_context_action = kwargs.get(
-            "auto_context_action", "report_and_compact"
-        )
-        self.auto_context_chain = kwargs.get("auto_context_chain", 3)
-        self.auto_context_chain_used = kwargs.get("auto_context_chain_used", 0)
-        self._focus = kwargs.get("focus_name", "")
-
-    @property
-    def _session_focus_name(self):
-        return self._focus
-
-    @property
-    def status(self):
-        from agent13.core import AgentStatus
-
-        if self.is_paused:
-            return AgentStatus.IDLE
-        return AgentStatus.IDLE
-
-    @property
-    def is_idle(self):
-        return not self.is_pausing and not self.is_paused
-
-
-class MockTracker:
-    """Minimal tracker mock."""
-
-    def __init__(self, **kwargs):
-        self.prompt_tokens = kwargs.get("prompt_tokens", 0)
-        self.completion_tokens = kwargs.get("completion_tokens", 0)
-        self._turn_count = kwargs.get("turn_count", 0)
-        self._total_processing_time = kwargs.get("total_processing_time", 0.0)
-
-
-class MockPromptManager:
-    """Minimal prompt manager mock."""
-
-    def __init__(self, active="default"):
+    def __init__(self, active: str):
         self.active_prompt = active
+
+
+def make_agent(**attrs):
+    """A real Agent with ``attrs`` set on it - the subject of the from_agent tests.
+
+    A name the Agent does not have raises instead of becoming a new attribute,
+    so a typo in a test fails here rather than silently asserting a default.
+    """
+    agent = Agent(_Client(), model="test-model")
+    for name, value in attrs.items():
+        if not hasattr(agent, name):
+            raise AttributeError(f"Agent has no attribute {name!r}")
+        setattr(agent, name, value)
+    return agent
+
+
+def minimal_agent():
+    """The smallest object ``from_agent`` accepts.
+
+    Everything it reads WITHOUT a getattr guard is here; the guarded ones
+    (chain_count, session_started_at, focus name, tracker, mcp, prompt manager)
+    are absent, which is the only way to reach their defaults - a real Agent
+    always has them.
+    """
+    return SimpleNamespace(
+        is_pausing=False,
+        is_paused=False,
+        status=AgentStatus.IDLE,
+        queue=AgentQueue(),
+        mcp=None,
+        messages=[],
+        tool_stats=ToolStats(),
+        journal_mode=False,
+        devel_mode=False,
+        skills_mode=False,
+        remove_reasoning=False,
+        auto_context_threshold=220000,
+        auto_context_action="report_and_compact",
+        auto_context_chain=3,
+        auto_context_chain_used=0,
+    )
 
 
 # ── format_duration tests ──
@@ -153,6 +151,129 @@ class TestFmtTokens:
         assert fmt_tokens(1234567) == "1234.6k"
 
 
+# ── ctx_alert_style tests ────────────────────────────────────────────────────
+
+
+class TestCtxAlertStyle:
+    """Tests for ctx_alert_style() - the status bar's context-pressure bands.
+
+    The bands are fractions of the auto-context threshold: warn at 80%, crit at
+    90%. The boundary itself is IN the band (>=), so a value sitting exactly on
+    the threshold is crit, not warn.
+
+    The four colours are config values ([ui] ctx_*_fg / ctx_*_bg). "" leaves a
+    channel alone, which is what makes the shipped default "coloured text on
+    the bar's own background" and the alternative "black on red" a solid block.
+    """
+
+    THRESHOLD = 200000
+
+    def test_below_warn_is_uncoloured(self):
+        assert ctx_alert_style(100000, self.THRESHOLD) is None
+
+    def test_just_below_warn(self):
+        warn = int(self.THRESHOLD * CTX_WARN_RATIO)
+        assert ctx_alert_style(warn - 1, self.THRESHOLD) is None
+
+    def test_at_warn_is_yellow(self):
+        warn = int(self.THRESHOLD * CTX_WARN_RATIO)
+        assert ctx_alert_style(warn, self.THRESHOLD) == "yellow"
+
+    def test_between_bands_is_yellow(self):
+        assert ctx_alert_style(170000, self.THRESHOLD) == "yellow"
+
+    def test_just_below_crit_is_yellow(self):
+        crit = int(self.THRESHOLD * CTX_CRIT_RATIO)
+        assert ctx_alert_style(crit - 1, self.THRESHOLD) == "yellow"
+
+    def test_at_crit_is_red(self):
+        crit = int(self.THRESHOLD * CTX_CRIT_RATIO)
+        assert ctx_alert_style(crit, self.THRESHOLD) == "red"
+
+    def test_over_threshold_is_red(self):
+        assert ctx_alert_style(250000, self.THRESHOLD) == "red"
+
+    def test_disabled_threshold_is_uncoloured(self):
+        """threshold 0 means auto-context is off: nothing to be close to."""
+        assert ctx_alert_style(250000, 0) is None
+
+    def test_negative_threshold_is_uncoloured(self):
+        assert ctx_alert_style(250000, -1) is None
+
+    def test_zero_value_is_uncoloured(self):
+        assert ctx_alert_style(0, self.THRESHOLD) is None
+
+    def test_bool_threshold_is_rejected(self):
+        """isinstance(True, int) is True - a bool must not be read as 1."""
+        assert ctx_alert_style(250000, True) is None
+
+    def test_bool_value_is_rejected(self):
+        assert ctx_alert_style(True, self.THRESHOLD) is None
+
+    def test_non_int_arguments_are_rejected(self):
+        """A stub agent's MagicMock threshold must not raise."""
+        from unittest.mock import MagicMock
+
+        assert ctx_alert_style(250000, MagicMock()) is None
+        assert ctx_alert_style(MagicMock(), self.THRESHOLD) is None
+
+    # ── the four configurable colours ────────────────────────────────────
+
+    def test_default_is_foreground_only(self):
+        """The shipped default: coloured text, no background."""
+        assert ctx_alert_style(170000, self.THRESHOLD) == "yellow"
+        assert ctx_alert_style(190000, self.THRESHOLD) == "red"
+
+    def test_solid_block_style(self):
+        """black on yellow / black on red - the documented alternative."""
+        kwargs = dict(warn_fg="black", warn_bg="yellow", crit_fg="black", crit_bg="red")
+        assert ctx_alert_style(170000, self.THRESHOLD, **kwargs) == "black on yellow"
+        assert ctx_alert_style(190000, self.THRESHOLD, **kwargs) == "black on red"
+
+    def test_background_only(self):
+        """An empty fg keeps the bar's text colour and paints only the bg."""
+        assert (
+            ctx_alert_style(190000, self.THRESHOLD, crit_fg="", crit_bg="red")
+            == "on red"
+        )
+
+    def test_all_channels_empty_means_no_style(self):
+        """A user who blanks all four gets an unstyled segment, not "[None]"."""
+        assert (
+            ctx_alert_style(
+                190000,
+                self.THRESHOLD,
+                warn_fg="",
+                warn_bg="",
+                crit_fg="",
+                crit_bg="",
+            )
+            is None
+        )
+
+    def test_bands_use_their_own_pair(self):
+        """The warn pair must not leak into the crit band (or vice versa)."""
+        assert (
+            ctx_alert_style(
+                170000, self.THRESHOLD, warn_fg="cyan", crit_fg="magenta"
+            )
+            == "cyan"
+        )
+        assert (
+            ctx_alert_style(
+                190000, self.THRESHOLD, warn_fg="cyan", crit_fg="magenta"
+            )
+            == "magenta"
+        )
+
+    def test_whitespace_is_trimmed(self):
+        """TOML values are hand-edited; ' red ' must not produce ' red  on  x'."""
+        assert (
+            ctx_alert_style(190000, self.THRESHOLD, crit_fg=" red ", crit_bg=" black ")
+            == "red on black"
+        )
+
+
 # ── parse_token_count tests ──────────────────────────────────────────────────
 
 
@@ -184,254 +305,351 @@ class TestParseTokenCount:
             parse_token_count(bad)
 
 
-# ── gather_status tests ──
+# ── status tests ──
 
 
-class TestGatherStatus:
-    """Tests for gather_status()."""
+class TestBuildStatus:
+    """build_status takes a plain dataclass: no Agent, no mock, no globals.
 
-    def _make_agent(self, **kwargs):
-        return MockAgent(**kwargs)
+    This is the seam the split bought. These tests construct the two or three
+    fields they care about instead of faking an object with 24 attributes and
+    two private tracker fields.
+    """
 
-    def test_basic_idle(self):
-        agent = self._make_agent()
-        sd = gather_status(agent, "test-provider", "test-model", time.time())
+    def test_formats_a_source_with_no_agent(self):
+        sd = build_status(
+            StatusSource(provider="p", model="m", prompt_tokens=1500, completion_tokens=500)
+        )
+        assert sd.provider == "p"
+        assert sd.model == "m"
         assert sd.agent_status == "idle"
-        assert sd.provider == "test-provider"
-        assert sd.model == "test-model"
-        assert sd.message_count == 0
-        assert sd.queue_count == 0
+        assert sd.prompt_tokens_fmt == "1.5k"
+        assert sd.total_tokens_fmt == "2.0k"
+        assert sd.mcp_status == "off"
 
-    def test_bounded_count(self):
-        agent = self._make_agent(tool_stats=MockToolStats(bounded=3))
-        sd = gather_status(agent, "p", "m", time.time())
-        assert sd.bounded_count == 3
+    def test_mcp_connected(self):
+        assert build_status(StatusSource(mcp_connected=True)).mcp_status == "connected"
 
-    def test_pausing_status(self):
-        agent = self._make_agent(is_pausing=True)
-        sd = gather_status(agent, "p", "m", time.time())
-        assert sd.agent_status == "pausing"
+    def test_total_processing_is_blank_at_zero(self):
+        assert build_status(StatusSource()).total_processing == "0s"
+        assert build_status(StatusSource(total_processing_time=65)).total_processing == "1m 5s"
 
-    def test_paused_status(self):
-        agent = self._make_agent(is_paused=True)
-        sd = gather_status(agent, "p", "m", time.time())
-        assert sd.agent_status == "paused"
+    def test_goal_line_is_carried_through(self):
+        sd = build_status(StatusSource(goal_line="Grind: 2h left"))
+        assert sd.goal_line == "Grind: 2h left"
 
-    def test_queued_status(self):
-        agent = self._make_agent(pending=3)
-        sd = gather_status(agent, "p", "m", time.time())
-        assert sd.agent_status == "queued"
-        assert sd.queue_count == 3
+    def test_resumed_fields_are_left_at_their_defaults(self):
+        """Neither half fills the resumed-session fields - the /status handler does."""
+        sd = build_status(StatusSource(turn_count=9))
+        assert sd.resumed_turn_count == 0
+        assert sd.resumed_saved_at is None
 
-    def test_message_count(self):
-        agent = self._make_agent(messages=["a", "b", "c"])
-        sd = gather_status(agent, "p", "m", time.time())
-        assert sd.message_count == 3
+    def test_the_adapter_is_exactly_the_two_halves(self):
+        agent = make_agent()
+        start = time.time()
+        assert build_status(
+            StatusSource.from_agent(agent, "p", "m", start)
+        ) == gather_status(agent, "p", "m", start)
 
-    def test_run_time(self):
-        start = time.time() - 125  # 2m 5s ago
-        agent = self._make_agent()
-        sd = gather_status(agent, "p", "m", start)
+    # -- carried through unchanged -------------------------------------------
+    # Every other field is a straight copy. run_time, cwd and total_processing
+    # are computed, so they keep their own tests above.
+
+    def test_status_words_are_carried_through(self):
+        for word in ("idle", "pausing", "paused", "queued", "processing"):
+            assert build_status(StatusSource(agent_status=word)).agent_status == word
+
+    def test_counts_are_carried_through(self):
+        sd = build_status(StatusSource(message_count=3, queue_count=2))
+        assert (sd.message_count, sd.queue_count) == (3, 2)
+
+    def test_run_time_is_measured_from_the_session_start(self):
+        sd = build_status(StatusSource(session_start_time=time.time() - 125))
         assert "2m" in sd.run_time
-        assert "s" in sd.run_time
 
-    def test_cwd(self):
-        agent = self._make_agent()
-        sd = gather_status(agent, "p", "m", time.time())
-        assert sd.cwd == os.getcwd()
+    def test_cwd_is_the_process_cwd(self):
+        assert build_status(StatusSource()).cwd == os.getcwd()
 
-    def test_focus_name_gathered(self):
-        agent = self._make_agent(focus_name="auto_context")
-        sd = gather_status(agent, "p", "m", time.time())
+    def test_focus_chain_and_session_start_are_carried_through(self):
+        sd = build_status(
+            StatusSource(
+                focus_name="auto_context",
+                chain_count=20,
+                session_started_at="2026-09-21T14:32:00",
+            )
+        )
         assert sd.focus_name == "auto_context"
-
-    def test_focus_name_default_empty(self):
-        agent = self._make_agent()
-        sd = gather_status(agent, "p", "m", time.time())
-        assert sd.focus_name == ""
-
-    def test_chain_count_gathered(self):
-        agent = self._make_agent()
-        agent.chain_count = 20
-        agent.session_started_at = "2026-09-21T14:32:00"
-        sd = gather_status(agent, "p", "m", time.time())
         assert sd.chain_count == 20
         assert sd.session_started_at == "2026-09-21T14:32:00"
 
-    def test_chain_count_defaults_when_agent_lacks_attrs(self):
-        """Old-style/stub agents without the properties gather as 0/empty."""
-        agent = self._make_agent()
-        sd = gather_status(agent, "p", "m", time.time())
-        assert sd.chain_count == 0
-        assert sd.session_started_at == ""
+    def test_tool_counts_are_carried_through(self):
+        sd = build_status(StatusSource(tool_successes=45, tool_calls=52, bounded_count=3))
+        assert (sd.tool_successes, sd.tool_calls, sd.bounded_count) == (45, 52, 3)
 
-    def test_tracker_tokens(self):
-        tracker = MockTracker(prompt_tokens=5000, completion_tokens=3000)
-        agent = self._make_agent()
-        sd = gather_status(agent, "p", "m", time.time(), tracker=tracker)
-        assert sd.prompt_tokens == 5000
-        assert sd.completion_tokens == 3000
-        assert sd.prompt_tokens_fmt == "5.0k"
-        assert sd.completion_tokens_fmt == "3.0k"
-        assert sd.total_tokens_fmt == "8.0k"
-
-    def test_tracker_turns(self):
-        tracker = MockTracker(turn_count=5, total_processing_time=120.0)
-        agent = self._make_agent()
-        sd = gather_status(agent, "p", "m", time.time(), tracker=tracker)
-        assert sd.turn_count == 5
-        assert sd.total_processing == "2m 0s"
-
-    def test_no_tracker(self):
-        agent = self._make_agent()
-        sd = gather_status(agent, "p", "m", time.time())
-        assert sd.prompt_tokens == 0
-        assert sd.completion_tokens == 0
-        assert sd.turn_count == 0
-
-    def test_mcp_connected(self):
-        mcp = MockMCP(connected=True)
-        agent = self._make_agent(mcp=mcp)
-        sd = gather_status(agent, "p", "m", time.time())
-        assert sd.mcp_status == "connected"
-
-    def test_mcp_off(self):
-        agent = self._make_agent()
-        sd = gather_status(agent, "p", "m", time.time())
-        assert sd.mcp_status == "off"
-
-    def test_mcp_disconnected(self):
-        mcp = MockMCP(connected=False)
-        agent = self._make_agent(mcp=mcp)
-        sd = gather_status(agent, "p", "m", time.time())
-        assert sd.mcp_status == "off"
-
-    def test_tool_stats(self):
-        stats = MockToolStats(successes=45, calls=52)
-        agent = self._make_agent(tool_stats=stats)
-        sd = gather_status(agent, "p", "m", time.time())
-        assert sd.tool_successes == 45
-        assert sd.tool_calls == 52
-
-    def test_tool_stats_zero(self):
-        agent = self._make_agent()
-        sd = gather_status(agent, "p", "m", time.time())
-        assert sd.tool_successes == 0
-        assert sd.tool_calls == 0
-
-    def test_settings_defaults(self):
-        agent = self._make_agent()
-        sd = gather_status(agent, "p", "m", time.time())
-        assert sd.journal_mode is False
-        assert sd.devel_mode is False
-        assert sd.skills_mode is False
-        assert sd.remove_reasoning is False
-
-    def test_settings_enabled(self):
-        agent = self._make_agent(
-            journal_mode=True,
-            devel_mode=True,
-            skills_mode=True,
-            remove_reasoning=True,
+    def test_settings_are_carried_through(self):
+        sd = build_status(
+            StatusSource(
+                journal_mode=True,
+                devel_mode=True,
+                skills_mode=True,
+                remove_reasoning=True,
+            )
         )
-        sd = gather_status(agent, "p", "m", time.time())
         assert sd.journal_mode is True
         assert sd.devel_mode is True
         assert sd.skills_mode is True
         assert sd.remove_reasoning is True
 
-    def test_auto_context_settings(self):
-        agent = self._make_agent(
-            auto_context_threshold=150000,
-            auto_context_action="compact",
-            auto_context_chain=2,
-            auto_context_chain_used=1,
+    def test_auto_context_settings_are_carried_through(self):
+        sd = build_status(
+            StatusSource(
+                auto_context_threshold=150000,
+                auto_context_action="compact",
+                auto_context_chain=2,
+                auto_context_chain_used=1,
+            )
         )
-        sd = gather_status(agent, "p", "m", time.time())
         assert sd.auto_context_threshold == 150000
         assert sd.auto_context_action == "compact"
         assert sd.auto_context_chain == 2
         assert sd.auto_context_chain_used == 1
 
+    def test_active_prompt_is_carried_through(self):
+        assert build_status(StatusSource(active_prompt="coding")).active_prompt == "coding"
+
+    def test_sandbox_and_pins_are_carried_through(self):
+        sd = build_status(
+            StatusSource(
+                sandbox_mode="off",
+                sandbox_pinned="permissive-closed",
+                devel_pinned=True,
+            )
+        )
+        assert sd.sandbox_mode == "off"
+        assert sd.sandbox_pinned == "permissive-closed"
+        assert sd.devel_pinned is True
+
+
+class TestFromAgent:
+    """The adapter half: what ``from_agent`` reads off a REAL Agent.
+
+    A fake Agent would pass even if the Agent renamed an attribute, so these
+    tests take the real thing. ``_read`` is how a front-end calls it: provider
+    and model only, everything else from the agent.
+    """
+
+    @staticmethod
+    def _read(agent, **kwargs):
+        return StatusSource.from_agent(agent, "p", "m", **kwargs)
+
+    def test_provider_and_model_come_from_the_caller(self):
+        source = self._read(make_agent())
+        assert (source.provider, source.model) == ("p", "m")
+
+    def test_provider_and_model_fall_back_to_the_agent(self):
+        agent = make_agent()
+        agent.provider_name = "from-agent"
+        source = StatusSource.from_agent(agent)
+        assert (source.provider, source.model) == ("from-agent", "test-model")
+
+    def test_status_word_is_the_enum_lowercased(self):
+        agent = make_agent()
+        agent._status = AgentStatus.IDLE
+        assert self._read(agent).agent_status == "idle"
+
+    def test_pausing_wins_over_paused_and_queued(self):
+        agent = make_agent()
+        agent._pause_state = PauseState.PAUSING
+        agent.queue.add("queued too")
+        assert self._read(agent).agent_status == "pausing"
+
+    def test_paused(self):
+        agent = make_agent()
+        agent._pause_state = PauseState.PAUSED
+        assert self._read(agent).agent_status == "paused"
+
+    def test_queued_when_the_queue_has_items(self):
+        agent = make_agent()
+        for text in ("a", "b", "c"):
+            agent.queue.add(text)
+        source = self._read(agent)
+        assert source.agent_status == "queued"
+        assert source.queue_count == 3
+
+    def test_message_count_is_the_message_list_length(self):
+        assert self._read(make_agent(messages=["a", "b", "c"])).message_count == 3
+
+    def test_session_start_time_is_read(self):
+        start = time.time() - 125
+        assert self._read(make_agent(session_start_time=start)).session_start_time == start
+
+    def test_session_start_time_falls_back_to_now(self):
+        """0.0 is the Agent's own default - a front-end that never set it still gets a run time."""
+        source = self._read(make_agent(session_start_time=0.0))
+        assert source.session_start_time == pytest.approx(time.time(), abs=5)
+
+    def test_focus_name_is_read(self):
+        agent = make_agent()
+        agent.apply_focus_name("auto_context")
+        assert self._read(agent).focus_name == "auto_context"
+
+    def test_focus_name_defaults_to_empty(self):
+        assert self._read(make_agent()).focus_name == ""
+
+    def test_chain_count_and_session_start_are_read(self):
+        agent = make_agent()
+        agent._chain_count = 20
+        agent._session_started_at = "2026-09-21T14:32:00"
+        source = self._read(agent)
+        assert source.chain_count == 20
+        assert source.session_started_at == "2026-09-21T14:32:00"
+
+    def test_guarded_attributes_default_when_absent(self):
+        source = self._read(minimal_agent())
+        assert source.chain_count == 0
+        assert source.session_started_at == ""
+        assert source.focus_name == ""
+
+    def test_goal_line_is_empty_without_a_window(self):
+        assert self._read(make_agent()).goal_line == ""
+
+    def test_tracker_tokens(self):
+        tracker = TokenTimingTracker()
+        tracker.prompt_tokens = 5000
+        tracker.completion_tokens = 3000
+        source = self._read(make_agent(), tracker=tracker)
+        assert (source.prompt_tokens, source.completion_tokens) == (5000, 3000)
+
+    def test_tracker_turns(self):
+        tracker = TokenTimingTracker()
+        tracker._turn_count = 5
+        tracker._total_processing_time = 120.0
+        source = self._read(make_agent(), tracker=tracker)
+        assert source.turn_count == 5
+        assert source.total_processing_time == 120.0
+
+    def test_no_tracker(self):
+        source = self._read(make_agent(tracker=None))
+        assert source.prompt_tokens == 0
+        assert source.completion_tokens == 0
+        assert source.turn_count == 0
+
+    def test_mcp_connected(self):
+        agent = make_agent()
+        agent._mcp = _MCPStub(connected=True)
+        assert self._read(agent).mcp_connected is True
+
+    def test_mcp_off_when_the_agent_has_no_manager(self):
+        assert self._read(make_agent()).mcp_connected is False
+
+    def test_mcp_disconnected(self):
+        agent = make_agent()
+        agent._mcp = _MCPStub(connected=False)
+        assert self._read(agent).mcp_connected is False
+
+    def test_tool_stats(self):
+        agent = make_agent()
+        agent.tool_stats.calls = {"t": 52}
+        agent.tool_stats.successes = {"t": 45}
+        agent.tool_stats.bounded = 3
+        source = self._read(agent)
+        assert source.tool_successes == 45
+        assert source.tool_calls == 52
+        assert source.bounded_count == 3
+
+    def test_tool_stats_zero(self):
+        source = self._read(make_agent())
+        assert source.tool_successes == 0
+        assert source.tool_calls == 0
+        assert source.bounded_count == 0
+
+    def test_settings_defaults(self):
+        source = self._read(make_agent())
+        assert source.journal_mode is False
+        assert source.devel_mode is False
+        assert source.skills_mode is False
+        assert source.remove_reasoning is False
+
+    def test_settings_enabled(self):
+        source = self._read(
+            make_agent(
+                journal_mode=True,
+                _devel_mode=True,
+                _skills_mode=True,
+                remove_reasoning=True,
+            )
+        )
+        assert source.journal_mode is True
+        assert source.devel_mode is True
+        assert source.skills_mode is True
+        assert source.remove_reasoning is True
+
+    def test_auto_context_settings(self):
+        source = self._read(
+            make_agent(
+                auto_context_threshold=150000,
+                auto_context_action="compact",
+                auto_context_chain=2,
+                _auto_context_chain_used=1,
+            )
+        )
+        assert source.auto_context_threshold == 150000
+        assert source.auto_context_action == "compact"
+        assert source.auto_context_chain == 2
+        assert source.auto_context_chain_used == 1
+
     def test_active_prompt(self):
-        pm = MockPromptManager(active="coding")
-        agent = self._make_agent()
-        sd = gather_status(agent, "p", "m", time.time(), prompt_manager=pm)
-        assert sd.active_prompt == "coding"
+        source = self._read(make_agent(), prompt_manager=_PromptManagerStub("coding"))
+        assert source.active_prompt == "coding"
 
     def test_no_prompt_manager(self):
-        agent = self._make_agent()
-        sd = gather_status(agent, "p", "m", time.time())
-        assert sd.active_prompt == ""
+        assert self._read(make_agent(prompt_manager=None)).active_prompt == ""
 
     @mock.patch("tools.security.get_current_sandbox_mode")
     def test_sandbox_mode(self, mock_sandbox):
         from agent13.sandbox import SandboxMode
 
         mock_sandbox.return_value = SandboxMode.OFF
-        agent = self._make_agent()
-        sd = gather_status(agent, "p", "m", time.time())
-        assert sd.sandbox_mode == "off"
+        assert self._read(make_agent()).sandbox_mode == "off"
 
     @mock.patch("tools.security.get_current_sandbox_mode")
     def test_sandbox_mode_error(self, mock_sandbox):
         mock_sandbox.side_effect = RuntimeError("no sandbox")
-        agent = self._make_agent()
-        sd = gather_status(agent, "p", "m", time.time())
-        assert sd.sandbox_mode == "unknown"
+        assert self._read(make_agent()).sandbox_mode == "unknown"
 
     @mock.patch("agent13.pins.get_pinned_devel")
     @mock.patch("agent13.sandbox.get_pinned_sandbox_mode")
     @mock.patch("tools.security.get_current_sandbox_mode")
-    def test_pins_populated(
-        self, mock_sandbox, mock_sandbox_pin, mock_devel_pin
-    ):
+    def test_pins_populated(self, mock_sandbox, mock_sandbox_pin, mock_devel_pin):
         from agent13.sandbox import SandboxMode
 
         mock_sandbox.return_value = SandboxMode.OFF
         mock_sandbox_pin.return_value = SandboxMode.PERMISSIVE_CLOSED
         mock_devel_pin.return_value = True
-        agent = self._make_agent()
-        sd = gather_status(agent, "p", "m", time.time())
-        assert sd.sandbox_pinned == "permissive-closed"
-        assert sd.devel_pinned is True
+        source = self._read(make_agent())
+        assert source.sandbox_pinned == "permissive-closed"
+        assert source.devel_pinned is True
 
     @mock.patch("agent13.pins.get_pinned_devel")
     @mock.patch("agent13.sandbox.get_pinned_sandbox_mode")
     @mock.patch("tools.security.get_current_sandbox_mode")
-    def test_pins_none_when_unpinned(
-        self, mock_sandbox, mock_sandbox_pin, mock_devel_pin
-    ):
+    def test_pins_none_when_unpinned(self, mock_sandbox, mock_sandbox_pin, mock_devel_pin):
         from agent13.sandbox import SandboxMode
 
         mock_sandbox.return_value = SandboxMode.OFF
         mock_sandbox_pin.return_value = None
         mock_devel_pin.return_value = None
-        agent = self._make_agent()
-        sd = gather_status(agent, "p", "m", time.time())
-        assert sd.sandbox_pinned is None
-        assert sd.devel_pinned is None
+        source = self._read(make_agent())
+        assert source.sandbox_pinned is None
+        assert source.devel_pinned is None
 
-    def test_tui_fields_default_none(self):
-        """TUI-only optional fields default to None."""
-        agent = self._make_agent()
-        sd = gather_status(agent, "p", "m", time.time())
-        assert sd.pretty is None
-        assert sd.tool_response_format is None
-        assert sd.spinner_speed is None
-        assert sd.clipboard_method is None
-        assert sd.saves_auto_count is None
+    def test_resumed_fields_default_to_zero(self):
+        """gather_status leaves the resumed-session fields alone."""
+        sd = gather_status(make_agent(), "p", "m", time.time())
         assert sd.resumed_turn_count == 0
-
-    def test_tui_fields_can_be_set(self):
-        """TUI can populate its optional fields after gather."""
-        agent = self._make_agent()
-        sd = gather_status(agent, "p", "m", time.time())
-        sd.pretty = True
-        sd.tool_response_format = "auto"
-        sd.resumed_turn_count = 5
-        assert sd.pretty is True
-        assert sd.resumed_turn_count == 5
+        assert sd.resumed_saved_at is None
+        assert sd.resumed_prompt_tokens == 0
+        assert sd.resumed_completion_tokens == 0
 
 
 class TestStatusData:
@@ -446,6 +664,14 @@ class TestStatusData:
         assert sd.model == ""
         assert sd.prompt_tokens == 0
         assert sd.completion_tokens == 0
+
+    def test_resumed_fields_can_be_set(self):
+        """The /status handler fills them from the agent after gather."""
+        sd = StatusData(agent_status="idle", run_time="0s", cwd="/tmp")
+        sd.resumed_turn_count = 5
+        sd.resumed_saved_at = "2026-10-26T12:00:00"
+        assert sd.resumed_turn_count == 5
+        assert sd.resumed_saved_at == "2026-10-26T12:00:00"
 
     def test_full_construction(self):
         sd = StatusData(
@@ -515,11 +741,27 @@ class TestToggleEnum:
 
 
 class MockToolStatsWithDict:
-    """Mock tool stats with calls/successes dicts."""
+    """Mock tool stats with calls/successes dicts.
 
-    def __init__(self, calls=None, successes=None):
+    Mirrors the real ToolStats fields the summary reads - the mode and
+    param-combo breakdowns included, so a missing attribute fails here.
+    """
+
+    def __init__(
+        self,
+        calls=None,
+        successes=None,
+        modes=None,
+        mode_successes=None,
+        param_combos=None,
+        param_combo_successes=None,
+    ):
         self.calls = calls or {}
         self.successes = successes or {}
+        self.modes = modes or {}
+        self.mode_successes = mode_successes or {}
+        self.param_combos = param_combos or {}
+        self.param_combo_successes = param_combo_successes or {}
 
     @property
     def total_calls(self):
@@ -593,3 +835,46 @@ class TestGetToolStatsSummary:
         agent = MockAgentForTools(stats)
         result = get_tool_stats_summary(agent)
         assert result["success_rate"] == 100.0
+
+    def test_per_tool_mode_breakdown(self):
+        """Each per-tool entry carries its mode breakdown, sorted by mode."""
+        stats = MockToolStatsWithDict(
+            calls={"read_file": 5},
+            successes={"read_file": 4},
+            modes={"read_file": {"raw": 3, "lines": 2}},
+            mode_successes={"read_file": {"raw": 2, "lines": 2}},
+        )
+        agent = MockAgentForTools(stats)
+        result = get_tool_stats_summary(agent)
+
+        assert result["per_tool"][0]["modes"] == [
+            {"mode": "lines", "calls": 2, "successes": 2},
+            {"mode": "raw", "calls": 3, "successes": 2},
+        ]
+
+    def test_per_tool_param_combos_sorted_by_calls(self):
+        """Param combos come back most-used first."""
+        stats = MockToolStatsWithDict(
+            calls={"edit_file": 6},
+            successes={"edit_file": 5},
+            param_combos={"edit_file": {"filepath,find": 2, "filepath,find,content": 4}},
+            param_combo_successes={
+                "edit_file": {"filepath,find": 1, "filepath,find,content": 4}
+            },
+        )
+        agent = MockAgentForTools(stats)
+        result = get_tool_stats_summary(agent)
+
+        assert result["per_tool"][0]["param_combos"] == [
+            {"combo": "filepath,find,content", "calls": 4, "successes": 4},
+            {"combo": "filepath,find", "calls": 2, "successes": 1},
+        ]
+
+    def test_per_tool_without_breakdowns_gets_empty_lists(self):
+        """A tool with neither modes nor combos gets empty lists, not keys."""
+        stats = MockToolStatsWithDict(calls={"command": 1}, successes={"command": 1})
+        agent = MockAgentForTools(stats)
+        result = get_tool_stats_summary(agent)
+
+        assert result["per_tool"][0]["modes"] == []
+        assert result["per_tool"][0]["param_combos"] == []

@@ -10,7 +10,7 @@ string formatting, and state transitions.
 
 import time
 
-from agent13.timing import TokenTimingTracker
+from agent13.timing import TaskClock, TokenTimingTracker
 
 
 # ── REPL wiring pattern ──────────────────────────────────────────────
@@ -140,7 +140,7 @@ class _MinimalTUIShim:
         self.prompt_tokens = 0
         self.completion_tokens = 0
         self.total_tokens = 0
-        self._elapsed_start_time = None
+        self.task_clock = TaskClock()
 
     def _reset_stream_timing(self):
         """Mirrors ui/tui.py post-refactor."""
@@ -157,14 +157,17 @@ class _MinimalTUIShim:
             self._last_tps = result.tps
 
     def _update_status(self, status):
-        """Mirrors ui/tui.py post-refactor."""
+        """Mirrors ui/tui.py post-refactor.
+
+        The task clock is driven by the agent (core), not by this handler;
+        the TUI only renders it. Kept here so the shim stays a faithful
+        mirror of the status pipeline.
+        """
         if status == "processing":
-            if self._elapsed_start_time is None:
-                self._elapsed_start_time = time.time()
             self.tracker.turn_start()
         elif status == "idle":
             self.tracker.turn_end()
-            self._elapsed_start_time = None
+            self.task_clock.stop()
 
 
 class TestTUIWiringPattern:

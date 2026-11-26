@@ -453,6 +453,10 @@ def _make_tui_app(skills_dir: Path | None = None):
 
     agent = MagicMock()
     agent.durable_records = DurableRecords()
+    # The status bar reads model/provider from the agent (single source
+    # of truth), so the stub must carry real strings, not MagicMocks.
+    agent.model = "test-model"
+    agent.provider_name = "test"
     mcp = FakeMCP()
     agent.mcp = mcp
     agent._mcp = mcp
@@ -468,6 +472,11 @@ def _make_tui_app(skills_dir: Path | None = None):
     agent.tool_stats.total_calls = 0
     agent.auto_context_chain_used = 0
     agent.skills_mode = False
+    # The shared /skillname and /snippet dispatchers read their managers from
+    # the agent, so the stub carries the same real ones the app was built with.
+    agent.skill_manager = app.agent.skill_manager
+    agent.snippet_manager = app.agent.snippet_manager
+    agent.prompt_manager = app.agent.prompt_manager
 
     async def _run_forever():
         await asyncio.Event().wait()
@@ -478,15 +487,17 @@ def _make_tui_app(skills_dir: Path | None = None):
 
 
 class TestChainTuiWiring:
-    """TUI command handlers: /chain no-skills queues the data flag;
-    /skillname tracks the loaded content on the agent."""
+    """TUI command wiring: the shared /chain handler decides the data flag,
+    the TUI tail queues the turn; /skillname tracks the loaded content."""
 
     @pytest.mark.asyncio
     async def test_chain_no_skills_queues_data(self, isolated_config):
+        from agent13.commands import execute_chain
+
         app = _make_tui_app()
         async with app.run_test() as pilot:
             await pilot.pause()
-            app._handle_chain_command("no-skills")
+            app._run_command_follow_up(execute_chain(app.agent, "no-skills"), "no-skills")
             await pilot.pause(0.2)
         app.agent.add_message.assert_awaited_once_with(
             "/chain", kind="chain", data={"no_skills": True}
@@ -494,11 +505,13 @@ class TestChainTuiWiring:
 
     @pytest.mark.asyncio
     async def test_chain_dash_and_underscore_variants(self, isolated_config):
+        from agent13.commands import execute_chain
+
         app = _make_tui_app()
         async with app.run_test() as pilot:
             await pilot.pause()
-            app._handle_chain_command("--no-skills")
-            app._handle_chain_command("no_skills")
+            app._run_command_follow_up(execute_chain(app.agent, "--no-skills"), "")
+            app._run_command_follow_up(execute_chain(app.agent, "no_skills"), "")
             await pilot.pause(0.2)
         calls = [c for c in app.agent.add_message.await_args_list]
         assert len(calls) == 2
@@ -507,10 +520,12 @@ class TestChainTuiWiring:
 
     @pytest.mark.asyncio
     async def test_chain_bare_queues_no_data_flag(self, isolated_config):
+        from agent13.commands import execute_chain
+
         app = _make_tui_app()
         async with app.run_test() as pilot:
             await pilot.pause()
-            app._handle_chain_command("")
+            app._run_command_follow_up(execute_chain(app.agent, ""), "")
             await pilot.pause(0.2)
         app.agent.add_message.assert_awaited_once_with(
             "/chain", kind="chain", data={}

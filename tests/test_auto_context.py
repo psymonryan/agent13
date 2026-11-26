@@ -16,18 +16,22 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from agent13.config_paths import get_records_dir
 from agent13.core import Agent, AgentStatus
 from agent13.events import AgentEvent
 from agent13.message_history import LOCAL_MSG_KEYS, is_turn_start
 from agent13.prompts import (
-    AUTO_CONTEXT_CARRY_HINT,
     AUTO_CONTEXT_CONTINUE_HINT,
-    CHAIN_RESTART_INTRO,
     DEFAULT_REPORT_AND_COMPACT_PROMPT,
     DEFAULT_REPORT_AND_COMPACT_SUMMARY_PROMPT,
     resolve_report_and_compact_prompt,
 )
 from agent13.queue import QueueItem
+
+
+def _mem(filename: str) -> str:
+    """The absolute path of a record file in the project's records directory."""
+    return str((get_records_dir() / filename).resolve())
 
 
 def make_agent(
@@ -103,6 +107,45 @@ class TestAutoContextPromptResolution:
         assert "journal" in text
         assert "append" in text
         assert "progress report" not in text
+
+    def test_default_gives_a_self_made_rerank_a_legal_citation(self):
+        """The h. rule must be satisfiable without a user message.
+
+        Live failure: a rank change driven by the model's own step had no
+        legal way to be recorded, so the rule sent the model looking for a
+        citation and the only candidate in the transcript was the harness's
+        own continuation message. An unsatisfiable rule gets satisfied with
+        whatever text is available.
+        """
+        text = DEFAULT_REPORT_AND_COMPACT_PROMPT
+        assert "not user direction" in text
+        assert "by my own judgement" in text
+
+    def test_default_for_user_is_what_the_user_must_do(self):
+        """The old wording ("act on or know") admitted anything interesting,
+        and the model reaches for its own plan first - it has just written it
+        in b.
+
+        Measured drift: three live blocks carried one item that was the b.
+        action lifted verbatim, and one that was a status report.
+        """
+        text = DEFAULT_REPORT_AND_COMPACT_PROMPT
+        assert "act on or know" not in text
+        assert "must DO or DECIDE" in text
+        assert "NOT a status report" in text
+        assert "NOT your plan" in text
+        assert "repeats the b. action is a copy" in text
+
+    def test_the_quoted_label_matches_the_message_the_harness_emits(self):
+        """The rule quotes the continuation label; it must be the real one.
+
+        A rule that names a label the harness no longer emits reads as being
+        about a message that does not exist.
+        """
+        from agent13.prompts import GOAL_ITEM
+
+        assert '"Next step"' in DEFAULT_REPORT_AND_COMPACT_PROMPT
+        assert GOAL_ITEM.startswith("Next step")
 
 
 # ───────────────────────── Threshold-gate logic ─────────────────────────
@@ -315,6 +358,12 @@ class TestSessionJournal:
     """The session journal: date injection, path capture from the wrap-up's own
     append tool call, and the nudge carrying the path across chain restarts."""
 
+    @pytest.fixture(autouse=True)
+    def _isolated_records(self, tmp_path, monkeypatch):
+        """The records directory is ``<cwd>/records`` - run the
+        test in a temp project so it never touches the repo's own."""
+        monkeypatch.chdir(tmp_path)
+
     @staticmethod
     def _append_tool_call(path: str) -> dict:
         return {
@@ -364,14 +413,14 @@ class TestSessionJournal:
 
         async def fake_llm_turn(*args, **kwargs):
             agent.messages.append(
-                self._append_tool_call("docs_archive/my_focus_journal.md")
+                self._append_tool_call(_mem("my_focus_journal.md"))
             )
 
         agent._llm_turn = fake_llm_turn
 
         await agent._run_report_and_compact_turn()
 
-        assert agent._session_journal_path == "docs_archive/my_focus_journal.md"
+        assert agent._session_journal_path == _mem("my_focus_journal.md")
 
     @pytest.mark.asyncio
     async def test_journal_path_not_captured_for_other_paths(self):
@@ -436,18 +485,18 @@ class TestSessionJournal:
 
         async def fake_llm_turn(*args, **kwargs):
             agent.messages.append(
-                self._append_tool_call("docs_archive/my_focus_journal.md")
+                self._append_tool_call(_mem("my_focus_journal.md"))
             )
             agent.messages.append(
-                self._append_tool_call("docs_archive/my_focus_current_truth.md")
+                self._append_tool_call(_mem("my_focus_current_truth.md"))
             )
 
         agent._llm_turn = fake_llm_turn
 
         await agent._run_report_and_compact_turn()
 
-        assert agent._session_truth_path == "docs_archive/my_focus_current_truth.md"
-        assert agent._session_journal_path == "docs_archive/my_focus_journal.md"
+        assert agent._session_truth_path == _mem("my_focus_current_truth.md")
+        assert agent._session_journal_path == _mem("my_focus_journal.md")
 
     @pytest.mark.asyncio
     async def test_nudge_plain_without_journal_path(self):
@@ -743,19 +792,28 @@ class TestWrapupCommand:
         assert "/wrapup" in tui.SLASH_COMMANDS
 
     @pytest.mark.asyncio
-    async def test_wrapup_tui_handler_queues_item(self):
+    async def test_wrapup_handler_queues_item(self):
+        """The shared handler asks; the TUI tail queues the turn."""
+        from agent13.commands import execute_wrapup
+
         tui = self._make_tui()
         tui.agent.add_message = AsyncMock()
-        tui._handle_wrapup_command()
+        result = execute_wrapup(tui.agent, "")
+        tui._run_command_follow_up(result, "")
         await asyncio.sleep(0.01)
-        tui.agent.add_message.assert_awaited_once_with("/wrapup", kind="wrapup")
+        tui.agent.add_message.assert_awaited_once_with(
+            "/wrapup", kind="wrapup", data={}
+        )
 
     @pytest.mark.asyncio
-    async def test_wrapup_tui_handler_queues_focus_name(self):
+    async def test_wrapup_handler_queues_focus_name(self):
         """Rest of line (spaces kept, stripped) becomes data['focus_name']."""
+        from agent13.commands import execute_wrapup
+
         tui = self._make_tui()
         tui.agent.add_message = AsyncMock()
-        tui._handle_wrapup_command("  my cool game  ")
+        result = execute_wrapup(tui.agent, "  my cool game  ")
+        tui._run_command_follow_up(result, "  my cool game  ")
         await asyncio.sleep(0.01)
         tui.agent.add_message.assert_awaited_once_with(
             "/wrapup my cool game",
@@ -768,6 +826,12 @@ class TestFocusNameState:
     """Explicit focus name: first-class core state, authoritative over the
     wrap-up's tool-call capture. /focus [NAME] sets it (and seeds an empty
     history from the focus's durable records); /wrapup NAME re-sets it."""
+
+    @pytest.fixture(autouse=True)
+    def _isolated_records(self, tmp_path, monkeypatch):
+        """The records directory is ``<cwd>/records`` - run the
+        test in a temp project so it never touches the repo's own."""
+        monkeypatch.chdir(tmp_path)
 
     def _make_tui(self, **kwargs):
         from ui.tui import AgentTUI
@@ -801,15 +865,11 @@ class TestFocusNameState:
 
     @staticmethod
     def _write_records(tmp_path, name, truth=None, journal=None):
-        (tmp_path / "docs_archive").mkdir(exist_ok=True)
+        records = get_records_dir()
         if truth is not None:
-            (tmp_path / "docs_archive" / f"{name}_current_truth.md").write_text(
-                truth, encoding="utf-8"
-            )
+            (records / f"{name}_current_truth.md").write_text(truth, encoding="utf-8")
         if journal is not None:
-            (tmp_path / "docs_archive" / f"{name}_journal.md").write_text(
-                journal, encoding="utf-8"
-            )
+            (records / f"{name}_journal.md").write_text(journal, encoding="utf-8")
 
     # ── set_focus_name ──────────────────────────────────────────────
 
@@ -817,16 +877,16 @@ class TestFocusNameState:
         agent = make_agent()
         agent.set_focus_name("my game")
         assert agent._focus_name == "my game"
-        assert agent._session_truth_path == "docs_archive/my game_current_truth.md"
-        assert agent._session_journal_path == "docs_archive/my game_journal.md"
+        assert agent._session_truth_path == _mem("my game_current_truth.md")
+        assert agent._session_journal_path == _mem("my game_journal.md")
 
     def test_set_focus_name_rederives_on_change(self):
         agent = make_agent()
         agent.set_focus_name("alpha")
         agent.set_focus_name("beta")
         assert agent._focus_name == "beta"
-        assert agent._session_truth_path == "docs_archive/beta_current_truth.md"
-        assert agent._session_journal_path == "docs_archive/beta_journal.md"
+        assert agent._session_truth_path == _mem("beta_current_truth.md")
+        assert agent._session_journal_path == _mem("beta_journal.md")
 
     def test_set_focus_name_ignores_blank(self):
         agent = make_agent()
@@ -855,19 +915,19 @@ class TestFocusNameState:
         agent = make_agent()
         agent.set_focus_name("explicit")
         agent._capture_session_journal_path(
-            [self._tool_call("docs_archive/other_journal.md")]
+            [self._tool_call(_mem("other_journal.md"))]
         )
         # The derived paths are authoritative - the wrap-up's writes can't
         # move the record.
-        assert agent._session_journal_path == "docs_archive/explicit_journal.md"
-        assert agent._session_truth_path == "docs_archive/explicit_current_truth.md"
+        assert agent._session_journal_path == _mem("explicit_journal.md")
+        assert agent._session_truth_path == _mem("explicit_current_truth.md")
 
     def test_capture_still_works_when_unset(self):
         agent = make_agent()
         agent._capture_session_journal_path(
-            [self._tool_call("docs_archive/captured_journal.md")]
+            [self._tool_call(_mem("captured_journal.md"))]
         )
-        assert agent._session_journal_path == "docs_archive/captured_journal.md"
+        assert agent._session_journal_path == _mem("captured_journal.md")
 
     # ── /wrapup NAME -> state ───────────────────────────────────────
 
@@ -888,8 +948,8 @@ class TestFocusNameState:
         await agent._process_item(item)
 
         assert agent._focus_name == "my cool game"
-        assert agent._session_truth_path == "docs_archive/my cool game_current_truth.md"
-        assert agent._session_journal_path == "docs_archive/my cool game_journal.md"
+        assert agent._session_truth_path == _mem("my cool game_current_truth.md")
+        assert agent._session_journal_path == _mem("my cool game_journal.md")
 
     # ── seeding from records ────────────────────────────────────────
 
@@ -983,8 +1043,7 @@ class TestFocusNameState:
 
     # ── /focus (apply_focus_name - immediate, not queued) ───────────
 
-    @pytest.mark.asyncio
-    async def test_focus_mid_session_is_set_only(self, tmp_path, monkeypatch):
+    def test_focus_mid_session_is_set_only(self, tmp_path, monkeypatch):
         agent = make_agent()
         monkeypatch.chdir(tmp_path)
         self._write_records(
@@ -995,7 +1054,7 @@ class TestFocusNameState:
         )
         agent.messages = [{"role": "user", "content": "mid session"}]
 
-        message, level = await agent.apply_focus_name("my game")
+        message, level = agent.apply_focus_name("my game")
 
         assert agent._focus_name == "my game"
         assert len(agent.messages) == 1  # no seeding mid-session
@@ -1021,14 +1080,13 @@ class TestFocusNameState:
 
         agent._llm_turn = fake_llm_turn
 
-        await agent.apply_focus_name("aname")
+        agent.apply_focus_name("aname")
         await agent._run_report_and_compact_turn()
 
         wrapup_prompt = agent.messages[-1]["content"]
         assert '"aname"' in wrapup_prompt
 
-    @pytest.mark.asyncio
-    async def test_focus_empty_history_seeds_records(self, tmp_path, monkeypatch):
+    def test_focus_empty_history_seeds_records(self, tmp_path, monkeypatch):
         agent = make_agent()
         monkeypatch.chdir(tmp_path)
         self._write_records(
@@ -1039,7 +1097,7 @@ class TestFocusNameState:
         )
         agent.messages = []
 
-        message, level = await agent.apply_focus_name("my game")
+        message, level = agent.apply_focus_name("my game")
 
         assert agent._focus_name == "my game"
         assert [m["role"] for m in agent.messages] == ["user", "assistant"]
@@ -1049,13 +1107,12 @@ class TestFocusNameState:
             "info",
         )
 
-    @pytest.mark.asyncio
-    async def test_focus_empty_history_no_records(self, tmp_path, monkeypatch):
+    def test_focus_empty_history_no_records(self, tmp_path, monkeypatch):
         agent = make_agent()
         monkeypatch.chdir(tmp_path)
         agent.messages = []
 
-        message, level = await agent.apply_focus_name("my game")
+        message, level = agent.apply_focus_name("my game")
 
         assert agent._focus_name == "my game"
         assert agent.messages == []
@@ -1064,20 +1121,18 @@ class TestFocusNameState:
             "warning",
         )
 
-    @pytest.mark.asyncio
-    async def test_focus_no_arg_reports_current_name(self):
+    def test_focus_no_arg_reports_current_name(self):
         agent = make_agent()
         agent.set_focus_name("my game")
 
-        message, level = await agent.apply_focus_name("")
+        message, level = agent.apply_focus_name("")
 
         assert (message, level) == ("Focus name: my game", "info")
 
-    @pytest.mark.asyncio
-    async def test_focus_no_arg_unset(self):
+    def test_focus_no_arg_unset(self):
         agent = make_agent()
 
-        message, level = await agent.apply_focus_name("")
+        message, level = agent.apply_focus_name("")
 
         assert (message, level) == ("No focus name set", "warning")
 
@@ -1087,42 +1142,34 @@ class TestFocusNameState:
         tui = self._make_tui()
         assert "/focus" in tui.SLASH_COMMANDS
 
-    @pytest.mark.asyncio
-    async def test_focus_tui_handler_applies_immediately(self):
-        """No arg: reports the current name via apply_focus_name('') -
-        no queue item is created; the result goes to the info pane (not
-        a toast), warning level = yellow."""
-        tui = self._make_tui()
-        tui.agent.apply_focus_name = AsyncMock(
-            return_value=("No focus name set", "warning")
-        )
-        tui._update_info_content = MagicMock()
-        tui.update_status = MagicMock()
-        tui._handle_focus_command()
-        await asyncio.sleep(0.01)
-        tui.agent.apply_focus_name.assert_awaited_once_with("")
-        tui._update_info_content.assert_called_once_with(
-            "[yellow]No focus name set[/]"
-        )
-        tui.update_status.assert_called_once()
+    def test_focus_is_a_shared_command(self):
+        """Both front-ends run the same handler - no per-UI focus branch."""
+        from agent13.commands import get_command
 
-    @pytest.mark.asyncio
-    async def test_focus_tui_handler_applies_name(self):
-        """Rest of line (spaces kept, stripped) goes to apply_focus_name;
-        the result goes to the info pane (info level = green)."""
-        tui = self._make_tui()
-        tui.agent.apply_focus_name = AsyncMock(
-            return_value=("Focus name is now set to my game", "info")
-        )
-        tui._update_info_content = MagicMock()
-        tui.update_status = MagicMock()
-        tui._handle_focus_command("  my game  ")
-        await asyncio.sleep(0.01)
-        tui.agent.apply_focus_name.assert_awaited_once_with("my game")
-        tui._update_info_content.assert_called_once_with(
-            "[green]Focus name is now set to my game[/]"
-        )
-        tui.update_status.assert_called_once()
+        assert get_command("focus").handler is not None
+
+    def test_focus_handler_reports_and_refreshes(self):
+        """No arg: reports the current name; the status bar shows the focus
+        segment, so the result asks for a refresh."""
+        from agent13.commands import execute_focus
+
+        agent = make_agent()
+        result = execute_focus(agent, "")
+
+        assert result.message == "No focus name set"
+        assert result.refresh_status is True
+
+    def test_focus_handler_strips_the_name(self):
+        """Rest of line (spaces kept, stripped) goes to apply_focus_name."""
+        from agent13.commands import execute_focus
+
+        agent = make_agent()
+        agent.messages = [{"role": "user", "content": "mid session"}]
+
+        result = execute_focus(agent, "  my game  ")
+
+        assert agent._focus_name == "my game"
+        assert result.message == "Focus name is now set to my game"
 
     def test_repl_help_lists_focus(self):
         from agent13.repl import COMMANDS
@@ -1137,6 +1184,12 @@ class TestFocusStartupPreprocess:
     and replies a minimal ack while the user types. The TUI wiring is
     _apply_focus_startup (called from on_mount); the REPL wiring is the
     startup_focus call in run_repl."""
+
+    @pytest.fixture(autouse=True)
+    def _isolated_records(self, tmp_path, monkeypatch):
+        """The records directory is ``<cwd>/records`` - run the
+        test in a temp project so it never touches the repo's own."""
+        monkeypatch.chdir(tmp_path)
 
     def _make_tui(self, **kwargs):
         from ui.tui import AgentTUI
@@ -1153,15 +1206,11 @@ class TestFocusStartupPreprocess:
 
     @staticmethod
     def _write_records(tmp_path, name, truth=None, journal=None):
-        (tmp_path / "docs_archive").mkdir(exist_ok=True)
+        records = get_records_dir()
         if truth is not None:
-            (tmp_path / "docs_archive" / f"{name}_current_truth.md").write_text(
-                truth, encoding="utf-8"
-            )
+            (records / f"{name}_current_truth.md").write_text(truth, encoding="utf-8")
         if journal is not None:
-            (tmp_path / "docs_archive" / f"{name}_journal.md").write_text(
-                journal, encoding="utf-8"
-            )
+            (records / f"{name}_journal.md").write_text(journal, encoding="utf-8")
 
     @pytest.mark.asyncio
     async def test_tui_enqueues_preprocess_turn(self, tmp_path, monkeypatch):
@@ -1370,7 +1419,7 @@ class TestAutoContextChain:
         """The chain budget is spent: the CHAT_REBUILD footer is the
         exhaustion notice — a persistent record in the wiped window of why
         the turn stopped (the toast alone is transient and was invisible
-        by morning, observed 2026-10-07 edmac overnight run)."""
+        by morning, observed 2026-10-07 on an overnight run)."""
         agent = make_agent(
             auto_context_threshold=1000,
             auto_context_action="report_and_compact",
@@ -1555,156 +1604,6 @@ class TestSessionChainCount:
 
         assert agent._chain_count == 0
         assert agent._session_started_at != "2026-09-21T14:32:00"
-
-
-# ────────────────────────────────────────────────────────────────────────────
-# In-flight instruction carry (standing instruction across chain restarts)
-# ────────────────────────────────────────────────────────────────────────────
-
-
-class TestInFlightInstructionCarry:
-    """The turn-start user instruction is carried VERBATIM into every chain
-    restart's nudge. The user's standing instruction is the intent source
-    across chains: a mid-turn question survives its restart, and the intro
-    no longer commands ticket work (the former "continue on the top
-    unblocked ticket" line is gone)."""
-
-    @staticmethod
-    def _capture(agent) -> list:
-        events: list = []
-
-        async def capture(event_type, data):
-            events.append((event_type, data))
-
-        agent.emit = capture
-        return events
-
-    @pytest.mark.asyncio
-    async def test_nudge_carries_instruction_verbatim(self):
-        """report_and_compact restart: the nudge is the carry hint with the
-        turn-start instruction verbatim; the intro has no ticket command."""
-        agent = make_agent(
-            auto_context_threshold=1000,
-            auto_context_action="report_and_compact",
-            auto_context_chain=1,
-        )
-        agent.messages = [
-            {"role": "user", "content": "close the first ticket"},
-            {"role": "assistant", "content": "on it"},
-        ]
-        agent._in_flight_user_request = "close the first ticket"
-        agent.compact_history = AsyncMock(return_value=(True, "Compacted"))
-        self._capture(agent)
-        agent._report_and_compact_triggered = True
-        agent._auto_context_triggered = True
-
-        await agent._run_auto_context_post_turn()
-
-        nudge = agent.messages[-1]
-        assert nudge["role"] == "user"
-        assert nudge.get("injected") is True
-        assert nudge["content"] == AUTO_CONTEXT_CARRY_HINT.format(
-            instruction="close the first ticket"
-        )
-        # The intro (first message) no longer commands the ticket queue.
-        assert "top unblocked ticket" not in agent.messages[0]["content"]
-        assert "Read the records below." in agent.messages[0]["content"]
-
-    @pytest.mark.asyncio
-    async def test_nudge_falls_back_to_bare_hint_without_instruction(self):
-        """No captured instruction (e.g. manual /chain while idle) -> the
-        bare continue hint, as before."""
-        agent = make_agent(
-            auto_context_threshold=1000,
-            auto_context_action="report_and_compact",
-            auto_context_chain=1,
-        )
-        agent.messages = [{"role": "assistant", "content": "prior turn"}]
-        agent._in_flight_user_request = ""
-        agent.compact_history = AsyncMock(return_value=(True, "Compacted"))
-        self._capture(agent)
-        agent._report_and_compact_triggered = True
-        agent._auto_context_triggered = True
-
-        await agent._run_auto_context_post_turn()
-
-        assert agent.messages[-1]["content"] == AUTO_CONTEXT_CONTINUE_HINT
-
-    @pytest.mark.asyncio
-    async def test_instruction_persists_across_restarts_in_same_turn(self):
-        """Re-tripping continuation turn, chain=2: BOTH restarts' nudges
-        carry the original instruction (the stored state, not a re-scan of
-        the post-restart history, which would find the injected intro)."""
-        agent = make_agent(
-            auto_context_threshold=1000,
-            auto_context_action="report_and_compact",
-            auto_context_chain=2,
-        )
-        nudges: list = []
-
-        async def fake_llm_turn(*args, **kwargs):
-            if agent.messages:
-                nudges.append(agent.messages[-1]["content"])
-            agent._auto_context_triggered = True
-
-        agent._llm_turn = fake_llm_turn
-        agent.messages = [{"role": "user", "content": "close the first ticket"}]
-        agent._in_flight_user_request = "close the first ticket"
-        agent.compact_history = AsyncMock(return_value=(True, "Compacted"))
-        self._capture(agent)
-        agent._report_and_compact_triggered = True
-        agent._auto_context_triggered = True
-
-        await agent._run_auto_context_post_turn()
-
-        carried = [c for c in nudges if "standing instruction" in c]
-        assert len(carried) == 2
-        assert all("close the first ticket" in c for c in carried)
-
-    def test_capture_from_restored_history(self):
-        """Resume path: the scan finds the last genuine user message of the
-        restored history (the interrupted turn's instruction)."""
-        agent = make_agent()
-        agent.messages = [
-            {"role": "user", "content": "earlier question"},
-            {"role": "assistant", "content": "earlier answer"},
-            {"role": "user", "content": "close the first ticket"},
-            {"role": "assistant", "content": "working on it"},
-            {"role": "tool", "content": "tool output", "tool_call_id": "x"},
-        ]
-        assert agent._capture_in_flight_user_request() == "close the first ticket"
-        # Stored: a second call is a no-op returning the same value.
-        assert agent._in_flight_user_request == "close the first ticket"
-
-    def test_capture_skips_injected_and_interrupt_messages(self):
-        agent = make_agent()
-        agent.messages = [
-            {"role": "user", "content": "real question"},
-            {"role": "user", "content": "injected nudge", "injected": True},
-            {"role": "user", "content": "[Interrupted]", "interrupt": True},
-        ]
-        assert agent._capture_in_flight_user_request() == "real question"
-
-    def test_capture_no_user_message_returns_empty(self):
-        agent = make_agent()
-        agent.messages = []
-        assert agent._capture_in_flight_user_request() == ""
-        assert agent._in_flight_user_request == ""
-
-    def test_turn_state_reset_clears_instruction(self):
-        agent = make_agent()
-        agent._in_flight_user_request = "stale instruction"
-        agent._reset_auto_context_turn_state()
-        assert agent._in_flight_user_request == ""
-
-    def test_intro_and_carry_hint_text(self):
-        intro = CHAIN_RESTART_INTRO.format(truth_file="t.md", journal_file="j.md")
-        assert "top unblocked ticket" not in intro
-        assert intro.endswith("Read the records below.")
-        assert AUTO_CONTEXT_CARRY_HINT.format(instruction="q") == (
-            "[Context was compacted mid-turn. Your standing instruction for "
-            "this run, verbatim:\n" '"q"\nContinue it.]'
-        )
 
 
 # ────────────────────────────────────────────── Pre-turn threshold ──────────────────────────────────────────────
@@ -1914,9 +1813,18 @@ class TestAgentTUIWiring:
         assert tui.agent.report_and_compact_prompt == "CUSTOM WRAP-UP"
 
     def test_tui_resolves_prompt_when_not_given(self):
+        from agent13.prompts import PromptManager
+
+        # Hermetic: a developer's prompts.yaml may carry an older
+        # report_and_compact entry (ensure_default_prompts never overwrites an
+        # existing file), which would make this assertion depend on the machine.
+        # Drop the entry so resolution must fall back to the builtin default.
+        manager = PromptManager()
+        manager.prompts.pop("report_and_compact", None)
         tui = self._make_tui(
             auto_context_action="report_and_compact",
             report_and_compact_prompt="",
+            prompt_manager=manager,
         )
         assert tui.agent.report_and_compact_prompt == DEFAULT_REPORT_AND_COMPACT_PROMPT
 
@@ -1937,16 +1845,29 @@ class TestAgentTUIWiring:
         ]
 
     def test_status_shows_auto_context_lines(self):
+        """/status reports the four auto-context settings (shared handler)."""
+        from agent13.commands import execute_status
+
         tui = self._make_tui()
-        captured = []
-        tui._update_info_content = captured.append
-        tui._handle_status_command()
-        assert len(captured) == 1
-        text = captured[0]
-        assert "auto-context: [yellow]220,000 tokens[/]" in text
-        assert "auto-action: [yellow]report_and_compact[/]" in text
-        assert "auto-chain: [yellow]3[/]" in text
-        assert "chains: [yellow]0/3[/]" in text
+        text = execute_status(tui.agent).message
+        assert "auto-context: 220,000 tokens" in text
+        assert "auto-action: report_and_compact" in text
+        assert "auto-chain: 3" in text
+        assert "chains: 0/3" in text
+
+    def test_status_shows_idle_save(self):
+        """The idle auto-save setting is visible in /status (on and off)."""
+        from agent13.commands import execute_status
+
+        tui = self._make_tui(auto_save_idle_seconds=120)
+        assert "idle-save: 120s idle" in execute_status(tui.agent).message
+
+        tui = self._make_tui(auto_save_idle_seconds=0)
+        assert "idle-save: off" in execute_status(tui.agent).message
+
+    def test_tui_forwards_auto_save_idle(self):
+        tui = self._make_tui(auto_save_idle_seconds=45)
+        assert tui.agent.auto_save_idle_seconds == 45
 
     def test_status_bar_shows_chain_used(self):
         """Bottom bar trn: segment - three segments total:turn:turns.
@@ -1995,8 +1916,359 @@ class TestAgentTUIWiring:
         tui.update_status()
         assert "trn: 5:1:0" in right[-1]
 
+    def test_status_bar_shows_task_duration(self):
+        """Bottom bar dur: comes from the agent's task clock.
+
+        The clock is the agent's (it survives wrap-up + chain restarts and
+        freezes while paused); the bar only formats it. A frozen clock keeps
+        showing the finished task's total, so the number does not drop to the
+        last turn's duration when the agent goes idle.
+        """
+
+        class _Bar:
+            def __init__(self):
+                self.values = []
+
+            def update(self, v):
+                self.values.append(v)
+
+        tui = self._make_tui()
+        tui._status_left = _Bar()
+        tui._status_right = _Bar()
+        right = tui._status_right.values
+
+        # No task yet -> no dur: segment
+        tui.update_status()
+        assert "dur:" not in right[-1]
+
+        # A task in progress -> dur: shown, H:MM (hours and minutes, never
+        # seconds: the numerator used to be m:ss, so 125 s rendered "2:05").
+        tui.agent.task_clock.start()
+        tui.agent.task_clock._bank = 125.0  # 2m05s without sleeping
+        tui.update_status()
+        assert "dur: 0:02" in right[-1]
+
+        # Paused -> frozen at the same value, not growing
+        tui.agent.task_clock.pause()
+        tui.update_status()
+        assert "dur: 0:02" in right[-1]
+
+        # Idle (task over) -> the total stays on screen
+        tui.agent.task_clock.stop()
+        tui.update_status()
+        assert "dur: 0:02" in right[-1]
+
+    def test_status_bar_ctx_colour_tracks_threshold(self):
+        """The Ctx segment goes yellow at 80% and red at 90% of the
+        auto-context threshold, using the number the bar DISPLAYS.
+
+        The estimate drives the colour while the count is estimated: the
+        grounded count can still be low while the live estimate is already
+        past the band, and the bar must not show a green number the threshold
+        check is about to act on.
+        """
+
+        class _Bar:
+            def __init__(self):
+                self.values = []
+
+            def update(self, v):
+                self.values.append(v)
+
+        tui = self._make_tui()
+        tui._status_left = _Bar()
+        tui._status_right = _Bar()
+        right = tui._status_right.values
+        tui.agent.auto_context_threshold = 200000
+        tui.context_is_estimated = False
+
+        # Well under the first band -> plain segment
+        tui.prompt_tokens = 100000
+        tui.update_status()
+        assert "Ctx: 100.0k" in right[-1]
+        assert "[yellow]" not in right[-1]
+        assert "[red]" not in right[-1]
+
+        # 80% -> yellow
+        tui.prompt_tokens = 160000
+        tui.update_status()
+        assert "[yellow]Ctx: 160.0k[/]" in right[-1]
+
+        # 90% -> red
+        tui.prompt_tokens = 180000
+        tui.update_status()
+        assert "[red]Ctx: 180.0k[/]" in right[-1]
+
+        # Estimated count: the ESTIMATE is what the bar shows, so it decides
+        tui.prompt_tokens = 100000
+        tui.estimated_context = 190000
+        tui.context_is_estimated = True
+        tui.update_status()
+        assert "[red]Ctx: ~190.0k[/]" in right[-1]
+
+        # Auto-context disabled (threshold 0) -> no colour, whatever the count
+        tui.agent.auto_context_threshold = 0
+        tui.update_status()
+        assert "Ctx: ~190.0k" in right[-1]
+        assert "[red]" not in right[-1]
+
+    def test_status_bar_ctx_colours_come_from_config(self):
+        """The four [ui] colours reach the bar: a "black on red" pair renders
+        a solid block, and blanking all four removes the styling entirely."""
+        from unittest.mock import MagicMock
+
+        from ui.tui import AgentTUI
+
+        class _Bar:
+            def __init__(self):
+                self.values = []
+
+            def update(self, v):
+                self.values.append(v)
+
+        tui = AgentTUI(
+            client=MagicMock(),
+            model="test-model",
+            model_names=["test-model"],
+            provider="test",
+            prompt_manager=None,
+            ctx_warn_fg="black",
+            ctx_warn_bg="yellow",
+            ctx_crit_fg="black",
+            ctx_crit_bg="red",
+        )
+        tui._status_left = _Bar()
+        tui._status_right = _Bar()
+        right = tui._status_right.values
+        tui.agent.auto_context_threshold = 200000
+        tui.context_is_estimated = False
+
+        tui.prompt_tokens = 170000
+        tui.update_status()
+        assert "[black on yellow]Ctx: 170.0k[/]" in right[-1]
+
+        tui.prompt_tokens = 190000
+        tui.update_status()
+        assert "[black on red]Ctx: 190.0k[/]" in right[-1]
+
+        # All four blank -> the segment is plain, never "[None]"
+        for attr in ("_ctx_warn_fg", "_ctx_warn_bg", "_ctx_crit_fg", "_ctx_crit_bg"):
+            setattr(tui, attr, "")
+        tui.update_status()
+        assert "Ctx: 190.0k" in right[-1]
+        assert "[" not in right[-1].split("Ctx:")[1]
+        assert "None" not in right[-1]
+
+        # Display config stays in the TUI: core carries no UI settings, so a
+        # shared handler can never read a colour off the agent.
+        for attr in ("ctx_warn_fg", "ctx_warn_bg", "ctx_crit_fg", "ctx_crit_bg"):
+            assert not hasattr(tui.agent, attr), f"agent must not carry {attr}"
+
 
 # ───────────────────────────────────────────────────────────────────────── TUI commands ─────────────────────────────────────────────────────────────────────────
+
+
+class TestStatusUpdateReentrancy:
+    """``update_status`` must not re-enter itself.
+
+    A watcher fired by a reactive ``update_status`` reads can call straight
+    back in. The cycle then spins the event loop without ever yielding, so
+    input, signals and /save all queue behind it - the app looks alive but is
+    unreachable (observed 2026-11-19: 80 minutes at 100% CPU, ~19k calls/s).
+    """
+
+    def _make_tui(self):
+        from unittest.mock import MagicMock
+
+        from ui.tui import AgentTUI
+
+        return AgentTUI(
+            client=MagicMock(),
+            model="test-model",
+            model_names=["test-model"],
+            provider="test",
+            prompt_manager=None,
+        )
+
+    def test_a_nested_update_status_is_dropped(self):
+        tui = self._make_tui()
+        calls = []
+
+        def body():
+            calls.append(1)
+            tui.update_status()  # re-entrant: must be dropped
+
+        tui._update_status_body = body
+        tui.update_status()
+
+        assert len(calls) == 1, "the nested call ran - the guard did not hold"
+
+    def test_the_guard_clears_after_a_normal_call(self):
+        tui = self._make_tui()
+        tui._update_status_body = lambda: None
+
+        tui.update_status()
+
+        assert tui._updating_status is False
+
+    def test_the_guard_clears_after_an_exception(self):
+        """A raising body must not wedge the guard and freeze the bar."""
+        tui = self._make_tui()
+
+        def boom():
+            raise RuntimeError("boom")
+
+        tui._update_status_body = boom
+        with pytest.raises(RuntimeError):
+            tui.update_status()
+
+        assert tui._updating_status is False
+
+
+class TestTokenDisplayAfterHistoryReplaced:
+    """The status bar's Ctx number must follow the history, not the last
+    safe-point estimate.
+
+    Regression, reported 2026-11-19: after a compaction the bar showed ~13k
+    (an estimate). Loading a 180k save left it at ~13k until the next LLM
+    call, because only a TOKEN_USAGE event cleared ``context_is_estimated``
+    and none arrives until a turn runs. A restart "fixed" it because a fresh
+    TUI starts with the flag False.
+    """
+
+    def _make_tui(self):
+        from unittest.mock import MagicMock
+
+        from ui.tui import AgentTUI
+
+        return AgentTUI(
+            client=MagicMock(),
+            model="test-model",
+            model_names=["test-model"],
+            provider="test",
+            prompt_manager=None,
+        )
+
+    def _stub_panes(self, tui):
+        """The handlers touch widgets that only exist once mounted."""
+        tui._update_info_content = MagicMock()
+        tui._replay_loaded_messages = AsyncMock()
+        return tui
+
+    def test_ground_token_display_sets_counts_and_drops_the_estimate(self):
+        tui = self._make_tui()
+        tui._set_context_estimate(13_000)
+        assert tui.context_is_estimated is True
+
+        tui._ground_token_display(180_000, 500)
+
+        assert (tui.prompt_tokens, tui.completion_tokens, tui.total_tokens) == (
+            180_000,
+            500,
+            180_500,
+        )
+        assert tui.context_is_estimated is False
+
+    @pytest.mark.asyncio
+    async def test_context_loaded_drops_the_stale_estimate(self):
+        """A /load at a safe point shows the loaded record's count."""
+        tui = self._stub_panes(self._make_tui())
+        tui._set_context_estimate(13_000)
+        tui.agent.prompt_tokens = 180_000
+        tui.agent.completion_tokens = 500
+
+        await tui.agent.emit(
+            AgentEvent.CONTEXT_LOADED,
+            {"success": True, "message": "Loaded", "incomplete": False},
+        )
+
+        assert tui.context_is_estimated is False
+        assert tui.prompt_tokens == 180_000
+        assert tui.total_tokens == 180_500
+
+    @pytest.mark.asyncio
+    async def test_messages_cleared_drops_the_stale_estimate(self):
+        """A /clear at a safe point must not leave ~13k on an empty session."""
+        tui = self._stub_panes(self._make_tui())
+        tui._set_context_estimate(13_000)
+
+        await tui.agent.emit(
+            AgentEvent.MESSAGES_CLEARED, {"count": 5, "mode": "all"}
+        )
+
+        assert tui.context_is_estimated is False
+        assert tui.prompt_tokens == 0
+        assert tui.total_tokens == 0
+
+    @pytest.mark.asyncio
+    async def test_failed_load_leaves_the_estimate_alone(self):
+        """A load that FAILED did not replace the history - the estimate
+        still describes it, so it must not be dropped."""
+        tui = self._stub_panes(self._make_tui())
+        tui._set_context_estimate(13_000)
+
+        await tui.agent.emit(
+            AgentEvent.CONTEXT_LOADED,
+            {"success": False, "message": "Not found", "incomplete": False},
+        )
+
+        assert tui.context_is_estimated is True
+        assert tui.estimated_context == 13_000
+
+
+class TestStatusBarColours:
+    """[ui] status_fg / status_bg paint the bar itself.
+
+    Applied in on_mount, so these need a mounted app - the widgets do not
+    exist before that. The two child Statics carry their own `color: white`
+    in the stylesheet, which is why the foreground must reach them too.
+    """
+
+    def _make(self, **kwargs):
+        from unittest.mock import MagicMock
+
+        from ui.tui import AgentTUI
+
+        defaults = dict(
+            client=MagicMock(),
+            model="test-model",
+            model_names=["test-model"],
+            provider="test",
+            prompt_manager=None,
+        )
+        defaults.update(kwargs)
+        return AgentTUI(**defaults)
+
+    @pytest.mark.asyncio
+    async def test_configured_colours_are_applied(self):
+        app = self._make(status_fg="black", status_bg="#333333")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            bar = app.query_one("#status-line")
+            assert bar.styles.background.hex.lower() == "#333333"
+            assert bar.styles.color.hex.lower() == "#000000"
+            for widget_id in ("#status-left", "#status-right"):
+                assert app.query_one(widget_id).styles.color.hex.lower() == "#000000"
+
+    @pytest.mark.asyncio
+    async def test_defaults_leave_the_theme_alone(self):
+        """Both "" -> the stylesheet's own colours survive untouched."""
+        app = self._make()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            bar = app.query_one("#status-line")
+            primary = app.get_css_variables()["primary"]
+            assert bar.styles.background.hex.lower() == primary.lower()
+            assert app.query_one("#status-left").styles.color.hex.lower() == "#ffffff"
+
+    @pytest.mark.asyncio
+    async def test_background_only_keeps_the_theme_foreground(self):
+        app = self._make(status_bg="#333333")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            bar = app.query_one("#status-line")
+            assert bar.styles.background.hex.lower() == "#333333"
+            assert app.query_one("#status-left").styles.color.hex.lower() == "#ffffff"
 
 
 class TestAutoContextTuiCommands:
@@ -2025,10 +2297,19 @@ class TestAutoContextTuiCommands:
         tui._update_info_content = captured.append
         return captured
 
+    def _run(self, tui, name, args):
+        """Run a shared command through the registry, capturing its message."""
+        from agent13.commands import run_command
+
+        result = run_command(name, tui.agent, args)
+        assert result is not None, f"{name} is not a shared command"
+        tui._update_info_content(result.message)
+        return result
+
     def test_threshold_noarg_two_lines_on_default(self):
         tui = self._make_tui()  # threshold 220000, action report_and_compact, chain 3
         captured = self._info(tui)
-        tui._handle_auto_context_threshold_command("")
+        self._run(tui, "auto_context_threshold", "")
         assert len(captured) == 1
         assert "Auto-context: on (220,000 tokens)" in captured[0]
         assert "Action: report_and_compact (chain: 3)" in captured[0]
@@ -2036,49 +2317,58 @@ class TestAutoContextTuiCommands:
     def test_threshold_noarg_two_lines_on_compact(self):
         tui = self._make_tui(auto_context_action="compact", auto_context_chain=0)
         captured = self._info(tui)
-        tui._handle_auto_context_threshold_command("")
+        self._run(tui, "auto_context_threshold", "")
         assert "Auto-context: on (220,000 tokens)" in captured[0]
         assert "Action: compact (chain: 0)" in captured[0]
 
     def test_threshold_noarg_action_none_ignores_chain(self):
         tui = self._make_tui(auto_context_action="none", auto_context_chain=5)
         captured = self._info(tui)
-        tui._handle_auto_context_threshold_command("")
+        self._run(tui, "auto_context_threshold", "")
         assert "Action: none (chain ignored)" in captured[0]
         assert "chain: 5" not in captured[0]
 
     def test_threshold_noarg_off(self):
         tui = self._make_tui(auto_context_threshold=0)
         captured = self._info(tui)
-        tui._handle_auto_context_threshold_command("")
+        self._run(tui, "auto_context_threshold", "")
         assert "Auto-context: off (threshold 0)" in captured[0]
         assert "Action:" not in captured[0]
 
     def test_threshold_set_still_works(self):
         tui = self._make_tui()
         captured = self._info(tui)
-        tui._handle_auto_context_threshold_command("150k")
+        self._run(tui, "auto_context_threshold", "150k")
         assert tui.agent.auto_context_threshold == 150000
         assert "Auto-context: on (150,000 tokens)" in captured[0]
+
+    def test_threshold_set_refreshes_the_status_bar(self):
+        """The Ctx colour is a function of the threshold (warn 80%, crit 90%),
+        so setting it must repaint the bar - otherwise it keeps the old band.
+        Found live: the bar sat unstyled after /auto_context_threshold 6000."""
+        tui = self._make_tui()
+        self._info(tui)
+        assert self._run(tui, "auto_context_threshold", "150k").refresh_status is True
+        assert self._run(tui, "auto_context_threshold", "0").refresh_status is True
 
     def test_action_noarg_shows_current_and_valid(self):
         tui = self._make_tui(auto_context_action="report_and_compact")
         captured = self._info(tui)
-        tui._handle_auto_context_action_command("")
+        self._run(tui, "auto_context_action", "")
         assert "Auto-context action: report_and_compact" in captured[0]
         assert "compact | report_and_compact | none" in captured[0]
 
     def test_action_set_valid(self):
         tui = self._make_tui()
         captured = self._info(tui)
-        tui._handle_auto_context_action_command("none")
+        self._run(tui, "auto_context_action", "none")
         assert tui.agent.auto_context_action == "none"
         assert "Auto-context action: none" in captured[0]
 
     def test_action_set_invalid_lists_the_three(self):
         tui = self._make_tui()
         captured = self._info(tui)
-        tui._handle_auto_context_action_command("bogus")
+        self._run(tui, "auto_context_action", "bogus")
         assert tui.agent.auto_context_action == "report_and_compact"  # unchanged
         assert "Usage: /auto_context_action" in captured[0]
         assert "compact" in captured[0]
@@ -2088,7 +2378,7 @@ class TestAutoContextTuiCommands:
     def test_chain_noarg_shows_suffix(self):
         tui = self._make_tui(auto_context_chain=3)
         captured = self._info(tui)
-        tui._handle_auto_context_chain_command("")
+        self._run(tui, "auto_context_chain", "")
         assert "Auto-context chain: 3" in captured[0]
         assert "(restarts per turn; 0 = stop after the action)" in captured[0]
 
@@ -2096,30 +2386,30 @@ class TestAutoContextTuiCommands:
         tui = self._make_tui(auto_context_nudge_cap=2)
         tui.agent._degenerate_nudges_total = 4
         captured = self._info(tui)
-        tui._handle_auto_context_nudge_cap_command("")
+        self._run(tui, "auto_context_nudge_cap", "")
         assert "Degeneration guard: on (cap 2)" in captured[0]
         assert "nudges: 4" in captured[0]
 
     def test_nudge_cap_noarg_shows_off_at_zero(self):
         tui = self._make_tui(auto_context_nudge_cap=0)
         captured = self._info(tui)
-        tui._handle_auto_context_nudge_cap_command("")
+        self._run(tui, "auto_context_nudge_cap", "")
         assert "Degeneration guard: off (nudge cap 0)" in captured[0]
 
     def test_nudge_cap_set_and_zero_disables(self):
         tui = self._make_tui()
         captured = self._info(tui)
-        tui._handle_auto_context_nudge_cap_command("3")
+        self._run(tui, "auto_context_nudge_cap", "3")
         assert tui.agent.auto_context_nudge_cap == 3
         assert "Degeneration guard cap: 3" in captured[-1]
-        tui._handle_auto_context_nudge_cap_command("0")
+        self._run(tui, "auto_context_nudge_cap", "0")
         assert tui.agent.auto_context_nudge_cap == 0
         assert "Degeneration guard: off (nudge cap 0)" in captured[-1]
 
     def test_nudge_cap_invalid_shows_usage(self):
         tui = self._make_tui()
         captured = self._info(tui)
-        tui._handle_auto_context_nudge_cap_command("bogus")
+        self._run(tui, "auto_context_nudge_cap", "bogus")
         assert tui.agent.auto_context_nudge_cap == 2  # unchanged
         assert "Usage: /auto_context_nudge_cap" in captured[0]
 

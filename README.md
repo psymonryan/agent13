@@ -7,17 +7,17 @@
      <a href="https://github.com/psymonryan/agent13/blob/main/LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-green?style=flat"></a>
 </p>
 
-**A self-coding AI agent that runs where others won't - built for tight VRAM, any OpenAI-compatible API.**
+**A self-coding AI agent with durable memory that runs where others won't - tight VRAM, any OpenAI-compatible API.**
 
 ![Agent13 - built for tight spaces](./images/agent13maxing.png)
 
 > Named after the agent from Get Smart who always seemed to end up in the tightest places - a mailbox, a fridge, a grandfather clock, and now a GPU?
 
-- **Runs well in low VRAM environments** - works with any OpenAI-compatible API: llama-server, Ollama, vLLM, LM Studio, OpenRouter
-- **Incremental compaction or full compaction with steering** ; journals tool responses so context stays small without losing information, or compacts the entire message thread
-- **Autonomous mode** - If you have enough context, this mode automatically maintains a truths document and a journal + a bridging compaction - Allows the agent to stay on task for many context cycles (author has run Qwen3.8 for more than 24 hours on a single task)
+- **Durable focus** - the agent keeps a truth file and a journal for each project, this makes it build expertise specific to its current focus. 
+- **Factory mode** - point it at a ticket list, arm `/grind 4h`, walk away. It works the tickets, asks you only when a decision is genuinely yours, and writes up what it did.
+- **Runs well in low VRAM** - incremental compaction (best for planning) or full compaction with steering; journals tool responses so context stays small without losing information. Works with any OpenAI-compatible API: llama-server, Ollama, vLLM, LM Studio, OpenRouter. The author has run Qwen3.8 for more than 200 compactions without it losing the plot.
 - **No telemetry** - privacy focussed
-- **Screen Reader Friendly** - Has both a REPL mode and the option to also to split output to a separate file which can then be tailed into a text to speech engine such as Linux-Speakup
+- **Screen reader friendly** - REPL mode, or split output to a separate file and tail it into a text-to-speech engine such as Linux-Speakup
 
 ## How is this different?
 
@@ -27,13 +27,15 @@ Most AI agents fix tool-use issues by adding more instructions: *"do this, don't
 
 agent13 takes the opposite approach: *every tool was refined by watching how models actually used them, then modifying the tool to suit the AI's expectations.*
 
-After applying this approach, tool-use success across open-weight models (Qwen, GLM, Kimi, Devstral) went from around 50% to near 95%, this is a real speedup when the agent is trying to get things done!  - PS. If you dont like this agent, then tell your agent to steal the edit tools from this agent. :grinning:
+After applying this approach, tool-use success across open-weight models (Qwen, GLM, Kimi, Devstral) went from around 50% to near 95%, this is a real speedup when the agent is trying to get things done!  - PS. If you dont feel like using this agent, then tell your agent to steal the edit tools from this agent. :grinning:
 
 ### Is agent13 for you?
 
 **agent13 is for you if:**
 
 - You run local models and need an agent that keeps VRAM context low
+- You want it to keep working while you're away
+- You come back to the same project across sessions and want it to remember
 - You want to switch models/providers without restarting (mid session)
 - You care about privacy
 - You're comfortable with terminal interfaces
@@ -47,9 +49,11 @@ After applying this approach, tool-use success across open-weight models (Qwen, 
 
 ## Features
 
-**Reconfigurable mid-flight.** While the agent is processing, you can: change models, switch providers, pause/resume, save session for later, or inject interrupt prompts with the `!!`  prefix. Eg:
+**Durable focus.** Give the work a name (`/focus my-project`) and the agent maintains two files for it in the project's `records/` directory: a truth file (what is known, organised by topic, with open tickets) and a journal (what happened, and when). Every context cycle ends with the agent updating them; every new session starts with the agent reading them back. Restarting is cheap because nothing important lives only in the conversation.
 
-**Inflight Steering**, without cancelling the agents turn, you can inject interrupt prompts with the `!!`  prefix. Eg:
+**Factory mode.** `/grind 4h` arms a goal window: for the next four hours, when the agent finishes a turn and would idle, it picks its own next step and keeps going. If it hits a decision that is genuinely yours, it stops and asks. Everything else it decides itself. Combine it with the ticket list in the focus's record and the agent can chew through work for hours unattended.
+
+**Reconfigurable mid-flight.** While the agent is processing, you can: change models, switch providers, pause/resume, save session for later, or steer the running turn with the `!!`  prefix. Eg:
 
 ```
 > !!Oh, and I forgot to mention that the doco you need lives in ~/mydocs
@@ -57,11 +61,13 @@ After applying this approach, tool-use success across open-weight models (Qwen, 
 
 This means when you see the agent struggling with something, or you forgot to tell it something, you can provide this information without breaking/cancelling the current turn and experiencing loss of work or worse, another round of full prompt processing.
 
+Actually, since I implemented this, most other agent harnesses can now do this in one form or another.
+
 **TUI interface.** Full-featured Textual-based terminal UI: streaming responses, queue management (multiple prompts in flight), priority commands, info pane with context stats, session auto-save, and markdown rendering. Non-blocking input throughout.
 
-**CLI interface.** Run one-shot prompts from the command line or scripts, with pretty mode (rich output) on or off. Ideal for automation, CI pipelines, and shell scripting.
+**CLI interface.** Run one-shot prompts from the command line or scripts, with pretty mode (rich output) on or off. Ideal for automation, CI pipelines, and shell scripting. Works nicely with tmux and includes special code to assist with multi-window multi-pane focus (cursor vanished when the pane is unfocussed)
 
-**Skills and MCP** As you would expect.
+**Skills and MCP** Built in - As you would expect. They are now versioned, so if the ones I provide get updated, then yours will update also (unless you changed them, then you get a toast warning)
 
 **Sandbox mode.** Five security profiles from unrestricted to macOS Seatbelt sandboxing. Tools run isolated by default; escalate only when needed. Configurable per-session (`--sandbox`) or per-tool. (Note: command tool sandboxing currently macOS-only via Seatbelt.)
 
@@ -71,7 +77,9 @@ This means when you see the agent struggling with something, or you forgot to te
 
 **Tools that work WITH the Agent.** Automatically correcting for known LLM shortcomings with feedback, rollback and hinting on errors to help the agents next try. 
 
-**Tools automatically self-throttle** - if the output of a tool call is larger than a threshold, the agent is made aware and can chunk results without blowing the context. When using Vision models, images are pruned from the message history once the model has seen them.
+**Tools automatically self-throttle** - if the output of a tool call is larger than a threshold, the agent is made aware and can chunk results without blowing the context. 
+
+Vision images stay in the history for their whole turn, because rewriting them makes a considerable kv cache hit. They remain until the next compaction.
 
 ## Quick start
 
@@ -88,7 +96,7 @@ If your terminal says `uv` is not recognised after installing, close and reopen 
 **From GitHub release** (recommended - latest stable):
 
 ```bash
-uv tool install https://github.com/psymonryan/agent13/releases/download/v0.6.0/agent13-0.6.0-py3-none-any.whl
+uv tool install https://github.com/psymonryan/agent13/releases/download/v0.7.0/agent13-0.7.0-py3-none-any.whl
 ```
 
 **From source** (for development):
@@ -206,6 +214,18 @@ I dont like the status bar colours, change them for me.
 
 For the full reference (slash commands, config keys, modes) and troubleshooting, see [USER_GUIDE.md](USER_GUIDE.md).
 
+### 8. Try the factory
+
+Get the agent working while you're not there. In a project directory:
+
+```text
+/focus demo
+/grind 20m Write a FizzBuzz script, write tests for it, then run the tests
+/wrapup
+```
+
+The agent keeps working through the goal until it's done or the window closes, then hands back. `/wrapup` writes what it learned into the focus's record, so next session `/focus demo` puts it back where it left off. See [Working with a focus](USER_GUIDE.md#working-with-a-focus) for the full workflow. IMO the way I'm doing focus works way better than various so called 'memory' mcp servers. The only disadvantage is that as your focus documentation grows, you will consume more context.
+
 ### Debugging
 
 Use: `uv run ./utils/analyse-debug.py` to explore the possibly huge debug.log (you need to first run with --devel option)
@@ -234,7 +254,7 @@ All commands accept `--help` for full option listing.
 | `--model <name>`                  | Select model (number or name)                                        | prompts interactively |
 | `--system-prompt <name>`          | System prompt to use                                                 | default               |
 | `--sandbox <mode>`                | Set sandbox mode for session                                         | permissive-open       |
-| `--pretty on\|off`                | Enable/disable markdown rendering                                    | on                    |
+| `--pretty on\|off`                | Markdown rendering (batch/REPL; TUI always renders it)               | on                    |
 | `--debug`                         | Enable debug mode                                                    | off                   |
 | `--tool-response raw\|json`       | Tool output format                                                   | raw                   |
 | `--mcp`                           | Connect to MCP servers on startup                                    | off                   |
@@ -312,6 +332,6 @@ Agent13 does not collect telemetry, so if something is confusing, useful, annoyi
 
 Agent13 was bootstrapped using Mistral Vibe and then built by itself using local models: Qwen-3.5-27B, GLM-5, GLM-5.1, Kimi-K2.5 on llama-swap/llama-server, then oMLX. Features were typically started with Qwen-3.5-27B; when things got tricky, swapped to Kimi or GLM-5.1 on OpenRouter.
 
-Inspired by the need for a lightweight, controllable agent that fits within VRAM constraints while remaining usable for long sessions.
+Inspired by the need for a lightweight, controllable agent that fits within VRAM constraints, remembers its work across sessions, and can be left to run.
 
 Built 100% by itself (after initial bootstrap) under frustrated (at times) human guidance. :sweat_smile:

@@ -72,6 +72,33 @@ def get_global_saves_dir() -> Path:
     return _ensure_dir(get_config_dir() / "saves")
 
 
+def records_dir_for(project_dir: Path) -> Path:
+    """Return the durable-record directory for *project_dir*.
+
+    ``<project>/records/`` - in the project root, NOT under ``.agent13/``.
+    ``.agent13`` is gitignored in every project because it holds local state
+    (saves, skills, locks); a durable record is the opposite - it must be
+    versioned, so it lives where git can see it. Holds a focus's
+    ``<name>_current_truth.md`` and ``<name>_journal.md``.
+
+    Takes the project directory explicitly so a caller that walks many
+    projects (the migration script) does not get the cwd's directory for
+    every one of them.
+    """
+    return Path(project_dir) / "records"
+
+
+def get_records_dir(create: bool = True) -> Path:
+    """Return the durable-record directory for the CURRENT project (cwd).
+
+    Created on demand unless *create* is False - a caller that only asks a
+    question about the path (a predicate, a dry run) must not leave a
+    directory behind.
+    """
+    path = records_dir_for(Path.cwd())
+    return _ensure_dir(path) if create else path
+
+
 def get_skills_dir() -> Path:
     """Return the global skills directory path (~/.agent13/skills/).
 

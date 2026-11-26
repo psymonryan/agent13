@@ -17,7 +17,10 @@ class TestAgent13Help:
 
     def test_help_flag(self):
         result = subprocess.run(
-            ["./agent13.py", "--help"], capture_output=True, text=True, timeout=10
+            ["./agent13.py", "--help"], capture_output=True, text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=10,
         )
         assert result.returncode == 0
         assert "usage:" in result.stdout.lower() or "agent13" in result.stdout.lower()
@@ -25,7 +28,10 @@ class TestAgent13Help:
     def test_no_provider_shows_error(self):
         """No provider should show error."""
         result = subprocess.run(
-            ["./agent13.py"], capture_output=True, text=True, timeout=10
+            ["./agent13.py"], capture_output=True, text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=10,
         )
         assert result.returncode != 0
 
@@ -38,6 +44,8 @@ class TestAgent13ProviderList:
             ["./agent13.py", "--list-providers"],
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=10,
         )
         assert result.returncode == 0
@@ -53,6 +61,8 @@ class TestAgent13ModelSelection:
             ["uv", "run", "agent13.py", "test_mock", "--model"],
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=60,
             env=mock_provider_env,
             cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
@@ -66,6 +76,8 @@ class TestAgent13ModelSelection:
             ["uv", "run", "agent13.py", "test_mock", "--model", "1", "--model"],
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=60,
             env=mock_provider_env,
             cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
@@ -86,6 +98,8 @@ class TestAgent13BatchMode:
             ],
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=60,
             env=mock_provider_env,
             cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
@@ -104,6 +118,8 @@ class TestAgent13BatchMode:
             ],
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=60,
             env=mock_provider_env,
             cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
@@ -118,6 +134,8 @@ class TestAgent13BatchMode:
             ["./agent13.py", "nonexistent_provider", "-p", "hello"],
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=10,
         )
         assert result.returncode != 0
@@ -125,7 +143,10 @@ class TestAgent13BatchMode:
     def test_batch_no_provider_exits_nonzero(self):
         """No provider with -p should show error."""
         result = subprocess.run(
-            ["./agent13.py", "-p", "hello"], capture_output=True, text=True, timeout=10
+            ["./agent13.py", "-p", "hello"], capture_output=True, text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=10,
         )
         assert result.returncode != 0
 

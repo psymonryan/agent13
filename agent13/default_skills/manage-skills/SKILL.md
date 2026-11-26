@@ -1,5 +1,6 @@
 ---
 name: manage-skills
+disable-model-invocation: true
 description: Create, validate, and manage Agent Skills following the agentskills.io specification. Use when creating new skills, improving existing ones, or understanding skill structure and best practices.
 license: MIT
 compatibility: Requires basic Markdown knowledge and familiarity with file system operations. Works with any agent supporting the agentskills.io format.

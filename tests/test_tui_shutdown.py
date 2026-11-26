@@ -44,6 +44,10 @@ def _make_app(client):
 
     agent = MagicMock()
     agent.durable_records = DurableRecords()
+    # The status bar reads model/provider from the agent (single source
+    # of truth), so the stub must carry real strings, not MagicMocks.
+    agent.model = "test-model"
+    agent.provider_name = "test"
     agent.set_client = MagicMock()
     agent.add_message = AsyncMock()
     agent.set_system_prompt = MagicMock()

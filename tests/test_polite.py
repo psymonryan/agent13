@@ -6,7 +6,7 @@ integration test (two agents coordinating) lives in test_polite_integration.py.
 """
 
 import asyncio
-from unittest.mock import patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -183,6 +183,71 @@ async def test_acquire_release_basic(config_dir):
     assert lock.is_held()
     lock.release()
     assert not lock.is_held()
+
+
+# ---------------------------------------------------------------------------
+# Cancellation: /polite off during a wait must END the wait
+# ---------------------------------------------------------------------------
+
+
+async def test_cancel_check_ends_the_wait(config_dir):
+    """A cancelled wait raises instead of polling until the lock frees.
+
+    Without this the agent blocks for as long as the holder runs, wins the
+    lock, and then runs a turn holding a lock it has already forgotten.
+    """
+    from filelock import FileLock
+
+    from agent13.polite import PoliteCancelled
+
+    holder = FileLock(str(config_dir / "locks" / "polite_cancel.lck"))
+    (config_dir / "locks").mkdir(exist_ok=True)
+    holder.acquire(timeout=0)
+    try:
+        lock = PoliteLock(
+            provider="cancel", interval=0.01, cancel_check=lambda: True
+        )
+        with pytest.raises(PoliteCancelled):
+            await asyncio.wait_for(lock.acquire(), timeout=2.0)
+        assert not lock.is_held()
+    finally:
+        holder.release()
+
+
+async def test_cancel_after_winning_releases_the_lock(config_dir):
+    """A cancel that lands as the lock is won must not leave it held.
+
+    The window is one tick wide, and it is the one that leaks: the caller has
+    already stopped tracking the lock, so nothing else would release it.
+    """
+    from agent13.polite import PoliteCancelled
+
+    state = {"cancelled": False}
+    lock = PoliteLock(
+        provider="cancelwin", interval=0.01, cancel_check=lambda: state["cancelled"]
+    )
+    # Cancel on the same tick the acquire succeeds: the check runs after
+    # lock.acquire(timeout=0) returns, before the lock is claimed.
+    original = lock._cancel_check
+    calls = {"n": 0}
+
+    def flip():
+        calls["n"] += 1
+        return calls["n"] >= 2  # the post-acquire check cancels
+
+    lock._cancel_check = flip
+    with pytest.raises(PoliteCancelled):
+        await asyncio.wait_for(lock.acquire(), timeout=2.0)
+    assert not lock.is_held()
+    lock._cancel_check = original
+
+
+async def test_no_cancel_check_still_acquires(config_dir):
+    """None = not cancellable (tests, legacy callers)."""
+    lock = PoliteLock(provider="nocancel", interval=0.01)
+    await lock.acquire()
+    assert lock.is_held()
+    lock.release()
 
 
 async def test_acquire_emits_acquired_event(config_dir):
@@ -798,3 +863,151 @@ class TestAcquirePolite:
         # lock was won — _acquire_polite must not swallow it; the turn's next
         # safe point honours it.
         assert agent.pause_state == PauseState.PAUSING
+
+
+# ---------------------------------------------------------------------------
+# The wait ending WITHOUT the lock is an event, not silence
+# ---------------------------------------------------------------------------
+
+
+class TestWaitEndedEvent:
+    """``POLITE_WAIT_ENDED`` is what clears a UI's "wait: Ns" overlay.
+
+    Reported live 2026-11-09: /polite off during a lock wait started the turn
+    correctly (a94374c) but the status bar stayed on "wait: 0s" for the whole
+    turn. The overlay is cleared by an event, and on that path POLITE_ACQUIRED
+    never fires - the status stays "processing", so no status change clears it
+    either. The wait had no way to say it was over.
+    """
+
+    def _make_agent(self, config_dir):
+        from agent13.core import Agent
+
+        return Agent(client=_MockClient("http://x/v1"), model="mock-model")
+
+    @pytest.mark.asyncio
+    async def test_polite_off_emits_wait_ended(self, config_dir):
+        """/polite off mid-wait: cancelled, unlocked, and the UI is told."""
+        from agent13.events import AgentEvent
+        from agent13.polite import PoliteLock
+
+        agent = self._make_agent(config_dir)
+        events = []
+
+        async def capture(name, data=None):
+            events.append((name, data))
+
+        agent.emit = capture
+
+        holder = PoliteLock(provider="waitended", interval=0.01)
+        await holder.acquire()
+        try:
+            state = {"cancelled": False}
+
+            def cancel_check():
+                if state["cancelled"]:
+                    agent.polite_lock = None  # what disable_polite() does
+                    return True
+                return False
+
+            agent.polite_lock = PoliteLock(
+                provider="waitended",
+                interval=0.01,
+                emit=capture,
+                cancel_check=cancel_check,
+            )
+            task = asyncio.create_task(agent._acquire_polite())
+            await asyncio.sleep(0.1)  # the wait is live
+            state["cancelled"] = True
+            held = await asyncio.wait_for(task, timeout=2.0)
+        finally:
+            holder.release()
+
+        assert held is None
+        names = [name for name, _ in events]
+        assert AgentEvent.POLITE_WAITING in names
+        ended = [d for n, d in events if n == AgentEvent.POLITE_WAIT_ENDED]
+        assert ended == [{"reason": "cancelled"}]
+        # The turn runs unlocked, so the lock was never won.
+        assert AgentEvent.POLITE_ACQUIRED not in names
+
+    @pytest.mark.asyncio
+    async def test_a_rekey_does_not_emit_wait_ended(self, config_dir):
+        """A re-key replaces the lock and the wait CONTINUES on the new one.
+
+        Emitting "ended" there would clear the overlay while the agent is
+        still waiting.
+        """
+        from agent13.events import AgentEvent
+        from agent13.polite import PoliteLock
+
+        agent = self._make_agent(config_dir)
+        events = []
+
+        async def capture(name, data=None):
+            events.append((name, data))
+
+        agent.emit = capture
+
+        holder = PoliteLock(provider="rekey", interval=0.01)
+        await holder.acquire()
+        try:
+            state = {"rekeyed": False}
+
+            def cancel_check():
+                if state["rekeyed"]:
+                    # A DIFFERENT lock object, free: the loop must acquire it.
+                    agent.polite_lock = PoliteLock(
+                        provider="rekey-new", interval=0.01, emit=capture
+                    )
+                    return True
+                return False
+
+            agent.polite_lock = PoliteLock(
+                provider="rekey",
+                interval=0.01,
+                emit=capture,
+                cancel_check=cancel_check,
+            )
+            task = asyncio.create_task(agent._acquire_polite())
+            await asyncio.sleep(0.1)
+            state["rekeyed"] = True
+            held = await asyncio.wait_for(task, timeout=2.0)
+        finally:
+            holder.release()
+
+        assert held is not None
+        held.release()
+        names = [name for name, _ in events]
+        assert AgentEvent.POLITE_WAIT_ENDED not in names
+        assert AgentEvent.POLITE_ACQUIRED in names
+
+    @pytest.mark.asyncio
+    async def test_pause_emits_wait_ended(self, config_dir):
+        """/pause mid-wait: the overlay must go too (the status change to
+        PAUSED clears it today, but a UI should not have to know that)."""
+        from agent13.events import AgentEvent
+        from agent13.polite import PolitePauseRequested
+
+        agent = self._make_agent(config_dir)
+        events = []
+
+        async def capture(name, data=None):
+            events.append((name, data))
+
+        agent.emit = capture
+
+        stub = MagicMock()
+        stub.acquire = AsyncMock(side_effect=[PolitePauseRequested(), None])
+        agent.polite_lock = stub
+
+        agent.pause()
+
+        async def fake_wait(resume_status=None):
+            agent.resume()
+
+        with patch.object(agent, "_wait_if_paused", new=fake_wait):
+            await agent._acquire_polite()
+
+        ended = [d for n, d in events if n == AgentEvent.POLITE_WAIT_ENDED]
+        assert ended == [{"reason": "paused"}]

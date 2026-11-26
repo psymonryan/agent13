@@ -11,7 +11,7 @@ from agent13.debug_log import log_journal_debug
 
 # Message keys that are local bookkeeping flags, never sent to the API.
 # Stripped in llm.build_messages() before the request goes out.
-LOCAL_MSG_KEYS = ("interrupt", "injected", "report_and_compact")
+LOCAL_MSG_KEYS = ("interrupt", "injected", "report_and_compact", "goal_question")
 
 
 def is_injected(msg: dict) -> bool:

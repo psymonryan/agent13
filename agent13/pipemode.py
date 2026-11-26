@@ -120,6 +120,8 @@ async def run_pipe_mode(
     auto_context_action: str = "report_and_compact",
     auto_context_chain: int = 3,
     auto_context_nudge_cap: int = 2,
+    auto_save_idle_seconds: int = 300,
+    datetime_nudge_seconds: int = 3600,
     report_and_compact_prompt: str = "",
 ) -> None:
     """Long-running pipe session: NDJSON in on stdin, NDJSON out on stdout.
@@ -161,6 +163,8 @@ async def run_pipe_mode(
         auto_context_action=auto_context_action,
         auto_context_chain=auto_context_chain,
         auto_context_nudge_cap=auto_context_nudge_cap,
+        auto_save_idle_seconds=auto_save_idle_seconds,
+        datetime_nudge_seconds=datetime_nudge_seconds,
         report_and_compact_prompt=report_and_compact_prompt,
     )
 

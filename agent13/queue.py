@@ -185,6 +185,26 @@ class AgentQueue:
             return True
         return False
 
+    def set_interrupt(self, item_id: int, interrupt: bool) -> bool:
+        """Change an item's interrupt (steering) level. Returns True if found.
+
+        Promoting implies priority, matching ``add()``: an interrupt item is
+        always also a priority item. Demoting leaves priority set, so the
+        item drops back to the priority group rather than all the way to
+        normal.
+        """
+        for i, item in enumerate(self.items):
+            if item.id == item_id:
+                if item.interrupt != interrupt:
+                    # Remove from current position
+                    del self.items[i]
+                    # Update flags, then re-insert at the correct position
+                    item.interrupt = interrupt
+                    item.priority = item.priority or interrupt
+                    self._insert_at_position(item)
+                return True
+        return False
+
     @property
     def pending_count(self) -> int:
         """Number of pending items in queue."""
@@ -217,6 +237,15 @@ class AgentQueue:
     def list_items(self) -> list[QueueItem]:
         """Return list of pending items (not including currently running)."""
         return list(self.items)
+
+    def latest_pending(self) -> Optional[QueueItem]:
+        """The most recently added pending item, or None.
+
+        Keyed on ``id``, NOT list position: the queue reorders on insert
+        (interrupt -> priority -> normal), so ``items[-1]`` is the last
+        NORMAL item, which is not the one the user just typed.
+        """
+        return max(self.items, key=lambda item: item.id) if self.items else None
 
     def clear(self) -> int:
         """Clear all pending items. Returns count of cleared items."""

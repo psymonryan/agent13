@@ -44,6 +44,29 @@ class ChatTextArea(TextArea):
             self.prefix = prefix
             super().__init__()
 
+    @property
+    def _draw_cursor(self) -> bool:
+        """Draw the cursor only when the TERMINAL has focus.
+
+        AgentTUI bypasses Textual's own blur handling (see
+        ``AgentTUI._on_app_blur``), so the widget keeps its focus and this
+        flag is the only thing that changes. Costs one widget repaint on the
+        transition - nothing like a blinking cursor's continuous redraws.
+        """
+        return super()._draw_cursor and getattr(
+            self.app, "_terminal_focused", True
+        )
+
+    def refresh_focus_appearance(self) -> None:
+        """Re-render after the TERMINAL's focus changed.
+
+        The rendered lines are cached under a key that does not include the
+        focus flag, so ``refresh()`` alone would repaint the same cached
+        Strip - cursor and all. The cache has to be dropped first.
+        """
+        self._line_cache.clear()
+        self.refresh()
+
     def action_submit(self) -> None:
         """Submit the current text."""
         value = self.text.strip()

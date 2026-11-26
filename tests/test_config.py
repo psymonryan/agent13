@@ -18,6 +18,7 @@ from agent13.config import (
     resolve_provider_arg,
     resolve_provider_selection,
 )
+from agent13.fileio import ConfigFileError
 from agent13.config_paths import (
     get_config_dir,
     get_config_file,
@@ -192,6 +193,117 @@ api_key_env_var = ""
         """Missing config file raises FileNotFoundError."""
         with pytest.raises(FileNotFoundError):
             Config.from_file(tmp_path / "missing.toml")
+
+    def test_truth_index_defaults_off(self):
+        """The index is opt-in: the first run is the control."""
+        assert Config().auto_context_truth_index is False
+
+    def test_truth_index_parsed(self, tmp_path):
+        config_file = tmp_path / "config.toml"
+        config_file.write_text("[auto_context]\ntruth_index = true\n", encoding="utf-8")
+        assert Config.from_file(config_file).auto_context_truth_index is True
+
+    @pytest.mark.parametrize("bad", ["1", "0", '"yes"'])
+    def test_truth_index_rejects_non_bool(self, tmp_path, bad):
+        """isinstance(True, int) is True, so an int must not pass as a bool -
+        `truth_index = 1` would otherwise be silently accepted as True."""
+        config_file = tmp_path / "config.toml"
+        config_file.write_text(
+            f"[auto_context]\ntruth_index = {bad}\n", encoding="utf-8"
+        )
+        with pytest.raises(ConfigFileError, match="truth_index"):
+            Config.from_file(config_file)
+
+    def test_mindmap_style_template_defaults_to_empty(self):
+        assert Config().tools_mindmap_style_template == ""
+
+    def test_mindmap_style_template_parsed(self, tmp_path):
+        config_file = tmp_path / "config.toml"
+        config_file.write_text(
+            '[tools]\nmindmap_style_template = "  ~/maps/journal.itmz  "\n',
+            encoding="utf-8",
+        )
+        assert Config.from_file(config_file).tools_mindmap_style_template == (
+            "~/maps/journal.itmz"
+        )
+
+    @pytest.mark.parametrize("bad", ["1", "true", '["a.itmz"]'])
+    def test_mindmap_style_template_rejects_non_strings(self, tmp_path, bad):
+        config_file = tmp_path / "config.toml"
+        config_file.write_text(
+            f"[tools]\nmindmap_style_template = {bad}\n", encoding="utf-8"
+        )
+        with pytest.raises(ConfigFileError, match="mindmap_style_template"):
+            Config.from_file(config_file)
+
+    # ── [ui] status-bar Ctx colours ──────────────────────────────────────
+
+    def test_ctx_colours_default_to_foreground_only(self):
+        """The shipped look: coloured text, no background."""
+        cfg = Config()
+        assert (cfg.ctx_warn_fg, cfg.ctx_warn_bg) == ("yellow", "")
+        assert (cfg.ctx_crit_fg, cfg.ctx_crit_bg) == ("red", "")
+
+    def test_ctx_colours_parsed(self, tmp_path):
+        config_file = tmp_path / "config.toml"
+        config_file.write_text(
+            "[ui]\n"
+            'ctx_warn_fg = "black"\n'
+            'ctx_warn_bg = "yellow"\n'
+            'ctx_crit_fg = "black"\n'
+            'ctx_crit_bg = "red"\n',
+            encoding="utf-8",
+        )
+        cfg = Config.from_file(config_file)
+        assert (cfg.ctx_warn_fg, cfg.ctx_warn_bg) == ("black", "yellow")
+        assert (cfg.ctx_crit_fg, cfg.ctx_crit_bg) == ("black", "red")
+
+    def test_ctx_colour_empty_means_no_colour(self, tmp_path):
+        """\"\" is the documented "leave this channel alone" value."""
+        config_file = tmp_path / "config.toml"
+        config_file.write_text(
+            '[ui]\nctx_crit_fg = ""\nctx_crit_bg = "red"\n', encoding="utf-8"
+        )
+        cfg = Config.from_file(config_file)
+        assert (cfg.ctx_crit_fg, cfg.ctx_crit_bg) == ("", "red")
+
+    def test_ctx_colour_whitespace_trimmed(self, tmp_path):
+        config_file = tmp_path / "config.toml"
+        config_file.write_text('[ui]\nctx_warn_fg = "  orange  "\n', encoding="utf-8")
+        assert Config.from_file(config_file).ctx_warn_fg == "orange"
+
+    def test_status_bar_colours_default_to_theme(self):
+        """\"\" = the theme's own colours, which is the shipped look."""
+        cfg = Config()
+        assert (cfg.status_fg, cfg.status_bg) == ("", "")
+
+    def test_status_bar_colours_parsed(self, tmp_path):
+        config_file = tmp_path / "config.toml"
+        config_file.write_text(
+            '[ui]\nstatus_fg = "white"\nstatus_bg = "#333333"\n', encoding="utf-8"
+        )
+        cfg = Config.from_file(config_file)
+        assert (cfg.status_fg, cfg.status_bg) == ("white", "#333333")
+
+    def test_status_bar_colour_invalid_name_fails_at_load(self, tmp_path):
+        config_file = tmp_path / "config.toml"
+        config_file.write_text('[ui]\nstatus_bg = "nope"\n', encoding="utf-8")
+        with pytest.raises(ConfigFileError, match="status_bg"):
+            Config.from_file(config_file)
+
+    def test_ctx_colour_invalid_name_fails_at_load(self, tmp_path):
+        """A typo must surface as a config error, not hang the TUI: an
+        exception inside update_status hangs the app instead of failing it."""
+        config_file = tmp_path / "config.toml"
+        config_file.write_text('[ui]\nctx_crit_bg = "notacolour"\n', encoding="utf-8")
+        with pytest.raises(ConfigFileError, match="ctx_crit_bg"):
+            Config.from_file(config_file)
+
+    def test_ctx_colour_non_string_fails_at_load(self, tmp_path):
+        config_file = tmp_path / "config.toml"
+        config_file.write_text("[ui]\nctx_warn_fg = 1\n", encoding="utf-8")
+        with pytest.raises(ConfigFileError, match="ctx_warn_fg"):
+            Config.from_file(config_file)
 
     def test_config_from_file_or_empty_missing(self, tmp_path):
         """from_file_or_empty returns empty config if file missing."""

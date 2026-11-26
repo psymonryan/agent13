@@ -47,7 +47,9 @@ from agent13.pins import (
     get_pinned_reasoning,
     get_pinned_toolview,
 )
-from agent13.skills import SkillManager, ensure_default_skills
+from agent13.skills import SkillManager, sync_default_skills
+from agent13.snippets import SnippetManager
+from agent13.commands import command_names
 from agent13.prompts import get_skills_section, resolve_report_and_compact_prompt
 from tools.security import set_session_sandbox_mode
 from agent13.config_paths import get_global_env_file
@@ -99,8 +101,19 @@ async def run_batch_with_display(
     connect_mcp: bool = False,
     polite_interval: float | None = None,
     priming_enabled: bool = False,
+    journal_mode: bool = False,
+    auto_context_threshold: int = 220000,
+    auto_context_action: str = "report_and_compact",
+    auto_context_chain: int = 3,
+    auto_context_nudge_cap: int = 2,
+    report_and_compact_prompt: str = "",
 ):
-    """Run batch mode with Rich display."""
+    """Run batch mode with Rich display.
+
+    The context-management kwargs mirror the Agent constructor's defaults, so
+    a caller that omits them gets the same behaviour as before they existed.
+    The CLI resolves them from --flags/config and passes them explicitly.
+    """
     # Initialize prompt manager
     prompt_manager = prompt_manager or PromptManager()
 
@@ -133,6 +146,12 @@ async def run_batch_with_display(
         devel_mode=devel_mode,
         skills_mode=skills_mode,
         priming_enabled=priming_enabled,
+        journal_mode=journal_mode,
+        auto_context_threshold=auto_context_threshold,
+        auto_context_action=auto_context_action,
+        auto_context_chain=auto_context_chain,
+        auto_context_nudge_cap=auto_context_nudge_cap,
+        report_and_compact_prompt=report_and_compact_prompt,
     )
 
     # Focus name from --focus: authoritative state; on a fresh session the
@@ -424,6 +443,14 @@ Provider names are read from ~/.agent13/config.toml
         "(0 = guard off). Omitted = use config value",
     )
     parser.add_argument(
+        "--auto-save-idle",
+        type=int,
+        default=None,
+        metavar="SECONDS",
+        help="Write the daily auto-save once after SECONDS with nothing to "
+        "do (0 = off). Omitted = use config value",
+    )
+    parser.add_argument(
         "-c",
         "--continue",
         action="store_true",
@@ -510,7 +537,7 @@ Provider names are read from ~/.agent13/config.toml
         help=(
             "Focus name: sets the authoritative focus name at startup and, "
             "on a fresh session, runs its durable records "
-            "(docs_archive/NAME_current_truth.md and the last journal "
+            "(records/NAME_current_truth.md and the last journal "
             "entry) as the first turn - the model reads them and replies a "
             "minimal ack while you type, so no /focus is needed in a new "
             "session"
@@ -574,8 +601,12 @@ Provider names are read from ~/.agent13/config.toml
             )
             sys.exit(1)
 
-    # Ensure default skills are available for new users
-    ensure_default_skills()
+    # Sync bundled default skills into the user's skills dir: new defaults
+    # install even when the user has skills, bundled updates overwrite
+    # untouched copies, locally-modified ones are skipped and reported. The
+    # report renders to "" when nothing happened; batch/pipe modes get the
+    # detail via the module's debug-log lines.
+    skills_notice = sync_default_skills().render()
 
     # Ensure default prompts are available for new users
     from agent13.prompts import ensure_default_prompts
@@ -789,6 +820,15 @@ Provider names are read from ~/.agent13/config.toml
     # Create skill manager (needed for both batch and TUI if skills enabled)
     skill_manager = SkillManager(lambda: get_config())
 
+    # Create the snippet manager once so every mode shares one instance. The
+    # reserved names are the command catalogue's - a snippet may not shadow a
+    # built-in command.
+    try:
+        snippet_manager = SnippetManager(reserved_names=set(command_names()))
+    except Exception as e:
+        print(f"Error: Failed to load snippets: {e}", file=sys.stderr)
+        sys.exit(1)
+
     # Build system prompt (optionally with skills)
     system_prompt = prompt_manager.get_prompt()
     include_skills = args.skills or get_config().include_skills
@@ -833,6 +873,10 @@ Provider names are read from ~/.agent13/config.toml
                 auto_context_nudge_cap=args.auto_context_nudge_cap
                 if args.auto_context_nudge_cap is not None
                 else cfg.auto_context_nudge_cap,
+                auto_save_idle_seconds=args.auto_save_idle
+                if args.auto_save_idle is not None
+                else cfg.auto_save_idle_seconds,
+                datetime_nudge_seconds=cfg.datetime_nudge_seconds,
                 report_and_compact_prompt=resolve_report_and_compact_prompt(
                     prompt_manager
                 ),
@@ -866,6 +910,22 @@ Provider names are read from ~/.agent13/config.toml
                 connect_mcp=args.mcp,
                 polite_interval=args.polite,
                 priming_enabled=args.priming_prompt,
+                journal_mode=args.journal,
+                auto_context_threshold=args.auto_context_threshold
+                if args.auto_context_threshold is not None
+                else cfg.auto_context_threshold,
+                auto_context_action=args.auto_context_action
+                if args.auto_context_action is not None
+                else cfg.auto_context_action,
+                auto_context_chain=args.auto_context_chain
+                if args.auto_context_chain is not None
+                else cfg.auto_context_chain,
+                auto_context_nudge_cap=args.auto_context_nudge_cap
+                if args.auto_context_nudge_cap is not None
+                else cfg.auto_context_nudge_cap,
+                report_and_compact_prompt=resolve_report_and_compact_prompt(
+                    prompt_manager
+                ),
             )
         finally:
             await client.close()
@@ -893,6 +953,7 @@ Provider names are read from ~/.agent13/config.toml
                 devel_mode=devel_mode,
                 skills_mode=include_skills and bool(skill_manager.skills),
                 skill_manager=skill_manager,
+                snippet_manager=snippet_manager,
                 continue_session=args.continue_session,
                 output_path=args.output,
                 model_names=model_names,
@@ -919,9 +980,14 @@ Provider names are read from ~/.agent13/config.toml
                 auto_context_nudge_cap=args.auto_context_nudge_cap
                 if args.auto_context_nudge_cap is not None
                 else cfg.auto_context_nudge_cap,
+                auto_save_idle_seconds=args.auto_save_idle
+                if args.auto_save_idle is not None
+                else cfg.auto_save_idle_seconds,
+                datetime_nudge_seconds=cfg.datetime_nudge_seconds,
                 report_and_compact_prompt=resolve_report_and_compact_prompt(
                     prompt_manager
                 ),
+                skills_notice=skills_notice or None,
             )
         finally:
             await client.close()
@@ -951,12 +1017,12 @@ Provider names are read from ~/.agent13/config.toml
         model_names=model_names,
         provider=provider_name,
         provider_args=provider_args,
-        pretty=args.pretty == "on",
         debug=args.debug,
         tool_response_format=args.tool_response,
         prompt_manager=prompt_manager,
         connect_mcp=args.mcp,
         skill_manager=skill_manager,
+        snippet_manager=snippet_manager,
         system_prompt=system_prompt,
         include_skills=include_skills,
         journal_mode=args.journal,
@@ -979,6 +1045,12 @@ Provider names are read from ~/.agent13/config.toml
         cursor_blink=cfg.cursor_blink,
         reasoning_collapsed=reasoning_collapsed,
         toolview_collapsed=toolview_collapsed,
+        ctx_warn_fg=cfg.ctx_warn_fg,
+        ctx_warn_bg=cfg.ctx_warn_bg,
+        ctx_crit_fg=cfg.ctx_crit_fg,
+        ctx_crit_bg=cfg.ctx_crit_bg,
+        status_fg=cfg.status_fg,
+        status_bg=cfg.status_bg,
         auto_context_threshold=args.auto_context_threshold
         if args.auto_context_threshold is not None
         else cfg.auto_context_threshold,
@@ -991,7 +1063,12 @@ Provider names are read from ~/.agent13/config.toml
         auto_context_nudge_cap=args.auto_context_nudge_cap
         if args.auto_context_nudge_cap is not None
         else cfg.auto_context_nudge_cap,
+        auto_save_idle_seconds=args.auto_save_idle
+        if args.auto_save_idle is not None
+        else cfg.auto_save_idle_seconds,
+        datetime_nudge_seconds=cfg.datetime_nudge_seconds,
         report_and_compact_prompt=resolve_report_and_compact_prompt(prompt_manager),
+        skills_notice=skills_notice or None,
     )
 
 

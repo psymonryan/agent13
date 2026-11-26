@@ -1,6 +1,6 @@
 [project]
 name = "agent13"
-version = "0.6.0"
+version = "0.7.0"
 description = "Context-lean AI agent - minimal VRAM fits in a small cupboard, a postbox or even a clock"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -56,6 +56,7 @@ artifacts = [
     "agent13/default_env",
     "agent13/default_prompts.yaml",
     "agent13/sandbox_profiles/*.sb",
+    "agent13/mindmap_styles/*.xml",
 ]
 
 [tool.hatch.build.targets.sdist]
@@ -66,4 +67,5 @@ artifacts = [
     "agent13/default_env",
     "agent13/default_prompts.yaml",
     "agent13/sandbox_profiles/*.sb",
+    "agent13/mindmap_styles/*.xml",
 ]

@@ -421,6 +421,45 @@ class TestTurnTiming:
         assert tracker._turn_count == 3
         assert tracker._total_processing_time > 0.1
 
+    def test_turn_start_is_idempotent(self):
+        """A turn's status transitions must not restart its timer.
+
+        Both front-ends call turn_start() on every processing status
+        (thinking -> processing -> tooling -> ...). Stamping the start time
+        each time banked only the LAST segment: measured 2026-11-19, a 0.90s
+        turn recorded 0.31s, and a 2h17m session with 20 chain restarts
+        reported "total processing: 34s".
+        """
+        tracker = _make_tracker()
+
+        tracker.turn_start()
+        time.sleep(0.05)
+        tracker.turn_start()  # thinking -> processing
+        time.sleep(0.05)
+        tracker.turn_start()  # processing -> tooling
+        time.sleep(0.05)
+        duration = tracker.turn_end()
+
+        # The whole turn, not just the last segment.
+        assert duration >= 0.14
+        assert tracker._total_processing_time >= 0.14
+        assert tracker._turn_count == 1
+
+    def test_chain_segments_without_idle_bank_as_one_span(self):
+        """A chain goes WAITING (queue non-empty), not IDLE, so turn_end()
+        is not called between segments - the span must still be banked
+        whole when the queue finally drains."""
+        tracker = _make_tracker()
+
+        tracker.turn_start()
+        time.sleep(0.05)
+        tracker.turn_start()  # next chain segment, no idle in between
+        time.sleep(0.05)
+        tracker.turn_end()
+
+        assert tracker._total_processing_time >= 0.09
+        assert tracker._turn_count == 1
+
 
 # ---------------------------------------------------------------------------
 # Session elapsed
@@ -446,12 +485,21 @@ class TestSessionElapsed:
 
         assert elapsed2 > elapsed1
 
-    def test_elapsed_resets_on_new_turn_start(self):
-        """A new turn_start resets elapsed measurement."""
+    def test_elapsed_is_monotonic_across_turn_starts(self):
+        """session_elapsed measures from the FIRST turn_start of the turn.
+
+        A later turn_start is a status transition within the same turn
+        (thinking -> processing -> tooling), not a new measurement window.
+        The old test asserted the opposite - that a second turn_start
+        resets elapsed - which is the same overwrite bug that made
+        "total processing" under-report by an order of magnitude. The
+        property's own docstring says "since first turn_start" and the
+        class docstring says it "increases monotonically".
+        """
         tracker = _make_tracker()
         tracker.turn_start()
         time.sleep(0.1)
 
-        tracker.turn_start()  # new turn
+        tracker.turn_start()  # status transition, not a new turn
         elapsed = tracker.session_elapsed
-        assert elapsed < 0.05
+        assert elapsed >= 0.09

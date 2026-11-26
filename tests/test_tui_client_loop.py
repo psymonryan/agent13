@@ -44,6 +44,10 @@ def _make_app(client, provider_args=None):
 
     agent = MagicMock()
     agent.durable_records = DurableRecords()
+    # The status bar reads model/provider from the agent (single source
+    # of truth), so the stub must carry real strings, not MagicMocks.
+    agent.model = "test-model"
+    agent.provider_name = "test"
     agent.set_client = MagicMock()
     agent.add_message = AsyncMock()
     agent.set_system_prompt = MagicMock()
@@ -74,13 +78,14 @@ async def test_on_mount_creates_fresh_client_when_provider_args_given():
     )
     try:
         async with app.run_test():
-            assert app.client is not original
-            assert isinstance(app.client, type(original))
-            # Agent must be pointed at the new client (single source of truth).
-            agent.set_client.assert_called_once_with(app.client)
+            # The agent is the single source of truth for the live client.
+            agent.set_client.assert_called_once()
+            new_client = agent.set_client.call_args[0][0]
+            assert new_client is not original
+            assert isinstance(new_client, type(original))
     finally:
         await original.close()
-        await app.client.close()
+        await agent.set_client.call_args[0][0].close()
 
 
 @pytest.mark.asyncio
@@ -91,7 +96,6 @@ async def test_on_mount_keeps_client_when_no_provider_args():
     app, agent = _make_app(original)
     try:
         async with app.run_test():
-            assert app.client is original
             agent.set_client.assert_not_called()
     finally:
         await original.close()

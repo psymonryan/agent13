@@ -84,10 +84,18 @@ def _make_app(skill_manager, skills_mode: bool):
 
     agent = MagicMock()
     agent.durable_records = DurableRecords()
+    # The status bar reads model/provider from the agent (single source
+    # of truth), so the stub must carry real strings, not MagicMocks.
+    agent.model = "test-model"
+    agent.provider_name = "test"
     agent.skills_mode = skills_mode
+    agent.skills_list_enabled = skills_mode
     agent.set_skills_mode = MagicMock()
     agent.add_message = AsyncMock()
     agent.set_system_prompt = MagicMock()
+    # The shared /skills and /skillname handlers read the manager from the agent.
+    agent.skill_manager = skill_manager
+    agent.prompt_manager = MagicMock()
 
     async def _run_forever():
         await asyncio.Event().wait()
@@ -131,7 +139,7 @@ async def test_skills_off_does_not_disable_tool(skill_manager):
     async with app.run_test():
         app._handle_command("/skills off")
         agent.set_skills_mode.assert_not_called()
-        assert app._skills_list_enabled is False
+        assert agent.skills_list_enabled is False
 
 
 @pytest.mark.asyncio
@@ -141,4 +149,4 @@ async def test_skills_on_enables_tool_and_list(skill_manager):
     async with app.run_test():
         app._handle_command("/skills on")
         agent.set_skills_mode.assert_called_once_with(True)
-        assert app._skills_list_enabled is True
+        assert agent.skills_list_enabled is True

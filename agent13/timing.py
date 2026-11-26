@@ -11,6 +11,7 @@ Design notes:
 - Race-condition safe: caller passes captured timestamps as arguments
 """
 
+import time
 from dataclasses import dataclass
 
 
@@ -171,9 +172,21 @@ class TokenTimingTracker:
         )
 
     def turn_start(self) -> None:
-        """Mark the start of a new turn. Call before first LLM request."""
+        """Mark the start of a new turn. Call before first LLM request.
+
+        IDEMPOTENT, and that is load-bearing: a turn passes through several
+        processing statuses (thinking -> processing -> tooling -> ...) and
+        both front-ends call this on every one of them. Unconditionally
+        stamping the start time made each transition discard the time
+        already accumulated in the turn, so ``_total_processing_time``
+        recorded only the LAST segment - measured 2026-11-19: a 0.90s turn
+        banked 0.31s, and a 2h17m session with 20 chain restarts reported
+        "total processing: 34s".
+        """
         import time
 
+        if self._session_elapsed_start is not None:
+            return
         self._session_elapsed_start = time.time()
 
     def turn_end(self) -> float | None:
@@ -202,3 +215,95 @@ class TokenTimingTracker:
         if self._session_elapsed_start is None:
             return 0.0
         return time.time() - self._session_elapsed_start
+
+
+class TaskClock:
+    """Time on the current task, excluding paused time.
+
+    A *task* is one stretch of work the user asked for: it starts when a new
+    user turn begins and ends when the agent goes idle. Unlike a per-turn
+    timer it survives the auto-context wrap-up and chain restarts - those run
+    inside the same turn, so the clock never sees a boundary. It measures
+    "how long has the agent been on this task", which is what the status
+    bar's ``dur:`` shows.
+
+    Three states:
+
+    - **running** - ``elapsed()`` grows from ``_started_at``.
+    - **paused** - ``elapsed()`` is frozen at the banked total; the pause gap
+      is never counted (a pause is not time on task).
+    - **frozen** - the task ended; ``elapsed()`` keeps returning the final
+      total so the number stays on screen instead of dropping to the last
+      turn's duration.
+
+    ``start()`` resets the clock ONLY when it is frozen. A queued message
+    arriving mid-task therefore does not reset it, and neither does any
+    internal continuation (wrap-up, chain restart, ``!!`` steer) - none of
+    them pass through a frozen state. ESC -> /resume does reset: the
+    continuation message arrives after the agent went idle, and /resume is
+    the last user interaction.
+
+    Pure state, no UI dependencies: the agent drives it, front-ends read it.
+    """
+
+    def __init__(self) -> None:
+        self._bank = 0.0  # seconds of completed running segments
+        self._started_at: float | None = None  # running segment start
+        self._paused_at: float | None = None  # pause start (None when not paused)
+
+    @property
+    def is_running(self) -> bool:
+        """True while the clock is counting."""
+        return self._started_at is not None
+
+    @property
+    def is_paused(self) -> bool:
+        """True while the clock is frozen by a pause."""
+        return self._paused_at is not None
+
+    @property
+    def has_value(self) -> bool:
+        """True once a task has run (drives whether ``dur:`` is shown)."""
+        return self._bank > 0.0 or self._started_at is not None
+
+    def start(self) -> None:
+        """Begin a new task. No-op while a task is already running or paused."""
+        if self._started_at is not None or self._paused_at is not None:
+            return
+        self._bank = 0.0
+        self._started_at = time.time()
+
+    def pause(self) -> None:
+        """Freeze the clock, banking the running segment. No-op when idle."""
+        if self._started_at is None:
+            return
+        now = time.time()
+        self._bank += now - self._started_at
+        self._started_at = None
+        self._paused_at = now
+
+    def resume(self) -> None:
+        """Continue counting after a pause. No-op when not paused."""
+        if self._paused_at is None:
+            return
+        self._paused_at = None
+        self._started_at = time.time()
+
+    def stop(self) -> None:
+        """End the task, banking the running segment and freezing the total."""
+        if self._started_at is not None:
+            self._bank += time.time() - self._started_at
+            self._started_at = None
+        self._paused_at = None
+
+    def reset(self) -> None:
+        """Forget the current task entirely (new conversation, /load)."""
+        self._bank = 0.0
+        self._started_at = None
+        self._paused_at = None
+
+    def elapsed(self) -> float:
+        """Seconds on the current task, excluding paused time."""
+        if self._started_at is None:
+            return self._bank
+        return self._bank + (time.time() - self._started_at)

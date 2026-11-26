@@ -396,10 +396,32 @@ async def run_headless(
                     if agent.is_paused:
                         agent.resume()
                         print("RESUMING", flush=True)
+                    elif agent.has_incomplete_turn:
+                        # A turn loaded via --continue or /load. Signal run() to
+                        # call continue_incomplete_turn() inside its own loop -
+                        # mirrors the REPL and the TUI. Without this the
+                        # harness printed "INCOMPLETE_TURN: use /resume to
+                        # continue" and then refused the very command it
+                        # recommended, so every headless/pexpect test of the
+                        # resume path silently did nothing.
+                        agent.request_continue_incomplete()
+                        print("CONTINUING", flush=True)
                     else:
                         print("NOT_PAUSED", flush=True)
                 elif cmd == "/status":
                     print_status(status, agent.queue.pending_count)
+                elif cmd.startswith("/grind"):
+                    # Handler command: sets state and returns, exactly as the
+                    # TUI and REPL dispatch it. Not a queue item - a queued
+                    # window would only arm after the turn it was typed in.
+                    from agent13.commands import execute_grind
+
+                    parts = line.split(maxsplit=1)
+                    arg = parts[1].strip() if len(parts) > 1 else ""
+                    result = execute_grind(agent, arg)
+                    tag = "GRIND" if result.success else "GRIND_ERROR"
+                    for out_line in result.message.splitlines():
+                        print(f"{tag}: {out_line}", flush=True)
                 elif cmd.startswith("/mcp"):
                     # Handle /mcp command
                     parts = line.split(maxsplit=1)

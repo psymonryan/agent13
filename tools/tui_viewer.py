@@ -10,6 +10,7 @@ return an error message explaining the limitation.
 import os
 import re
 import sys
+import threading
 import time
 
 from tools import tool
@@ -55,12 +56,7 @@ def tui_launch(
 
     global _tui_state
     if _tui_state.get("pid"):
-        try:
-            os.kill(_tui_state["pid"], signal.SIGTERM)
-            os.waitpid(_tui_state["pid"], 0)
-        except (ProcessLookupError, ChildProcessError):
-            pass
-        _tui_state = {}
+        _teardown_session()
 
     # Create pyte screen
     screen = pyte.Screen(cols, rows)
@@ -91,14 +87,12 @@ def tui_launch(
     else:  # Parent process
         os.close(slave_fd)
 
-        # Wait for TUI to initialize
-        time.sleep(wait)
-
-        # Read initial output
-        output = _read_all_available(master_fd)
-        stream.feed(output.decode("utf-8", errors="replace"))
-
-        # Store state
+        # Drain the PTY continuously from a background thread. The TUI writes
+        # to the slave side; if nobody reads the master, the PTY buffer fills
+        # and the app's writer thread blocks in write(2), which in turn parks
+        # its event loop in queue.put - the whole UI freezes until the next
+        # tui_* call happens to read. The thread makes the screen always
+        # current, so tool calls are never the thing that unblocks the app.
         _tui_state = {
             "pid": pid,
             "master_fd": master_fd,
@@ -106,7 +100,20 @@ def tui_launch(
             "stream": stream,
             "rows": rows,
             "cols": cols,
+            "lock": threading.Lock(),
+            "stop": threading.Event(),
         }
+        reader = threading.Thread(
+            target=_reader_loop,
+            args=(master_fd, stream, _tui_state["lock"], _tui_state["stop"]),
+            daemon=True,
+            name="tui-pty-reader",
+        )
+        _tui_state["reader"] = reader
+        reader.start()
+
+        # Wait for TUI to initialize
+        time.sleep(wait)
 
         if format == "raw":
             return _format_screen(screen)
@@ -130,14 +137,11 @@ def tui_screenshot(format: str = "text") -> str:
     if format not in ("raw", "text"):
         return f"Error: Unknown format '{format}'. Use 'raw' or 'text'."
 
-    # Read any new output
-    output = _read_all_available(_tui_state["master_fd"])
-    if output:
-        _tui_state["stream"].feed(output.decode("utf-8", errors="replace"))
-
-    if format == "text":
-        return _format_screen_text(_tui_state["screen"])
-    return _format_screen(_tui_state["screen"])
+    # The reader thread keeps the screen current; just take a consistent copy
+    with _tui_state["lock"]:
+        if format == "text":
+            return _format_screen_text(_tui_state["screen"])
+        return _format_screen(_tui_state["screen"])
 
 
 @tool(groups=["devel"])
@@ -246,16 +250,11 @@ def tui_wait_until(
     last_screen = ""
 
     while time.monotonic() < deadline:
-        # Read any new output and update screen
-        output = _read_all_available(_tui_state["master_fd"])
-        if output:
-            _tui_state["stream"].feed(output.decode("utf-8", errors="replace"))
-
-        # Get plain text for searching
-        last_screen = _format_screen_text(_tui_state["screen"])
-
-        if contains in last_screen:
-            return _format(_tui_state["screen"])
+        # The reader thread keeps the screen current - just read it
+        with _tui_state["lock"]:
+            last_screen = _format_screen_text(_tui_state["screen"])
+            if contains in last_screen:
+                return _format(_tui_state["screen"])
 
         remaining = deadline - time.monotonic()
         if remaining <= 0:
@@ -264,9 +263,11 @@ def tui_wait_until(
         time.sleep(min(interval, remaining))
 
     # Timeout - return error with current state for debugging
+    with _tui_state["lock"]:
+        current = _format(_tui_state["screen"])
     return (
         f"Timeout: '{contains}' not found within {timeout}s.\n"
-        f"Current screen:\n{_format(_tui_state['screen'])}"
+        f"Current screen:\n{current}"
     )
 
 
@@ -277,8 +278,6 @@ def tui_quit() -> str:
     """
     if sys.platform == "win32":
         return "Error: TUI viewer tools require Unix (PTY not available on Windows)"
-
-    global _tui_state
 
     if not _tui_state:
         return "No TUI session running."
@@ -295,39 +294,65 @@ def tui_quit() -> str:
             time.sleep(0.5)
         except ProcessLookupError:
             pass  # Already exited cleanly
-
-        # Force kill if still running
-        try:
-            os.kill(_tui_state["pid"], signal.SIGTERM)
-            os.waitpid(_tui_state["pid"], 0)
-        except (ProcessLookupError, ChildProcessError):
-            pass
-
-        os.close(_tui_state["master_fd"])
     except Exception:
         pass
 
-    _tui_state = {}
+    _teardown_session()
     return "TUI session closed."
 
 
-def _read_all_available(fd: int, timeout: float = 0.1) -> bytes:
-    """Read all available data from file descriptor."""
-    output = b""
-    while True:
+def _teardown_session() -> None:
+    """Stop the reader thread, kill the child, and close the PTY master."""
+    global _tui_state
+    if not _tui_state:
+        return
+
+    stop = _tui_state.get("stop")
+    if stop is not None:
+        stop.set()
+    reader = _tui_state.get("reader")
+    if reader is not None:
+        reader.join(timeout=2.0)
+
+    pid = _tui_state.get("pid")
+    if pid:
         try:
-            ready, _, _ = select.select([fd], [], [], timeout)
-            if ready:
-                chunk = os.read(fd, 4096)
-                if chunk:
-                    output += chunk
-                else:
-                    break
-            else:
-                break
+            os.kill(pid, signal.SIGTERM)
+            os.waitpid(pid, 0)
+        except (ProcessLookupError, ChildProcessError):
+            pass
+
+    fd = _tui_state.get("master_fd")
+    if fd is not None:
+        try:
+            os.close(fd)
         except OSError:
-            break
-    return output
+            pass
+
+    _tui_state = {}
+
+
+def _reader_loop(fd: int, stream, lock: threading.Lock, stop: threading.Event) -> None:
+    """Drain the PTY master into the pyte screen until stopped or EOF.
+
+    Without this, the app's writes fill the PTY buffer and block, freezing
+    the UI between tui_* calls (see the note in tui_launch).
+    """
+    while not stop.is_set():
+        try:
+            ready, _, _ = select.select([fd], [], [], 0.1)
+        except (OSError, ValueError):
+            break  # fd closed underneath us
+        if not ready:
+            continue
+        try:
+            chunk = os.read(fd, 65536)
+        except OSError:
+            break  # EIO: child exited and the slave side is gone
+        if not chunk:
+            break  # EOF
+        with lock:
+            stream.feed(chunk.decode("utf-8", errors="replace"))
 
 
 def _format_screen(screen: pyte.Screen) -> str:

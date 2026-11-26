@@ -13,6 +13,7 @@ import sys
 import os
 import asyncio
 import json
+from contextlib import contextmanager
 
 from dotenv import load_dotenv
 from openai import AsyncOpenAI
@@ -29,19 +30,20 @@ from ui.chat_input import ChatTextArea
 from ui.summary import budget_for, first_line, tool_what, truncate_line
 import time
 import argparse
-from datetime import datetime
 from pathlib import Path
 
 # Re-export from shared module for backwards compatibility
 from agent13.models import (
     fetch_models,
+    format_model_list,
     print_model_list,
-    resolve_model_selection,
     select_model,
 )
+from agent13.config import current_provider_name
 from agent13.timing import TokenTimingTracker
 from agent13.file_injection import expand_file_mentions
 from agent13.bell import BellManager
+from agent13.completion import filename_completion_scan, plan_completion
 
 
 from agent13 import (
@@ -58,7 +60,6 @@ from agent13 import (
     get_filtered_tools,
     execute_tool,
     resolve_provider_arg,
-    resolve_provider_selection,
     create_client,
     init_debug,
     log_session_end,
@@ -77,44 +78,33 @@ from agent13 import (
     SkillManager,
     skill_manager_ctx,
 )
+from agent13 import goal as goal_rules
+from agent13.status import ctx_alert_style
 from agent13.durable_records import startup_focus
-from agent13.status import parse_token_count
 from agent13.persistence import (
     load_context,
     find_latest_auto_save,
-    list_all_saves,
 )
 from agent13.commands import (
-    execute_save,
-    execute_delete,
-    execute_retry,
-    execute_prioritise,
-    execute_deprioritise,
-    format_queue_items,
-    format_history_groups,
+    execute_queue,
+    get_command,
+    promote_latest,
+    run_command,
+    command_names,
+    complete_param,
+    format_help_sections,
 )
 from agent13.message_history import content_to_text, is_turn_start
+from agent13.stall_watchdog import StallWatchdog
 from agent13.prompts import get_skills_section, resolve_report_and_compact_prompt
 from agent13.sandbox import (
-    format_all_sandbox_modes,
     parse_sandbox_mode,
-    get_default_sandbox_mode,
     validate_sandbox_profiles,
     get_pinned_sandbox_mode,
-    pin_sandbox_mode,
-    unpin_sandbox_mode,
-)
-from agent13.pins import (
-    get_pinned_devel,
-    pin_devel,
-    unpin_devel,
 )
 from tools.security import (
     set_session_sandbox_mode,
-    get_session_sandbox_mode,
-    get_current_sandbox_mode,
 )
-from ui.display import format_mcp_servers
 
 # Track if exit was triggered by Ctrl+C to show message after TUI closes
 _ctrl_c_pressed = False
@@ -130,8 +120,27 @@ def escape_markup(text: str) -> str:
     return text.replace("\\", "\\\\").replace("[", "\\[").replace("]", "\\]")
 
 
+def escape_markup_open(text: str) -> str:
+    """Escape only opening brackets.
+
+    Textual unescapes '\\[' but not '\\]', so escaping both leaves a visible
+    backslash in front of every closing bracket. Use this where the text
+    carries bracketed usage forms like '[-y]'.
+    """
+    return text.replace("\\", "\\\\").replace("[", "\\[")
+
+
 # Max chars for the model name in the status bar before it's truncated.
 _MODEL_DISPLAY_BUDGET = 16
+
+# Max TOP-LEVEL chat widgets kept live. One per message (a message's own
+# children are its ~60 markdown widgets), so a trim never cuts mid-message.
+# The chat used to keep every message for the life of the session: 100
+# messages = 6,109 widgets, and any full-tree operation cost seconds
+# (update_node_styles measured 1.7 s at 6,109 and 5.0 s at 18,309).
+# The message HISTORY is untouched - /history, /rebuild and the model's
+# context all still see everything; only the live widgets are bounded.
+MAX_CHAT_MESSAGES = 40
 
 
 def compress_model(model: str, budget: int = _MODEL_DISPLAY_BUDGET) -> str:
@@ -594,6 +603,35 @@ class InterruptMessage(Static):
         )
 
 
+# Commands the TUI implements itself - their work is about this UI's own screen
+# or input, so there is nothing to share with the REPL. Shared commands come
+# from the registry in agent13.commands.
+_TUI_LOCAL_COMMANDS = frozenset(
+    {
+        "help",
+        "exit",
+        "clear",
+        "rebuild",
+        "reasoning",
+        "toolview",
+        "spinner",
+        "clipboard",
+        "pause",
+        "resume",
+    }
+)
+
+# Catalogue entries this front-end deliberately does not offer.
+#
+# /upgrade: the startup check already offers the update at the moment the user
+# learns about it, `agent13 --upgrade` covers every other case, and this
+# front-end's version applied the update with no confirmation prompt.
+#
+# /pretty: Textual always renders markdown, so the flag had no effect here -
+# it only made /status report a setting that did nothing.
+_TUI_NOT_IMPLEMENTED = frozenset({"multi", "stop", "upgrade", "pretty"})
+
+
 class AgentTUI(App):
     """TUI with streaming messages, smart scroll, and real Agent integration."""
 
@@ -741,7 +779,12 @@ class AgentTUI(App):
         max-height: 10;
         background: $surface;
         color: $text;
-        border: none;
+        /* The border is ALWAYS present; only its colour changes on focus.
+           Textual drops widget focus when the TERMINAL loses focus - that is
+           what hides the cursor, so you can see a click has not landed yet.
+           If the border only existed on :focus, that same event would also
+           remove 2 rows and reflow the whole screen. */
+        border: solid transparent;
     }
 
     ChatTextArea:focus {
@@ -810,88 +853,26 @@ class AgentTUI(App):
     # Available slash commands for tab completion
     # Note: Named SLASH_COMMANDS to avoid conflict with Textual's command palette
     # which expects app.COMMANDS to be a list of command provider classes
-    # Built-in slash commands (base list, skills added in __init__)
+    #
+    # The catalogue lives in agent13.commands. This list is derived from it:
+    # shared commands (those with a handler) plus the ones the TUI implements
+    # itself. Skills and snippets append their own names in __init__.
+    #
+    # Commands the TUI implements locally (see _TUI_LOCAL_COMMANDS above).
+    _LOCAL_COMMANDS = _TUI_LOCAL_COMMANDS
+
+    # Catalogue entries this front-end deliberately does not offer.
+    _NOT_IN_TUI = _TUI_NOT_IMPLEMENTED
+
     _BUILTIN_SLASH_COMMANDS = [
-        "/help",
-        "/exit",
-        "/clear",
-        "/rebuild",
-        "/new_session",
-        "/history",
-        "/delete",
-        "/model",
-        "/tool-response",
-        "/pretty",
-        "/prompt",
-        "/mcp",
-        "/queue",
-        "/pause",
-        "/resume",
-        "/retry",
-        "/prioritise",
-        "/deprioritise",
-        "/sandbox",
-        "/provider",
-        "/tools",
-        "/skills",
-        "/journal",
-        "/compact",
-        "/wrapup",
-        "/focus",
-        "/chain",
-        "/remove-api-reasoning",
-        "/reasoning",
-        "/toolview",
-        "/save",
-        "/load",
-        "/devel",
-        "/snippet",
-        "/spinner",
-        "/upgrade",
-        "/clipboard",
-        "/status",
-        "/cwd",
-        "/polite",
-        "/bell",
-        "/bell-command",
-        "/auto_context_threshold",
-        "/auto_context_action",
-        "/auto_context_chain",
-        "/auto_context_nudge_cap",
+        f"/{name}"
+        for name in command_names()
+        if get_command(name).handler is not None or name in _TUI_LOCAL_COMMANDS
     ]
+
     # Class-level attribute for type checking (instance copy created in __init__)
     SLASH_COMMANDS = _BUILTIN_SLASH_COMMANDS
 
-    # Parameter completers for slash commands
-    # Values can be:
-    #   - list: static list of completions
-    #   - str starting with '_': method name to call
-    #   - str: attribute name to get
-    _PARAM_COMPLETERS = {
-        "model": "_get_model_completions",  # Method to get model names
-        "mcp": ["connect", "disconnect", "reload"],  # MCP subcommands
-        "sandbox": None,  # Will use _get_sandbox_completions method
-        "pretty": ["on", "off"],
-        "tool-response": ["raw", "json"],
-        "provider": "_get_provider_completions",  # Method to get provider names
-        "prompt": "_get_prompt_completions",  # Method to get prompt names
-        "compact": "_get_prompt_completions",  # Same completions as /prompt
-        "delete": "_get_delete_completions",  # Delete from history, queue, or saves
-        "journal": ["on", "off", "last", "all", "status"],
-        "auto_context_action": ["compact", "report_and_compact", "none"],
-        "remove-api-reasoning": ["on", "off"],
-        "reasoning": ["hide", "show", "pin", "unpin"],
-        "toolview": ["hide", "show", "pin", "unpin"],
-        "save": "_get_save_completions",  # Method to list save files
-        "load": "_get_load_completions",  # Includes auto-saves
-        "devel": ["on", "off", "status", "pin", "unpin"],
-        "skills": ["on", "off", "list", "status"],
-        "snippet": "_get_snippet_completions",
-        "spinner": ["fast", "slow", "off", "status"],
-        "upgrade": ["--copy"],
-        "clipboard": ["osc52", "system"],
-        "polite": ["off"],
-    }
     # Spinner animation frames by speed mode
     SPINNER_FRAMES_FAST = [
         "⠋",
@@ -913,7 +894,6 @@ class AgentTUI(App):
     processing = reactive(False)
     _streaming = reactive(False)  # True when receiving tokens from LLM
     _spinner_index = reactive(0)
-    _spinner_speed: reactive = reactive("fast")  # "fast", "slow", or "off"
     # Polite mode: None when not waiting for lock, else elapsed seconds (float).
     # Drives the "polite: Ns" status overlay; cleared on POLITE_ACQUIRED.
     _polite_wait_elapsed: reactive = reactive(None)
@@ -931,6 +911,10 @@ class AgentTUI(App):
     # TPS (tokens per second) tracking
     _last_tps = reactive(0.0)  # TPS from the most recent API call
 
+    # Re-entrancy guard for update_status (a plain attribute, NOT a reactive:
+    # setting a reactive here would fire the very watchers it guards against).
+    _updating_status: bool = False
+
     def __init__(
         self,
         client: AsyncOpenAI,
@@ -938,12 +922,12 @@ class AgentTUI(App):
         model_names: list[str],
         provider: str = "",
         provider_args: tuple[str, str, float, float] | None = None,
-        pretty: bool = True,
         debug: bool = False,
         tool_response_format: str = "raw",
         prompt_manager: PromptManager = None,
         connect_mcp: bool = False,
         skill_manager: SkillManager = None,
+        snippet_manager: SnippetManager = None,
         system_prompt: str = None,
         include_skills: bool = False,
         journal_mode: bool = False,
@@ -962,11 +946,20 @@ class AgentTUI(App):
         cursor_blink: bool = False,
         reasoning_collapsed: bool = True,
         toolview_collapsed: bool = True,
+        ctx_warn_fg: str = "yellow",
+        ctx_warn_bg: str = "",
+        ctx_crit_fg: str = "red",
+        ctx_crit_bg: str = "",
+        status_fg: str = "",
+        status_bg: str = "",
         auto_context_threshold: int = 220000,
         auto_context_action: str = "report_and_compact",
         auto_context_chain: int = 3,
         auto_context_nudge_cap: int = 2,
+        auto_save_idle_seconds: int = 300,
+        datetime_nudge_seconds: int = 3600,
         report_and_compact_prompt: str = "",
+        skills_notice: str | None = None,
     ):
         """Initialize the TUI.
 
@@ -978,7 +971,6 @@ class AgentTUI(App):
             provider_args: (base_url, api_key, read_timeout, connect_timeout)
                 for creating a fresh client in the TUI's own event loop
                 (see on_mount). None for offline providers (fake).
-            pretty: Enable pretty output (markdown rendering)
             debug: Enable debug mode
             tool_response_format: Tool response format ('raw' or 'json')
             prompt_manager: Optional pre-configured PromptManager
@@ -1008,32 +1000,38 @@ class AgentTUI(App):
                 folded to a one-line header. Default True.
             toolview_collapsed: Tool call/result widgets start folded to a
                 one-line header. Default True.
+            ctx_warn_fg / ctx_warn_bg: Status-bar Ctx text/background colour
+                at 80% of auto_context_threshold. "" = leave that channel
+                alone (fg = the bar's text colour, bg = its background).
+            ctx_crit_fg / ctx_crit_bg: The same pair at 90%.
+            status_fg / status_bg: The status bar's own text/background colour.
+                "" = the theme's (white on the primary colour, the shipped
+                look). The Ctx segment's "" channels inherit these.
             auto_context_threshold: Token threshold for the auto-context check.
             auto_context_action: What to do at the threshold - "compact",
                 "report_and_compact", or "none".
             auto_context_chain: Turn restarts after a compact per turn (0 = none).
             auto_context_nudge_cap: Consecutive degenerate outputs before the
                 guard stops the turn (0 = guard off).
+            auto_save_idle_seconds: Write the daily auto-save once after this
+                many idle seconds (0 = off).
             report_and_compact_prompt: Prompt text for the wrap-up turn. Empty
                 string = resolve from prompts.yaml / built-in default.
         """
         super().__init__()
-        self.client = client
-        self.model = model
-        self.provider = provider
+        # The Agent owns the live model/client; the TUI reads them from there
+        # so a shared /model or /provider cannot leave a stale copy behind.
         self._provider_args = provider_args
-        self.pretty = pretty
         self._debug_mode = debug
-        self.tool_response_format = tool_response_format
         self._connect_mcp = connect_mcp
         self.read_files = read_files
         self.focus_name = focus_name
 
-        # Initialize prompt manager
-        self.prompt_manager = prompt_manager or PromptManager()
+        # Managers are constructed by cli.py so every mode shares one. They are
+        # attached to the agent below - the agent owns them, and the shared
+        # command handlers read them from there.
+        prompt_manager = prompt_manager or PromptManager()
 
-        # Skill manager for skill slash commands
-        self.skill_manager = skill_manager
         # Whether skills are opted in (--skills flag or config.include_skills).
         # Drives the skill *tool*'s initial visibility AND whether the skills
         # list starts in the system prompt. The tool is additionally ratcheted
@@ -1041,29 +1039,20 @@ class AgentTUI(App):
         # list is toggled at runtime by /skills on|off. Slash commands are
         # always available regardless.
         self._include_skills = include_skills
-        # Current state of the skills *list* in the system prompt. Toggled by
-        # /skills on|off; initial value mirrors include_skills.
-        self._skills_list_enabled = include_skills
+        # Snippet manager: cli.py builds it with the catalogue's names reserved;
+        # a direct construction here covers the standalone main() path.
+        if snippet_manager is None:
+            reserved = {cmd[1:] for cmd in self._BUILTIN_SLASH_COMMANDS}
+            try:
+                snippet_manager = SnippetManager(reserved_names=reserved)
+            except Exception as e:
+                import sys
 
-        # Snippet manager for snippet slash commands
-        reserved = {cmd[1:] for cmd in self._BUILTIN_SLASH_COMMANDS}
-        try:
-            self.snippet_manager = SnippetManager(reserved_names=reserved)
-        except Exception as e:
-            import sys
-
-            print(f"Error: Failed to load snippets: {e}", file=sys.stderr)
-            sys.exit(1)
+                print(f"Error: Failed to load snippets: {e}", file=sys.stderr)
+                sys.exit(1)
 
         # Initialize slash commands (instance attribute for skill extensibility)
         self.SLASH_COMMANDS = list(self._BUILTIN_SLASH_COMMANDS)
-
-        # Register skill commands
-        if self.skill_manager:
-            self._register_skill_commands()
-
-        # Register snippet commands and show collision warnings
-        self._register_snippet_commands()
 
         # Convert tool_response_format string to response_format dict
         response_format = (
@@ -1072,7 +1061,7 @@ class AgentTUI(App):
 
         # Determine system prompt
         effective_system_prompt = (
-            system_prompt if system_prompt else self.prompt_manager.get_prompt()
+            system_prompt if system_prompt else prompt_manager.get_prompt()
         )
 
         # Initialize agent with tools
@@ -1083,7 +1072,7 @@ class AgentTUI(App):
         # never switches off (see the /skill handler below). This only affects
         # what the LLM sees, per the minimal-context principle.
         skills_mode = self._include_skills and bool(
-            self.skill_manager and self.skill_manager.skills
+            skill_manager and skill_manager.skills
         )
         self.agent = Agent(
             client=client,
@@ -1106,12 +1095,35 @@ class AgentTUI(App):
             auto_context_action=auto_context_action,
             auto_context_chain=auto_context_chain,
             auto_context_nudge_cap=auto_context_nudge_cap,
+            auto_save_idle_seconds=auto_save_idle_seconds,
+            datetime_nudge_seconds=datetime_nudge_seconds,
             report_and_compact_prompt=report_and_compact_prompt
-            or resolve_report_and_compact_prompt(self.prompt_manager),
+            or resolve_report_and_compact_prompt(prompt_manager),
         )
 
         # Store available models on agent (single source of truth)
         self.agent.available_models = model_names
+        # Provider name for the status bar - the agent owns it so /provider
+        # can change it without leaving a stale copy here.
+        self.agent.provider_name = provider
+
+        # Managers the shared command handlers read (/prompt, /skills,
+        # /snippet, /compact, /status). The agent owns them so both front-ends
+        # read one instance.
+        self.agent.prompt_manager = prompt_manager
+        self.agent.skill_manager = skill_manager
+        self.agent.snippet_manager = snippet_manager
+        # Startup notice from the default-skills sync ("" or None = silent).
+        self._skills_notice = skills_notice
+        # The skills *list* starts in the prompt when skills are opted in
+        # (--skills / config.include_skills); /skills on|off toggles it.
+        self.agent.skills_list_enabled = include_skills
+
+        # Register skill and snippet slash commands (they read the managers
+        # from the agent, so this runs after the agent exists).
+        if self.agent.skill_manager:
+            self._register_skill_commands()
+        self._register_snippet_commands()
 
         # Set MCP server configs for lazy initialization
         if config.mcp_servers:
@@ -1125,15 +1137,27 @@ class AgentTUI(App):
         self._continue_session = continue_session
         self._session_loaded = False  # Track if we loaded a session
 
-        # Spinner speed (set reactive after super().__init__)
-        self._spinner_speed = spinner_speed
+        # Spinner speed ("fast", "slow", "off") - the agent owns the value so
+        # the shared /status can report it; the spinner reads it here.
+        self.agent.spinner_speed = spinner_speed
 
         # Clipboard method (osc52 or system)
-        self._clipboard_method = clipboard_method
+        self.agent.clipboard_method = clipboard_method
 
         # Widget folding (display only): which widget families start folded.
-        self._reasoning_collapsed = reasoning_collapsed
-        self._toolview_collapsed = toolview_collapsed
+        self.agent.reasoning_collapsed = reasoning_collapsed
+        self.agent.toolview_collapsed = toolview_collapsed
+
+        # Status-bar colours (display only), all TUI-local: no shared handler
+        # reads them, so they have no business on the Agent - core carries no
+        # UI config. The Ctx quad is read by update_status; the bar's own pair
+        # is applied to widgets that only exist once the app is mounted.
+        self._ctx_warn_fg = ctx_warn_fg
+        self._ctx_warn_bg = ctx_warn_bg
+        self._ctx_crit_fg = ctx_crit_fg
+        self._ctx_crit_bg = ctx_crit_bg
+        self._status_fg = status_fg
+        self._status_bg = status_bg
 
         # Bell: BellManager encapsulates threshold timer, command validation,
         # and ringing. TUI passes self.bell as the fallback (terminal bell).
@@ -1144,6 +1168,9 @@ class AgentTUI(App):
             command=bell_command,
             fallback_ring=self.bell,
         )
+        # The shared /bell and /bell-command handlers reach the manager through
+        # the agent, so the same code serves both front-ends.
+        self.agent.bell = self._bell
 
         # State
         self._history = (
@@ -1179,6 +1206,12 @@ class AgentTUI(App):
         self._agent_task: asyncio.Task | None = None
         self._mcp_connect_task: asyncio.Task | None = None
         self._shutting_down = False  # Set in on_unmount to prevent mount errors
+        # Nesting-safe suspension counter for the live-widget cap: a rebuild
+        # mounts everything (including its own status line) with the cap off.
+        self._chat_cap_suspends = 0
+        # Bumped on every focus-in so a blur whose tmux query is still in
+        # flight cannot hide the cursor after focus has come back.
+        self._focus_generation = 0
         self._agent_started = asyncio.Event()
         self._interrupt_requested = False  # Prevent double-cancellation
         self._interrupt_available = (
@@ -1190,25 +1223,21 @@ class AgentTUI(App):
 
         # TPS tracking — delegated to TokenTimingTracker
         # _last_tps stays as a Textual reactive for status bar binding
-        self.tracker = TokenTimingTracker()
+        self.agent.tracker = TokenTimingTracker()
         self._stream_start_time: float | None = (
             None  # When current stream started (debug tracking only)
         )
 
-        # Elapsed time tracking
-        self._elapsed_start_time: float | None = (
-            None  # When current processing session started
-        )
         # Session start time (when TUI was created, for /status run time)
-        self._session_start_time: float = time.time()
+        self.agent.session_start_time = time.time()
         # Last turn tracking (persists after idle for status bar + /status)
-        self._last_turn_duration: float | None = None  # seconds of last completed turn
-        self._last_turn_end_time: float | None = None  # when last turn finished (epoch)
+        self.agent.last_turn_duration = None  # seconds of last completed turn
+        self.agent.last_turn_end_time = None  # when last turn finished (epoch)
         # Resumed session tracking (for --continue and /load /status)
-        self._resumed_saved_at: str | None = None  # ISO timestamp from .ctx file
-        self._resumed_turn_count: int = 0  # user-role messages in loaded session
-        self._resumed_prompt_tokens: int = 0  # prompt tokens at load time
-        self._resumed_completion_tokens: int = 0  # completion tokens at load time
+        self.agent.resumed_saved_at = None  # ISO timestamp from .ctx file
+        self.agent.resumed_turn_count = 0  # user-role messages in loaded session
+        self.agent.resumed_prompt_tokens = 0  # prompt tokens at load time
+        self.agent.resumed_completion_tokens = 0  # completion tokens at load time
         self._pending_load_path: Path | None = None  # stored before deferred /load
 
         # Tab completion state
@@ -1240,15 +1269,15 @@ class AgentTUI(App):
 
     def _register_skill_commands(self) -> None:
         """Register slash commands for all skills."""
-        if not self.skill_manager:
+        if not self.agent.skill_manager:
             return
-        self._register_dynamic_commands(self.skill_manager.skills, "Skill")
+        self._register_dynamic_commands(self.agent.skill_manager.skills, "Skill")
 
     def _register_snippet_commands(self) -> None:
         """Register slash commands for snippets and show collision warnings."""
-        self._register_dynamic_commands(self.snippet_manager.snippets, "Snippet")
+        self._register_dynamic_commands(self.agent.snippet_manager.snippets, "Snippet")
         # Show collision warnings from initial load
-        for warning in self.snippet_manager._collisions:
+        for warning in self.agent.snippet_manager._collisions:
             print(
                 f"WARNING: Snippet '{warning}' conflicts with built-in '/{warning}' command. "
                 f"Use /snippet use {warning} to invoke it.",
@@ -1277,6 +1306,24 @@ class AgentTUI(App):
             else:
                 self.SLASH_COMMANDS.append(f"/{name}")
         return collisions
+
+    def _add_snippet_slash_command(self, name: str) -> None:
+        """Offer /name for a new or renamed snippet.
+
+        A name that collides with a built-in command is left out - the snippet
+        is still reachable through /snippet use.
+        """
+        if name in {cmd[1:] for cmd in self._BUILTIN_SLASH_COMMANDS}:
+            return
+        slash = f"/{name}"
+        if slash not in self.SLASH_COMMANDS:
+            self.SLASH_COMMANDS.append(slash)
+
+    def _remove_snippet_slash_command(self, name: str) -> None:
+        """Drop /name after a snippet is deleted or renamed away."""
+        slash = f"/{name}"
+        if slash in self.SLASH_COMMANDS:
+            self.SLASH_COMMANDS.remove(slash)
 
     def _is_at_bottom(self) -> bool:
         """Check if view is near bottom (within threshold)."""
@@ -1338,83 +1385,7 @@ class AgentTUI(App):
         Returns:
             List of matching file/directory paths with '@' prefix
         """
-        if not partial.startswith("@"):
-            return []
-
-        # Strip the leading @ to get the path
-        path_part = partial[1:]
-
-        # Determine the directory to scan and the prefix to filter by
-        if not path_part:
-            # Just "@" - list files in current directory
-            dir_path = "."
-            prefix = ""
-            base_for_completion = ""
-        elif path_part.startswith("~"):
-            # Handle home directory expansion
-            expanded = os.path.expanduser(path_part)
-            if os.path.isdir(expanded):
-                dir_path = expanded
-                prefix = ""
-            else:
-                dir_path = os.path.dirname(expanded)
-                prefix = os.path.basename(expanded)
-            # Preserve ~ in the completion
-            base_for_completion = (
-                path_part if path_part == "~" else os.path.dirname(path_part)
-            )
-            if base_for_completion and not base_for_completion.endswith("/"):
-                base_for_completion += "/"
-        else:
-            # Handle relative or absolute paths
-            if os.path.isabs(path_part):
-                full_path = path_part
-            else:
-                full_path = os.path.join(os.getcwd(), path_part)
-
-            if os.path.isdir(full_path):
-                dir_path = full_path
-                prefix = ""
-            else:
-                dir_path = os.path.dirname(full_path)
-                prefix = os.path.basename(full_path)
-
-            # Preserve the base path for completion
-            if "/" in path_part:
-                base_for_completion = path_part.rsplit("/", 1)[0] + "/"
-            else:
-                base_for_completion = ""
-
-        # Get the directory to scan
-        if not os.path.isdir(dir_path):
-            return []
-
-        try:
-            entries = os.listdir(dir_path)
-        except (PermissionError, OSError):
-            return []
-
-        # Filter by prefix and build completions
-        matches = []
-        for entry in sorted(entries):
-            if entry.startswith("."):
-                continue  # Skip hidden files
-            if prefix and not entry.lower().startswith(prefix.lower()):
-                continue
-
-            # Build the completion preserving the user's input style
-            completion = f"@{base_for_completion}{entry}"
-
-            # Add trailing / for directories
-            full_entry_path = os.path.join(dir_path, entry)
-            if os.path.isdir(full_entry_path):
-                completion += "/"
-
-            matches.append(completion)
-
-            if len(matches) >= 50:  # Limit matches (windowing shows 8 at a time)
-                break
-        return matches
+        return filename_completion_scan(partial)[0]
 
     def _get_param_completions(
         self, cmd: str, partial: str, full_text: str = ""
@@ -1429,282 +1400,7 @@ class AgentTUI(App):
         Returns:
             List of matching completions
         """
-        completer_spec = self._PARAM_COMPLETERS.get(cmd)
-        if completer_spec is None:
-            # No completer defined - check for special cases
-            if cmd == "sandbox":
-                return self._get_sandbox_completions(partial)
-            return []
-        # Get the completer value
-        if isinstance(completer_spec, list):
-            # Static list - apply filtering below
-            options = completer_spec
-            skip_filter = False
-        elif isinstance(completer_spec, str):
-            if completer_spec.startswith("_"):
-                # Method call - method does its own context-aware filtering
-                method = getattr(self, completer_spec, None)
-                if method:
-                    options = method(partial, full_text)
-                    skip_filter = True  # Method already filtered
-                else:
-                    return []
-            else:
-                # Attribute name
-                options = getattr(self, completer_spec, [])
-                skip_filter = False
-        else:
-            return []
-
-        # Filter by partial (skip for method-based completers that already filtered)
-        if skip_filter:
-            return options
-        if not partial:
-            return options
-
-        partial_lower = partial.lower()
-        return [opt for opt in options if opt.lower().startswith(partial_lower)]
-
-    def _get_sandbox_completions(self, partial: str) -> list[str]:
-        """Get completions for sandbox modes and subcommands."""
-        from agent13.sandbox import SandboxMode
-
-        options = [mode.value for mode in SandboxMode] + ["pin", "unpin"]
-        if not partial:
-            return options
-        partial_lower = partial.lower()
-        return [m for m in options if m.lower().startswith(partial_lower)]
-
-    def _get_provider_completions(self, partial: str, full_text: str = "") -> list[str]:
-        """Get completions for provider names from config.
-
-        Returns provider names for tab completion. If the partial text is a
-        number, returns the corresponding provider name so number selection works.
-        """
-        config = get_config()
-        providers = [p.name for p in config.providers]
-        if not partial:
-            return providers
-
-        # If partial is a number, return the corresponding provider name
-        if partial.isdigit():
-            idx = int(partial) - 1
-            if 0 <= idx < len(providers):
-                return [providers[idx]]
-            return []
-
-        partial_lower = partial.lower()
-        return [p for p in providers if p.lower().startswith(partial_lower)]
-
-    def _get_model_completions(self, partial: str, full_text: str = "") -> list[str]:
-        """Get completions for /model command.
-
-        Returns model names for tab completion. If the partial text is a
-        number, returns the corresponding model name so number selection works.
-
-        Args:
-            partial: The partial model name to complete
-            full_text: Full input text (unused, kept for API consistency)
-
-        Returns:
-            List of matching model names
-        """
-        if not partial:
-            return list(self.agent.available_models)
-
-        # If partial is a number, return the corresponding model name
-        if partial.isdigit():
-            idx = int(partial) - 1
-            if 0 <= idx < len(self.agent.available_models):
-                return [self.agent.available_models[idx]]
-            return []
-
-        # Filter by partial name (case-insensitive prefix match)
-        partial_lower = partial.lower()
-        return [
-            m
-            for m in self.agent.available_models
-            if m.lower().startswith(partial_lower)
-        ]
-
-    def _get_prompt_completions(self, partial: str, full_text: str = "") -> list[str]:
-        """Get completions for /prompt command.
-
-        Completes prompt names directly (flat command, no subcommands).
-
-        Args:
-            partial: Everything after "/prompt " (e.g., "d", "def", "default")
-            full_text: Full input text (unused, kept for API consistency)
-        """
-        prompt_names = list(self.prompt_manager.prompts.keys())
-        if not partial:
-            return prompt_names
-        partial_lower = partial.lower()
-        return [n for n in prompt_names if n.lower().startswith(partial_lower)]
-
-    def _get_snippet_completions(self, partial: str, full_text: str = "") -> list[str]:
-        """Get completions for /snippet command.
-
-        Handles subcommands: list, add, delete, rename, use
-
-        Args:
-            partial: Everything after "/snippet " (e.g., "a", "add ", "add last ")
-            full_text: Full input text (unused, kept for API consistency)
-        """
-        if not partial or " " not in partial:
-            # Completing subcommand: "", "a", "ad", "add", "li", "list", etc.
-            subcmds = ["list", "add", "delete", "rename", "use"]
-            if not partial:
-                return subcmds
-            partial_lower = partial.lower()
-            return [s for s in subcmds if s.lower().startswith(partial_lower)]
-
-        # Has a space - completing argument after subcommand
-        subcmd_part, arg_partial = partial.split(" ", 1)
-        subcmd = subcmd_part.lower()
-
-        snippet_names = list(self.snippet_manager.snippets.keys())
-
-        if subcmd == "add":
-            # Complete "last" keyword
-            if not arg_partial:
-                return ["last"]
-            if "last".startswith(arg_partial.lower()):
-                return ["last"]
-            # After "last ", complete snippet names for the <name> arg
-            if arg_partial.startswith("last"):
-                rest = arg_partial[4:].lstrip()
-                if rest or arg_partial.rstrip() == "last":
-                    if not rest:
-                        return snippet_names
-                    rest_lower = rest.lower()
-                    return [
-                        n for n in snippet_names if n.lower().startswith(rest_lower)
-                    ]
-            return []
-
-        if subcmd in ("delete", "rename", "use"):
-            # Complete snippet names
-            if not arg_partial:
-                return snippet_names
-            arg_lower = arg_partial.lower()
-            return [n for n in snippet_names if n.lower().startswith(arg_lower)]
-
-        # Unknown subcommand - no completions
-        return []
-
-    def _get_delete_completions(self, partial: str, full_text: str = "") -> list[str]:
-        """Get completions for /delete command.
-
-        Handles: h <num>, q <num>, s <save_name>
-        """
-        # If no space, complete the subcommand (h, q, s)
-        # User adds space manually to trigger argument completion
-        if not partial or " " not in partial:
-            subcmds = ["h", "q", "s"]
-            if not partial:
-                return subcmds
-            partial_lower = partial.lower()
-            return [s for s in subcmds if s.lower().startswith(partial_lower)]
-
-        # Has a space - completing argument after subcommand
-        subcmd_part, arg_partial = partial.split(" ", 1)
-        subcmd = subcmd_part.lower()
-
-        if subcmd == "s":
-            # Complete save names - return full text including subcommand
-            # since replacement range includes "s "
-            try:
-                from agent13.persistence import list_saves
-
-                saves = list_saves()
-            except Exception:
-                return []
-
-            # Sort by modification time, newest first
-            saves = sorted(saves, key=lambda p: p.stat().st_mtime, reverse=True)
-
-            # Extract names without .ctx extension
-            names = [s.stem for s in saves]
-
-            # Return completions with subcommand prefix included
-            if not arg_partial:
-                return [f"s {n}" for n in names]
-
-            arg_lower = arg_partial.lower()
-            matches = [n for n in names if n.lower().startswith(arg_lower)]
-            return [f"s {n}" for n in matches]
-
-        # For h and q, no completions (just numbers)
-        return []
-
-    def _get_save_completions(self, partial: str, full_text: str = "") -> list[str]:
-        """Get completions for /save command.
-
-        Lists manual save files only, sorted by newest first.
-
-        Args:
-            partial: The partial save name to complete
-            full_text: Full input text (unused, kept for API consistency)
-
-        Returns:
-            List of matching save names (without .ctx extension), sorted by newest first
-        """
-        try:
-            from agent13.persistence import list_saves
-
-            saves = list_saves()
-        except Exception:
-            return []
-
-        # Sort by modification time, newest first
-        saves = sorted(saves, key=lambda p: p.stat().st_mtime, reverse=True)
-
-        # Extract names without .ctx extension
-        names = [s.stem for s in saves]
-
-        if not partial:
-            return names  # Return all saves
-
-        partial_lower = partial.lower()
-        matches = [n for n in names if n.lower().startswith(partial_lower)]
-        return matches
-
-    def _get_load_completions(self, partial: str, full_text: str = "") -> list[str]:
-        """Get completions for /load command.
-
-        Lists manual saves first (sorted by mtime), then auto-saves (sorted by mtime).
-
-        Args:
-            partial: The partial save name to complete
-            full_text: Full input text (unused, kept for API consistency)
-
-        Returns:
-            List of matching save names (without .ctx extension),
-            manual saves first, then auto-saves, both newest first.
-        """
-        try:
-            saves = list_all_saves()
-        except Exception as e:
-            # Surface the failure where the user's eye already is — a silent
-            # empty list reads as "no saves" (and hides real errors, e.g.
-            # permission problems on the saves dir).
-            from agent13.debug_log import log_event
-
-            log_event(
-                "load_completions_failed",
-                {"error": str(e), "cwd": str(Path.cwd())},
-            )
-            return [f"saves list unavailable: {e}"[:100]]
-
-        names = [s.stem for s in saves]
-
-        if not partial:
-            return names
-
-        partial_lower = partial.lower()
-        matches = [n for n in names if n.lower().startswith(partial_lower)]
-        return matches
+        return complete_param(cmd, self.agent, partial, full_text)
 
     def _get_completions_for_context(
         self, completion_type: str, partial: str, full_text: str = ""
@@ -1820,10 +1516,13 @@ class AgentTUI(App):
         if has_below:
             lines.append(f"  [dim]↓{total - window_end} more below[/]")
 
+        # Only teach the → gesture when it applies - it opens a DIRECTORY
+        hint = "Tab/Shift+Tab/Up/Down to cycle, "
+        if current and current.endswith("/"):
+            hint += "\u2192 opens a dir, "
+        hint += "Enter to accept, Escape to cancel"
         lines.append("")
-        lines.append(
-            "[dim]Tab/Shift+Tab/Up/Down to cycle, Enter to accept, Escape to cancel[/]"
-        )
+        lines.append(f"[dim]{hint}[/]")
         self._update_info_content("\n".join(lines))
 
     def _reset_completion_state(self) -> None:
@@ -1945,7 +1644,9 @@ class AgentTUI(App):
             self._agent_started.set()
             self._error_state = False  # Clear error state on successful start
             self._last_error_type = None
-            asyncio.create_task(self._write_system(f"Agent started with {self.model}"))
+            asyncio.create_task(
+                self._write_system(f"Agent started with {self.agent.model}")
+            )
             asyncio.create_task(
                 self._write_system(
                     "Type your message, /help for commands, or Ctrl+D to exit"
@@ -2161,6 +1862,9 @@ class AgentTUI(App):
             # Agent has paused at a safe point
             self.call_later(self.update_status)
             self._update_info_content("[yellow]Agent paused[/]")
+            # The user has usually walked away by the time the pause lands;
+            # the bell is what turns the tmux tab yellow to say it is done.
+            self._bell.on_paused()
 
         @self.agent.on_event
         async def on_resumed(event: AgentEventData):
@@ -2177,7 +1881,7 @@ class AgentTUI(App):
             self.call_later(self.update_status)
             if self._info_pane_mode == "queue":
                 # Already showing queue — refresh with current state
-                self.call_later(self._handle_queue_command)
+                self.call_later(self._show_queue)
             # Background events never open the pane — only user actions do
             # (see on_chat_text_area_submitted is_queued check)
 
@@ -2190,10 +1894,9 @@ class AgentTUI(App):
             # Both "all" and "trim" modes clear the display
             if self._chat_ready():
                 await self._chat.remove_children()
-            # Reset TUI token counters to match agent
-            self.prompt_tokens = 0
-            self.completion_tokens = 0
-            self.total_tokens = 0
+            # Reset TUI token counters to match agent, and drop the
+            # safe-point estimate - it describes the history just cleared.
+            self._ground_token_display(0, 0)
             self.update_status()
             asyncio.create_task(self._write_system(f"Cleared {count} messages"))
 
@@ -2233,11 +1936,10 @@ class AgentTUI(App):
             message = event.data.get("message", "")
             incomplete = event.data.get("incomplete", False)
             if success:
-                # Reset TUI token counters
-                self.prompt_tokens = self.agent.prompt_tokens
-                self.completion_tokens = self.agent.completion_tokens
-                self.total_tokens = (
-                    self.agent.prompt_tokens + self.agent.completion_tokens
+                # Sync the token display to the loaded record, and drop the
+                # safe-point estimate - it describes the history just replaced.
+                self._ground_token_display(
+                    self.agent.prompt_tokens, self.agent.completion_tokens
                 )
                 # Capture resumed session stats for /status
                 self._capture_resumed_stats(path=self._pending_load_path)
@@ -2347,7 +2049,7 @@ class AgentTUI(App):
                 return
             # Capture timing data IMMEDIATELY to avoid race condition with _reset_stream_timing
             # Both this and STREAM_START use call_later, so order is non-deterministic
-            first_time = self.tracker._first_token_time
+            first_time = self.agent.tracker._first_token_time
             # Use current time as effective "last token time" - TOKEN_USAGE arrives when
             # the API has finished generating, which is the true end of the stream.
             # This handles cases where the API generates tokens that don't arrive as
@@ -2395,14 +2097,14 @@ class AgentTUI(App):
             self.call_later(self._set_polite_waiting, elapsed)
             if self._info_pane_mode == "queue":
                 # Already showing queue — refresh with "Waiting for lock" header
-                self.call_later(self._handle_queue_command, True)
+                self.call_later(self._show_queue, True)
             elif elapsed == 0.0 and not self._queue_pane_dismissed:
                 # First polite-wait tick and user hasn't dismissed the pane —
                 # open it with the "Waiting for lock" header.  This covers the
                 # case where the user's first message to a polite-mode agent
                 # was submitted while the agent was still IDLE (processing=False,
                 # so is_queued was False and the pane didn't open at submit time).
-                self.call_later(self._handle_queue_command, True)
+                self.call_later(self._show_queue, True)
             # Subsequent ticks or dismissed pane: only refresh if already showing
 
         @self.agent.on_event
@@ -2412,7 +2114,13 @@ class AgentTUI(App):
             self.call_later(self._clear_polite_waiting)
             # If queue pane is open, refresh without the "Waiting" header
             if self._info_pane_mode == "queue":
-                self.call_later(self._handle_queue_command)
+                self.call_later(self._show_queue)
+
+        @self.agent.on_event
+        async def on_polite_wait_ended(event: AgentEventData):
+            if event.event != AgentEvent.POLITE_WAIT_ENDED:
+                return
+            self._handle_polite_wait_ended()
 
     def compose(self) -> ComposeResult:
         with VerticalScroll(id="chat"):
@@ -2486,6 +2194,15 @@ class AgentTUI(App):
     async def on_mount(self) -> None:
         """Set up the TUI after mounting."""
         self._install_screen_event_guard()
+        # If the event loop ever stops yielding, nothing else can report it -
+        # this writes the stack to the debug log (agent13/stall_watchdog.py).
+        self._stall_watchdog = StallWatchdog()
+        self._stall_watchdog.start()
+        # Report from the default-skills sync (new/updated/skipped defaults).
+        # cli.py ran the sync before this app existed, so it hands the text
+        # over instead of printing into a terminal the TUI is about to own.
+        if self._skills_notice:
+            self.notify(self._skills_notice, title="Default skills", timeout=12)
         # Create the LLM client in THIS event loop. The client passed at
         # construction was used in the setup loop (model fetch), so its
         # pooled connections are bound to that now-closed loop; reusing
@@ -2493,17 +2210,18 @@ class AgentTUI(App):
         # setup-loop client was already closed by the CLI.
         if self._provider_args is not None:
             base_url, api_key, read_timeout, connect_timeout = self._provider_args
-            self.client = create_client(
-                base_url,
-                api_key,
-                read_timeout=read_timeout,
-                connect_timeout=connect_timeout,
+            self.agent.set_client(
+                create_client(
+                    base_url,
+                    api_key,
+                    read_timeout=read_timeout,
+                    connect_timeout=connect_timeout,
+                )
             )
-            self.agent.set_client(self.client)
 
         # Set skill manager context for skill tool
-        if self.skill_manager:
-            skill_manager_ctx.set(self.skill_manager)
+        if self.agent.skill_manager:
+            skill_manager_ctx.set(self.agent.skill_manager)
 
         # Start the sequential token processor
         self._token_processor_task = asyncio.create_task(self._process_tokens())
@@ -2522,6 +2240,7 @@ class AgentTUI(App):
         self._chat = self.query_one("#chat", VerticalScroll)
         self._status_left = self.query_one("#status-left", Static)
         self._status_right = self.query_one("#status-right", Static)
+        self._apply_status_colours()
 
         # Prevent chat area from taking focus
         self._chat.can_focus = False
@@ -2530,7 +2249,7 @@ class AgentTUI(App):
         self._chat.anchor()
 
         # Start spinner animation (respects spinner_speed setting)
-        self._restart_spinner(self._spinner_speed)
+        self._restart_spinner(self.agent.spinner_speed)
 
         # Initial status update
         self.update_status()
@@ -2655,9 +2374,112 @@ class AgentTUI(App):
         if tasks:
             await asyncio.wait(tasks, timeout=5.0)
 
+    # -- terminal focus ----------------------------------------------------
+    #
+    # Tracked WITHOUT Textual's app_focus machinery. Textual's AppBlur
+    # handler sets app_focus, which triggers _watch_app_focus ->
+    # screen.update_node_styles() (a CSS re-application over EVERY widget)
+    # plus a focus restore/repaint. Measured on a real chat: 1.65 s blur /
+    # 2.12 s focus at 6,109 widgets, 5.18 s / 5.00 s at 18,309. All we need
+    # is for the input cursor to change, so we repaint one widget instead.
+    #
+    # Not calling super() is deliberate: app_focus stays True. Nothing in
+    # this app reads it except CSS App:focus/App:blur rules, of which there
+    # are none.
+
+    _terminal_focused: bool = True
+
+    async def _on_app_blur(self, event) -> None:
+        """The terminal lost focus - hide the input cursor.
+
+        prevent_default() is load-bearing: Textual dispatches handlers up
+        the whole MRO, so without it App._on_app_blur runs too and sets
+        app_focus, bringing back the full-tree style walk.
+
+        Under tmux the repaint is SKIPPED when the whole window was switched
+        away (see _pane_still_visible): the pane is not on screen, so the
+        only effect would be to set the window's activity flag - the yellow
+        tab the user sees on every ^a^a.
+        """
+        event.prevent_default()
+        generation = self._focus_generation
+        if not await self._pane_still_visible():
+            return
+        if generation != self._focus_generation:
+            # Focus came back while we were asking; the focus handler has
+            # already settled the cursor.
+            return
+        self._terminal_focused = False
+        self._refresh_input_cursor()
+
+    async def _on_app_focus(self, event) -> None:
+        """The terminal regained focus - draw the input cursor.
+
+        Repaints only if the cursor was actually hidden, so a window switch
+        (where the blur was suppressed) writes nothing in either direction.
+        """
+        event.prevent_default()
+        self._focus_generation += 1
+        if self._terminal_focused:
+            return
+        self._terminal_focused = True
+        self._refresh_input_cursor()
+
+    async def _pane_still_visible(self) -> bool:
+        """True when the terminal we lost focus to still shows our pane.
+
+        tmux sends the SAME focus-out sequence whether focus moved to
+        another pane in this window or the whole window was switched away
+        (verified 2026-11-24: identical bytes, and the pane-focus-out hook
+        fires for both). Only the first case is worth repainting for - in
+        the second the pane is not on screen, and the repaint sets the
+        window's activity flag, which is the "yellow tab" the user sees on
+        every switch away.
+
+        The distinction lives only in the tmux server, so it has to be
+        asked for. Costs ~5 ms (measured) on a human-driven transition.
+
+        Outside tmux there is nothing to ask and no activity flag to set,
+        so the answer is True: the pre-existing behaviour (hide the cursor
+        on any focus loss) is preserved. Any failure also answers True -
+        doing what we did before is the safe direction.
+        """
+        pane = os.environ.get("TMUX_PANE")
+        if not os.environ.get("TMUX") or not pane:
+            return True
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "tmux",
+                "display-message",
+                "-p",
+                "-t",
+                pane,
+                "#{window_active}",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            out, _ = await asyncio.wait_for(proc.communicate(), timeout=1.0)
+            return out.strip() == b"1"
+        except (OSError, asyncio.TimeoutError):
+            return True
+
+    def _refresh_input_cursor(self) -> None:
+        """Repaint the input after a terminal focus change.
+
+        AppFocus/AppBlur are posted to the App with bubble=False, so the
+        input widget never sees them and has to be told.
+        """
+        for widget in self.query("#input-field"):
+            if isinstance(widget, ChatTextArea):
+                widget.refresh_focus_appearance()
+
     def on_unmount(self) -> None:
         """Clean up when unmounting."""
         self._shutting_down = True
+
+        watchdog = getattr(self, "_stall_watchdog", None)
+        if watchdog is not None:
+            watchdog.stop()
 
         # Cancel any pending bell timer so it can't fire after teardown.
         self._bell.cancel()
@@ -2706,9 +2528,53 @@ class AgentTUI(App):
             if not hasattr(self, "_chat") or not self._chat.is_mounted:
                 return False
             await self._chat.mount(widget)
+            await self._trim_chat()
             return True
         except MountError:
             return False
+
+    @contextmanager
+    def _cap_suspended(self):
+        """Suspend the live-widget cap for the duration of a rebuild.
+
+        A counter, not a bool, because rebuilds nest: ``_rebuild_chat``
+        calls ``_rebuild_from_messages`` and then writes its own status
+        line, and that line is mounted through ``_safe_mount`` like any
+        other widget. A bool would let the inner call re-enable the cap and
+        the status line would trim the rebuild straight back down.
+        """
+        self._chat_cap_suspends += 1
+        try:
+            yield
+        finally:
+            self._chat_cap_suspends -= 1
+
+    async def _trim_chat(self) -> None:
+        """Drop the oldest chat widgets beyond MAX_CHAT_MESSAGES.
+
+        Every message is a top-level child of the chat for the life of the
+        session, so a long conversation makes any full-tree operation (a
+        style walk, a focus toggle) cost seconds. Bounding the live widgets
+        is the fix; the message HISTORY is untouched, so /history, /rebuild
+        and the model's context still see everything.
+
+        Called from _safe_mount, the single choke point every chat widget
+        passes through. The newest widget is never a candidate (the excess
+        is taken from the FRONT), so a streaming message cannot be cut.
+        """
+        if self._chat_cap_suspends:
+            return
+        try:
+            children = list(self._chat.children)
+            excess = len(children) - MAX_CHAT_MESSAGES
+            if excess <= 0:
+                return
+            for child in children[:excess]:
+                await child.remove()
+        except Exception:
+            # A trim is housekeeping: never let it break the message that
+            # triggered it. Same rule as _scroll_if_at_bottom.
+            pass
 
     async def _scroll_if_at_bottom(self, was_at_bottom: bool) -> None:
         """Scroll to end if the user was at the bottom before a write."""
@@ -2772,19 +2638,20 @@ class AgentTUI(App):
             cut_index = user_indices[-keep_turns]
             recent = messages[cut_index:]
 
-        try:
-            await self._chat.remove_children()
-        except Exception:
-            pass
-        await self._rebuild_from_messages(recent)
-        if system_line is None:
-            system_line = (
-                f"Showing last {keep_turns} turns ({len(recent)} messages, "
-                "history untouched)"
-            )
-        await self._write_system(system_line)
-        self._chat.scroll_end(animate=False)
-        self._chat.anchor()
+        with self._cap_suspended():
+            try:
+                await self._chat.remove_children()
+            except Exception:
+                pass
+            await self._rebuild_from_messages(recent)
+            if system_line is None:
+                system_line = (
+                    f"Showing last {keep_turns} turns ({len(recent)} messages, "
+                    "history untouched)"
+                )
+            await self._write_system(system_line)
+            self._chat.scroll_end(animate=False)
+            self._chat.anchor()
 
     async def _write_system(self, text: str, escape_text: bool = True) -> None:
         """Write a system message (non-streaming).
@@ -2834,7 +2701,7 @@ class AgentTUI(App):
             return
         was_at_bottom = self._is_at_bottom()
         msg = ToolWidget(
-            name, collapsed=self._toolview_collapsed, kind="call"
+            name, collapsed=self.agent.toolview_collapsed, kind="call"
         )
         msg.set_call(name, arguments, seq)
         msg.add_class("tool-call")
@@ -2850,7 +2717,7 @@ class AgentTUI(App):
         was_at_bottom = self._is_at_bottom()
 
         msg = ToolWidget(
-            name, collapsed=self._toolview_collapsed, kind="result"
+            name, collapsed=self.agent.toolview_collapsed, kind="result"
         )
         msg.set_result(result, seq)
         msg.add_class("tool-result")
@@ -2917,16 +2784,17 @@ class AgentTUI(App):
         # Clear the chat window
         if not self._chat_ready():
             return
-        await self._chat.remove_children()
+        with self._cap_suspended():
+            await self._chat.remove_children()
 
-        # Get messages from agent
-        messages = self.agent.messages
+            # Get messages from agent
+            messages = self.agent.messages
 
-        if not messages:
-            await self._write_system("[dim]No messages in history[/]")
-            return
+            if not messages:
+                await self._write_system("[dim]No messages in history[/]")
+                return
 
-        await self._rebuild_from_messages(messages)
+            await self._rebuild_from_messages(messages)
 
     async def _rebuild_chat(self) -> None:
         """Rebuild the chat window from message history (/rebuild command).
@@ -2937,24 +2805,34 @@ class AgentTUI(App):
         """
         if not self._chat_ready():
             return
-        await self._chat.remove_children()
+        with self._cap_suspended():
+            await self._chat.remove_children()
 
-        messages = self.agent.messages
+            messages = self.agent.messages
 
-        if not messages:
-            await self._write_system("[dim]No messages in history[/]")
-            return
+            if not messages:
+                await self._write_system("[dim]No messages in history[/]")
+                return
 
-        await self._rebuild_from_messages(messages)
-        count = len(messages)
-        await self._write_system(f"Rebuilt chat from {count} messages")
-        self._chat.scroll_end(animate=False)
-        self._chat.anchor()
+            await self._rebuild_from_messages(messages)
+            count = len(messages)
+            await self._write_system(f"Rebuilt chat from {count} messages")
+            self._chat.scroll_end(animate=False)
+            self._chat.anchor()
 
     async def _rebuild_from_messages(self, messages: list) -> None:
         """Rebuild chat widgets from a list of message dicts.
 
         Shared by _replay_loaded_messages and _rebuild_chat.
+
+        CALLERS MUST WRAP THIS IN ``_cap_suspended()``: a rebuild is the
+        deliberate "show me everything" path, so it must not trim itself back
+        to MAX_CHAT_MESSAGES as it goes. The suspension lives in the callers
+        rather than here because each of them also mounts a status line
+        afterwards, and that line goes through _safe_mount like any other
+        widget - a suspension that ended at the end of THIS method would let
+        the status line trim the rebuild straight back down.
+
         Renders user messages, assistant content (StreamingMessage with
         markdown), reasoning blocks (ReasoningMessage, folded per the
         /reasoning setting), and tool call/result pairs (ToolWidget, folded
@@ -2990,6 +2868,11 @@ class AgentTUI(App):
                     await self._write_user(content)
 
             elif role == "assistant":
+                # Injected assistant text (the datetime nudge's role-alternation
+                # stub) is not model output - never render it. Same rule as the
+                # injected user messages above.
+                if msg.get("injected") and isinstance(msg.get("content"), str):
+                    continue
                 # Display reasoning if present
                 reasoning = msg.get("reasoning_content")
                 if reasoning and reasoning.strip():
@@ -2998,7 +2881,7 @@ class AgentTUI(App):
                     # the in-progress title in its completed tense, so this
                     # mounts as "Thoughts" exactly like the live path.
                     r_widget = ReasoningMessage(
-                        title="Thinking", collapsed=self._reasoning_collapsed
+                        title="Thinking", collapsed=self.agent.reasoning_collapsed
                     )
                     r_widget.add_class("assistant-message")
                     if await self._safe_mount(r_widget):
@@ -3153,112 +3036,6 @@ class AgentTUI(App):
             return text[:max_len] + "..."
         return text
 
-    @staticmethod
-    def _format_tool_call_preview(name: str, args_json: str) -> str:
-        """Extract the key argument from a tool call for display.
-
-        Guarantees single-line output — tool arguments (e.g. edit_file's
-        ``content``) frequently contain newlines that would corrupt the
-        one-entry-per-line history layout.
-        """
-        try:
-            args = json.loads(args_json) if args_json else {}
-        except (json.JSONDecodeError, TypeError):
-            args = {}
-
-        # Pick the most informative arg per tool
-        KEY_ARGS = {
-            "command": "command",
-            "read_file": "filepath",
-            "write_file": "filepath",
-            "edit_file": "filepath",
-            "skill": "name",
-            "square_number": "x",
-        }
-        key = KEY_ARGS.get(name)
-        if key and key in args:
-            preview = str(args[key])
-        elif args:
-            # Fall back to first string-ish value
-            preview = str(next(iter(args.values()), ""))
-        else:
-            return name
-
-        preview = AgentTUI._sanitize_text(preview, 60)
-        return f"{name} \u2192 {preview}"
-
-    @staticmethod
-    def _format_tool_result_preview(content: str) -> str:
-        """Parse tool result JSON and return success/failure preview.
-
-        Guarantees single-line output — tool result messages (especially
-        edit_file's ``Replaced ... of '<find>' with '<content>'``) embed
-        the raw find/content strings which routinely contain newlines.
-        """
-        # Normalize multimodal content (list of blocks) to text
-        if isinstance(content, list):
-            content = " ".join(
-                part.get("text", "")
-                for part in content
-                if isinstance(part, dict) and part.get("type") == "text"
-            )
-        if not content:
-            return "[dim]tool result (empty)[/]"
-
-        try:
-            data = json.loads(content)
-        except (json.JSONDecodeError, TypeError):
-            # Not JSON — show first bit of raw text
-            preview = AgentTUI._sanitize_text(content, 80)
-            return f"[dim]{escape_markup(preview)}[/]"
-
-        if not isinstance(data, dict):
-            preview = AgentTUI._sanitize_text(str(data), 80)
-            return f"[dim]{escape_markup(preview)}[/]"
-
-        ok = data.get("success", not data.get("error"))
-        tag = "[green]\u2713[/]" if ok else "[red]\u2717[/]"
-
-        # Build summary per known tool result shape
-        if "exit_code" in data:
-            # command result
-            exit_code = data.get("exit_code", "?")
-            stdout = AgentTUI._sanitize_text(data.get("stdout") or "", 60)
-            stderr = AgentTUI._sanitize_text(data.get("stderr") or "", 60)
-            if exit_code == 0:
-                return f"{tag} exit {exit_code}: {escape_markup(stdout)}"
-            else:
-                return f"{tag} exit {exit_code}: {escape_markup(stderr or stdout)}"
-
-        if "filepath" in data and "total_lines" in data:
-            # read_file result
-            fp = data.get("filepath", "")
-            lines = data.get("total_lines", 0)
-            view = data.get("view", "")
-            return f"{tag} {escape_markup(fp)} ({lines} lines, {view})"
-
-        if data.get("error"):
-            err = AgentTUI._sanitize_text(str(data["error"]), 80)
-            return f"{tag} {escape_markup(err)}"
-
-        if "message" in data:
-            # write_file / edit_file success
-            msg = AgentTUI._sanitize_text(data["message"], 80)
-            return f"{tag} {escape_markup(msg)}"
-
-        if "skill_name" in data:
-            # skill result
-            name = data.get("skill_name", "?")
-            return f"{tag} Skill loaded: {escape_markup(name)}"
-
-        # Fallback — first key/value
-        if data:
-            k, v = next(iter(data.items()))
-            preview = AgentTUI._sanitize_text(f"{k}: {v}", 80)
-            return f"{tag} {escape_markup(preview)}"
-
-        return f"{tag} (empty result)"
-
     def _reset_stream_timing(self) -> None:
         """Reset timing for a new LLM stream (called on STREAM_START event).
 
@@ -3269,18 +3046,18 @@ class AgentTUI(App):
         if is_debug_enabled():
             log_tps_timing_reset(
                 source="stream_start",
-                old_first=self.tracker._first_token_time,
-                old_last=self.tracker._last_token_time,
-                old_count=self.tracker._token_count,
+                old_first=self.agent.tracker._first_token_time,
+                old_last=self.agent.tracker._last_token_time,
+                old_count=self.agent.tracker._token_count,
                 old_stream_start=self._stream_start_time,
             )
-        self.tracker.reset_stream()
+        self.agent.tracker.reset_stream()
         self._stream_start_time = time.time()
         if is_debug_enabled():
             log_tps_stream_start(
                 source="stream_start",
-                first_token_time=self.tracker._first_token_time,
-                token_count=self.tracker._token_count,
+                first_token_time=self.agent.tracker._first_token_time,
+                token_count=self.agent.tracker._token_count,
                 stream_start_time=self._stream_start_time,
             )
 
@@ -3290,9 +3067,21 @@ class AgentTUI(App):
         self.update_status()
 
     def _clear_polite_waiting(self) -> None:
-        """Clear the polite-waiting overlay (lock acquired)."""
+        """Clear the polite-waiting overlay (lock acquired, or wait over)."""
         self._polite_wait_elapsed = None
         self.update_status()
+
+    def _handle_polite_wait_ended(self) -> None:
+        """The wait ended WITHOUT the lock: /polite off, a re-key, or /pause.
+
+        Cleared from its own event rather than inferred from the next status
+        change: on the /polite off path the turn starts immediately and the
+        status stays "processing", so nothing else fires and the overlay read
+        "wait: Ns" for the whole turn (reported live 2026-11-09).
+        """
+        self._clear_polite_waiting()
+        if self._info_pane_mode == "queue":
+            self.call_later(self._show_queue)
 
     def _update_status(self, status: str) -> None:
         """Update status from agent event."""
@@ -3326,10 +3115,7 @@ class AgentTUI(App):
             # happen during a stream (thinking→processing→tooling) and resetting
             # would wipe out timing before TOKEN_USAGE arrives.
             # _stream_start_time is set per-stream in _reset_stream_timing
-            self.tracker.turn_start()
-            # Start elapsed timer if not already running (new session)
-            if self._elapsed_start_time is None:
-                self._elapsed_start_time = time.time()
+            self.agent.tracker.turn_start()
             # Start bell timer if threshold is set and not already running
             self._bell.on_turn_start()
         elif status == "idle":
@@ -3342,14 +3128,15 @@ class AgentTUI(App):
             # during polite wait (status goes IDLE without POLITE_ACQUIRED).
             if self._polite_wait_elapsed is not None:
                 self._polite_wait_elapsed = None
-            # Only reset elapsed timer if no pending queue items
-            # (timer continues for queued messages)
+            # Record the last turn's duration for /status, but only when no
+            # queue items remain (a queued message means the turn continues).
+            # The status bar's "dur:" comes from the agent's task clock, not
+            # from this value.
             if self.agent.queue.pending_count == 0:
-                duration = self.tracker.turn_end()
+                duration = self.agent.tracker.turn_end()
                 if duration is not None:
-                    self._last_turn_duration = duration
-                    self._last_turn_end_time = time.time()
-                self._elapsed_start_time = None
+                    self.agent.last_turn_duration = duration
+                    self.agent.last_turn_end_time = time.time()
         elif status == "paused":
             self.processing = False
             # Clear the polite-waiting overlay — covers a /pause that took
@@ -3381,6 +3168,25 @@ class AgentTUI(App):
         self.estimated_context = est
         self.context_is_estimated = True
 
+    def _ground_token_display(self, prompt: int, completion: int) -> None:
+        """Set the status bar's token counts and drop the safe-point estimate.
+
+        After the history is REPLACED (/load, /clear) the estimate describes
+        a history that no longer exists. Only a TOKEN_USAGE event clears the
+        flag, and none arrives until the next LLM call - so without this the
+        bar keeps showing the stale "~N" indefinitely (a /load of a 180k save
+        into a session sitting at a 13k estimate displayed 13k until the next
+        turn).
+
+        The counts are passed in, not read from the agent: /clear trim leaves
+        the agent's counters describing the pre-trim history, where 0 is the
+        honest display.
+        """
+        self.prompt_tokens = prompt
+        self.completion_tokens = completion
+        self.total_tokens = prompt + completion
+        self.context_is_estimated = False
+
     def _update_token_usage(
         self, data: dict, first_token_time: float = None, last_token_time: float = None
     ) -> None:
@@ -3400,7 +3206,7 @@ class AgentTUI(App):
         # A grounded count just arrived - the estimate is no longer current.
         self.context_is_estimated = False
 
-        result = self.tracker.compute_tps(data, first_token_time, last_token_time)
+        result = self.agent.tracker.compute_tps(data, first_token_time, last_token_time)
         if result is not None:
             self._last_tps = result.tps
 
@@ -3408,12 +3214,12 @@ class AgentTUI(App):
             first_time = (
                 first_token_time
                 if first_token_time is not None
-                else self.tracker._first_token_time
+                else self.agent.tracker._first_token_time
             )
             last_time = (
                 last_token_time
                 if last_token_time is not None
-                else self.tracker._last_token_time
+                else self.agent.tracker._last_token_time
             )
             elapsed = (last_time - first_time) if (first_time and last_time) else 0
             threshold_passed = result is not None
@@ -3421,8 +3227,8 @@ class AgentTUI(App):
             log_tps_calculation(
                 elapsed=elapsed,
                 completion_tokens=self.completion_tokens,
-                min_elapsed=self.tracker.MIN_ELAPSED,
-                min_tokens=self.tracker.MIN_TOKENS,
+                min_elapsed=self.agent.tracker.MIN_ELAPSED,
+                min_tokens=self.agent.tracker.MIN_TOKENS,
                 threshold_passed=threshold_passed,
                 tps_value=tps_value,
             )
@@ -3432,7 +3238,7 @@ class AgentTUI(App):
                 total_tokens=self.total_tokens,
                 first_token_time=first_time,
                 last_token_time=last_time,
-                token_count=self.tracker._token_count,
+                token_count=self.agent.tracker._token_count,
             )
 
     def _get_spinner_frames(self) -> list[str]:
@@ -3441,14 +3247,14 @@ class AgentTUI(App):
         Fast mode uses braille (10 frames, smooth), slow uses classic (4 frames, chunky).
         Both give ~1 revolution per second at their respective intervals.
         """
-        if self._spinner_speed == "slow":
+        if self.agent.spinner_speed == "slow":
             return self.SPINNER_FRAMES_SLOW
         return self.SPINNER_FRAMES_FAST
 
     def _advance_spinner(self) -> None:
         """Advance the spinner animation frame."""
         # No animation when spinner is off
-        if self._spinner_speed == "off":
+        if self.agent.spinner_speed == "off":
             return
         # Only animate spinner when processing (waiting or streaming)
         if self.processing:
@@ -3479,11 +3285,51 @@ class AgentTUI(App):
             # OFF mode — no timer
             self._spinner_timer = None
 
-        self._spinner_speed = speed
+        self.agent.spinner_speed = speed
         self._spinner_index = 0  # Reset to avoid OOB after frame set change
         self.update_status()
 
+    def _apply_status_colours(self) -> None:
+        """Paint the status bar from [ui] status_fg / status_bg.
+
+        "" leaves that channel to the theme, which is the shipped look (white
+        on the theme's primary colour). The two child Statics carry their own
+        `color: white` in CSS, so a configured foreground has to be applied to
+        them as well - setting it on the container alone loses to them.
+
+        Called from on_mount: the widgets do not exist before that.
+        """
+        fg = (self._status_fg or "").strip()
+        bg = (self._status_bg or "").strip()
+        if not fg and not bg:
+            return
+        bar = self.query_one("#status-line", Horizontal)
+        if bg:
+            bar.styles.background = bg
+        if fg:
+            bar.styles.color = fg
+            for widget in (self._status_left, self._status_right):
+                widget.styles.color = fg
+
     def update_status(self) -> None:
+        """Render the status bar, guarded against re-entry.
+
+        A watcher fired by a reactive this method READS can call straight
+        back in, and the cycle then spins the event loop without ever
+        yielding - input, signals and /save all queue behind it (observed
+        2026-11-19: 80 minutes at 100% CPU, ~19k calls/s, unreachable).
+        The nested call has nothing new to draw, so dropping it is correct
+        as well as safe.
+        """
+        if self._updating_status:
+            return
+        self._updating_status = True
+        try:
+            self._update_status_body()
+        finally:
+            self._updating_status = False
+
+    def _update_status_body(self) -> None:
         """Update the status line display.
 
         Uses event-driven status from agent (self.status) as primary source,
@@ -3498,7 +3344,7 @@ class AgentTUI(App):
             return
 
         # Spinner logic based on processing state and speed setting
-        if self._spinner_speed == "off":
+        if self.agent.spinner_speed == "off":
             # Show a static indicator when processing, nothing when idle
             spinner = "..." if self.processing else ""
         elif self.agent.is_pausing:
@@ -3552,9 +3398,10 @@ class AgentTUI(App):
 
         # Update left side (status info)
         # Compress the model name to fit the bar (provider stays full).
-        compressed_model = compress_model(self.model)
+        compressed_model = compress_model(self.agent.model)
+        provider_name = current_provider_name(self.agent)
         model_display = (
-            f"{self.provider}/{compressed_model}" if self.provider else compressed_model
+            f"{provider_name}/{compressed_model}" if provider_name else compressed_model
         )
         # Focus name (session identity; hidden when unset)
         focus_name = self.agent._session_focus_name
@@ -3563,21 +3410,51 @@ class AgentTUI(App):
         self._status_left.update(left_side)
 
         # Update right side (duration, context, mcp, tools, tps)
-        # Calculate elapsed time if timer is running (during active session)
+        # Task duration: time on the current task, excluding paused time.
+        # The agent owns the clock (it survives the auto-context wrap-up and
+        # chain restarts, and freezes while paused); the bar only formats it.
+        # A frozen clock keeps showing the finished task's total until the
+        # next task starts.
+        #
+        # While a goal window (/grind) is armed the segment gains a
+        # denominator: the window's length. Both sides are H:MM - the
+        # numerator used to be m:ss with unbounded minutes, so a 3.5-hour task
+        # rendered "210:00" next to a "4:00" window. The has_value gate is
+        # bypassed while armed: an open window is information even before the
+        # first turn.
         elapsed_str = ""
-        if self._elapsed_start_time is not None:
-            elapsed_seconds = int(time.time() - self._elapsed_start_time)
-            minutes = elapsed_seconds // 60
-            seconds = elapsed_seconds % 60
-            elapsed_str = f"dur: {minutes}:{seconds:02d} | "
-        elif self._last_turn_duration is not None:
-            last_seconds = int(self._last_turn_duration)
-            minutes = last_seconds // 60
-            seconds = last_seconds % 60
-            elapsed_str = f"dur: {minutes}:{seconds:02d} | "
+        goal_active = getattr(self.agent, "goal_active", False)
+        if self.agent.task_clock.has_value or goal_active:
+            elapsed = goal_rules.format_window(self.agent.task_clock.elapsed())
+            if goal_active:
+                window = goal_rules.format_window(self.agent.goal_window)
+                elapsed_str = f"dur: {elapsed}/{window} | "
+            else:
+                elapsed_str = f"dur: {elapsed} | "
 
-        # Context (always shown, positioned after duration)
+        # Context (always shown, positioned after duration). The segment is
+        # styled at 80% and 90% of the auto-context threshold, so the wrap-up
+        # is visible before it fires. The style is derived from the SAME
+        # number the bar displays (estimate while estimated, grounded count
+        # otherwise) - a style computed from the other one would contradict
+        # the digits. Disabled auto-context (threshold 0) means nothing to be
+        # close to, so no style. Colours come from [ui] in the config file;
+        # "" leaves a channel alone, so the default is coloured text on the
+        # bar's own background and a "black on red" pair gives a solid block.
         ctx_str = f"Ctx: {total_str}"
+        ctx_value = (
+            self.estimated_context if self.context_is_estimated else self.prompt_tokens
+        )
+        ctx_style = ctx_alert_style(
+            ctx_value,
+            getattr(self.agent, "auto_context_threshold", 0),
+            self._ctx_warn_fg,
+            self._ctx_warn_bg,
+            self._ctx_crit_fg,
+            self._ctx_crit_bg,
+        )
+        if ctx_style:
+            ctx_str = f"[{ctx_style}]{ctx_str}[/]"
 
         # Turn count: "trn: total:turn:turns" - session-lifetime compaction
         # total (persists across saves), chain restarts THIS turn (resets per
@@ -3697,8 +3574,12 @@ class AgentTUI(App):
         if not text.startswith("/resume"):
             self._interrupt_available = False
 
+        # A bare "!"/"!!" is a control, not a message - keep it out of history.
+        bare_promotion = text in ("!", "!!")
+
         # Add to persistent history
-        self._history.add(text)
+        if not bare_promotion:
+            self._history.add(text)
         self._history.reset()
 
         if text.startswith("/"):
@@ -3718,6 +3599,11 @@ class AgentTUI(App):
                 priority = False
                 message_text = text
 
+            # "!!" or "!" ALONE promotes the most recently queued item
+            # instead of queueing an empty one.
+            if bare_promotion:
+                self._promote_latest(interrupt)
+                return
             # If message will be queued (agent busy, or an MCP connect is in
             # flight — the agent defers starting turns until it finishes),
             # show queue pane so the user sees their message queued
@@ -3727,7 +3613,7 @@ class AgentTUI(App):
                 or (self.agent.mcp is not None and self.agent.mcp.connecting)
             )
             if is_queued:
-                self.call_later(self._handle_queue_command)
+                self.call_later(self._show_queue)
 
             # Send message to agent (ITEM_STARTED handler will show in chat when processed)
             asyncio.create_task(self._send_message(message_text, priority, interrupt))
@@ -3791,6 +3677,131 @@ class AgentTUI(App):
         expanded = expand_file_mentions(text)
         await self.agent.add_message(expanded, priority=priority, interrupt=interrupt)
 
+    def _promote_latest(self, interrupt: bool) -> None:
+        """Promote the most recently queued item (a bare "!"/"!!" submit).
+
+        The shared helper owns the rule and the wording; this only renders
+        the line and refreshes an open queue pane, whose markers just moved.
+        """
+        line = promote_latest(self.agent, interrupt)
+        # escape_markup_open, not _write_system's default: the line carries a
+        # bracketed tag ("[steer]"), and escaping both brackets leaves a
+        # visible backslash before the "]".
+        asyncio.create_task(
+            self._write_system(escape_markup_open(line), escape_text=False)
+        )
+        if self._info_pane_mode == "queue":
+            self.call_later(self._show_queue)
+
+    def _run_command_follow_up(self, result, args: str) -> bool:
+        """Run the TUI-only tail a shared command asks for via ``result.data``.
+
+        Some commands cannot finish inside a handler: a listing opens the
+        completion picker instead of printing, a snippet fills the input, a
+        provider switch has to fetch the new model list asynchronously. Each is
+        announced in the result's data, so the handler stays free of UI
+        callbacks.
+
+        Returns True when this consumed the result (nothing to render).
+        """
+        # /retry: the shared handler removed the last group; the TUI's tail is
+        # to load the text into the input for editing rather than re-send it.
+        if "user_text" in result.data:
+            self._load_retry_text(result.data["user_text"])
+            return True
+
+        # /prompt with no args: the TUI's tail is its completion picker, not a
+        # printed list (the REPL prints the list).
+        prompt_picker = result.data.get("prompt_picker")
+        if prompt_picker:
+            names, active = prompt_picker
+            self._enter_command_completion("prompt", names, active)
+            return True
+
+        # /snippet use: load the text into the input for editing (the REPL has
+        # no input field, so it prints the text instead).
+        if "snippet_text" in result.data:
+            input_field = self.query_one("#input-field", ChatTextArea)
+            input_field.text = result.data["snippet_text"]
+            input_field.focus()
+            return True
+
+        # /snippet add|delete|rename: keep the dynamic slash commands in step.
+        # Not consumed - the handler's confirmation still renders.
+        added = result.data.get("snippet_added")
+        if added:
+            self._add_snippet_slash_command(added)
+        removed = result.data.get("snippet_removed")
+        if removed:
+            self._remove_snippet_slash_command(removed)
+
+        # /wrapup, /chain, /journal last|all: queue the agent turn. Not
+        # consumed - the handler's confirmation still renders.
+        agent_message = result.data.get("agent_message")
+        if agent_message:
+            text, kind, data = agent_message
+            asyncio.create_task(self.agent.add_message(text, kind=kind, data=data))
+
+        # /mcp connect|disconnect|reload: the action is async. Not consumed -
+        # the handler's "Connecting..." shows until the result replaces it.
+        mcp_action = result.data.get("mcp_action")
+        if mcp_action:
+            asyncio.create_task(self._run_mcp_action(mcp_action))
+
+        # /new_session: the wipe is always deferred through the queue, so it
+        # lands at a safe boundary. The chat display is reset by the
+        # MESSAGES_CLEARED handler, not here.
+        clear_mode = result.data.get("clear_mode")
+        if clear_mode:
+            asyncio.create_task(self.agent.request_clear(mode=clear_mode))
+
+        # /load: deferred through the queue. The path is recorded first so
+        # on_context_loaded can capture the resumed token stats.
+        load_path = result.data.get("load_path")
+        if load_path:
+            self._pending_load_path = Path(load_path)
+            asyncio.create_task(self.agent.request_load(load_path))
+        if not args.strip():
+            if "models" in result.data:
+                self._enter_command_completion(
+                    "model", result.data["models"], result.data.get("current", "")
+                )
+                return True
+            if "providers" in result.data:
+                self._enter_command_completion(
+                    "provider", result.data["providers"], result.data.get("current", "")
+                )
+                return True
+
+        base_url = result.data.get("base_url")
+        if base_url:
+            self._render_command_result(result, args)
+            asyncio.create_task(self._fetch_and_show_models(base_url))
+        return False
+
+    def _render_command_result(self, result, args: str = "") -> None:
+        """Render a shared command's result in the info pane.
+
+        The only side-effects a shared command can ask for are a status-bar
+        refresh and keeping the info pane open in a given mode.
+
+        Colour follows the info-pane convention: a no-arg invocation is a
+        status query (yellow), a change reads green, a failure reads red.
+        """
+        if not result.success:
+            colour = "red"
+        elif not args.strip():
+            colour = "yellow"
+        else:
+            colour = "green"
+        self._update_info_content(
+            f"[{colour}]{escape_markup_open(result.message)}[/]"
+        )
+        if result.pane:
+            self._info_pane_mode = result.pane
+        if result.refresh_status:
+            self.update_status()
+
     def _handle_command(self, cmd: str) -> None:
         """Handle slash commands."""
         parts = cmd[1:].split(maxsplit=1)
@@ -3803,16 +3814,16 @@ class AgentTUI(App):
         command = parts[0].lower()
         args = parts[1] if len(parts) > 1 else ""
 
+        # Shared commands run from the registry. The chain below covers the
+        # ones this front-end implements itself (screen, input, widgets).
+        result = run_command(command, self.agent, args)
+        if result is not None:
+            if not self._run_command_follow_up(result, args):
+                self._render_command_result(result, args)
+            return
+
         if command == "help":
             self._handle_help_command()
-        elif command == "status":
-            self._handle_status_command()
-        elif command == "model":
-            self._handle_model_command(args)
-        elif command == "history":
-            self._handle_hist_command()
-        elif command == "delete":
-            self._handle_delete_command(args)
         elif command == "clear":
             arg = args.strip().lower()
             if arg == "all":
@@ -3845,114 +3856,53 @@ class AgentTUI(App):
                 )
             else:
                 asyncio.create_task(self._rebuild_chat())
-        elif command == "new_session":
-            # Destructive: wipe history + display. The deferred clear
-            # dispatch (mode="all") also resets the session identity
-            # (compaction total + start time).
-            asyncio.create_task(self.agent.request_clear(mode="all"))
-        elif command == "prompt":
-            self._handle_prompt_command(args)
-        elif command == "pretty":
-            self._handle_pretty_command(args)
-        elif command == "tool-response":
-            self._handle_tool_response_command(args)
-        elif command == "queue":
-            self._handle_queue_command()
         elif command == "pause":
             self._handle_pause_command()
         elif command == "resume":
             self._handle_resume_command()
-        elif command == "retry":
-            self._handle_retry_command()
-        elif command == "prioritise" or command == "prioritize":
-            self._handle_prioritise_command(args)
-        elif command == "deprioritise" or command == "deprioritize":
-            self._handle_deprioritise_command(args)
-        elif command == "sandbox":
-            self._handle_sandbox_command(args)
-        elif command == "cwd":
-            self._handle_cwd_command(args)
-        elif command == "provider":
-            self._handle_provider_command(args)
-        elif command == "mcp":
-            self._handle_mcp_command(args)
-        elif command == "tools":
-            self._handle_tools_command()
-        elif command == "skills":
-            self._handle_skills_command(args)
-        elif command == "journal":
-            self._handle_journal_command(args)
-        elif command == "compact":
-            self._handle_compact_command(args)
-        elif command == "wrapup":
-            self._handle_wrapup_command(args)
-        elif command == "focus":
-            self._handle_focus_command(args)
-        elif command == "chain":
-            self._handle_chain_command(args)
-        elif command == "remove-api-reasoning":
-            self._handle_remove_reasoning_command(args)
         elif command == "reasoning":
             self._handle_collapse_command("reasoning", args)
         elif command == "toolview":
             self._handle_collapse_command("toolview", args)
-        elif command == "devel":
-            self._handle_devel_command(args)
-        elif command == "save":
-            self._handle_save_command(args)
-        elif command == "load":
-            self._handle_load_command(args)
-        elif command == "snippet":
-            self._handle_snippet_command(args)
         elif command == "spinner":
             self._handle_spinner_command(args)
+        elif command == "pretty":
+            # Deliberately not offered here (see _TUI_NOT_IMPLEMENTED):
+            # Textual always renders markdown. Point at where it does apply.
+            asyncio.create_task(
+                self._write_system(
+                    "/pretty is not available in the TUI (it always renders "
+                    "markdown); it applies to REPL and batch mode"
+                )
+            )
         elif command == "upgrade":
-            self._handle_upgrade_command(args)
+            # Deliberately not offered here (see _TUI_NOT_IMPLEMENTED): the
+            # startup check offers the update when the user learns of it, and
+            # `agent13 --upgrade` covers every other case. Point there rather
+            # than applying an update with no confirmation prompt.
+            asyncio.create_task(
+                self._write_system(
+                    "/upgrade is not available in the TUI: the startup check "
+                    "offers it, or run `agent13 --upgrade`"
+                )
+            )
         elif command == "clipboard":
             self._handle_clipboard_command(args)
-        elif command == "polite":
-            self._handle_polite_command(args)
-        elif command == "bell":
-            self._handle_bell_command(args)
-        elif command == "bell-command":
-            self._handle_bell_command_command(args)
-        elif command == "auto_context_threshold":
-            self._handle_auto_context_threshold_command(args)
-        elif command == "auto_context_action":
-            self._handle_auto_context_action_command(args)
-        elif command == "auto_context_chain":
-            self._handle_auto_context_chain_command(args)
-        elif command == "auto_context_nudge_cap":
-            self._handle_auto_context_nudge_cap_command(args)
         elif command in ("quit", "exit"):
             self.agent.stop(StopReason.QUIT)
             self.exit()
         else:
-            # Check for skill invocation
-            if self.skill_manager:
-                skill = self.skill_manager.get_skill(command)
-                if skill:
-                    content = self.skill_manager.format_skill_content(command)
-                    if content:
-                        # Ratchet the skill tool on (one-way): the first skill use
-                        # enables the tool for the rest of the session, even without
-                        # --skills. No-op if --skills already enabled it. Never
-                        # switches off again (avoids a repeated prompt re-process).
-                        if not self.agent.skills_mode:
-                            self.agent.set_skills_mode(True)
-                        if args:
-                            content = f"{content}\n\n{args}"
-                        # Track for chain-restart re-injection (the content
-                        # as sent, user args included).
-                        self.agent.note_skill_loaded(command, content)
-                        asyncio.create_task(self._send_message(content))
-                    else:
-                        self._update_info_content(
-                            f"[red]Failed to load skill: {command}[/]"
-                        )
-                    return
+            # Dynamic /skillname: the shared helper loads the skill, ratchets
+            # the tool on and queues the turn. None means "not a skill".
+            from agent13.commands import execute_skill_invocation
+
+            skill_result = execute_skill_invocation(self.agent, command, args)
+            if skill_result is not None:
+                if not self._run_command_follow_up(skill_result, args):
+                    self._render_command_result(skill_result, args)
+                return
             # Check for snippet invocation
-            snippet = self.snippet_manager.get_snippet(command)
+            snippet = self.agent.snippet_manager.get_snippet(command)
             if snippet is not None:
                 input_field = self.query_one("#input-field", ChatTextArea)
                 input_field.text = snippet
@@ -4007,391 +3957,39 @@ class AgentTUI(App):
 
         self.call_later(input_field.focus)
 
-    def _handle_model_command(self, args: str) -> None:
-        """Handle /model command."""
-        if not args:
-            # Show model list via completion system, starting at current model
-            matches = self._get_model_completions("")
-            self._enter_command_completion("model", matches, self.model)
-            return
-
-        model = self._resolve_model(args)
-        if model:
-            self.model = model
-            self.agent.set_model(self.model)
-            self._update_info_content(
-                f"[green]Model set to: {escape_markup(self.model)}[/]"
-            )
-            self.update_status()
-        else:
-            self._update_info_content(f"[red]Unknown model: {escape_markup(args)}[/]")
-
-    def _resolve_model(self, choice: str) -> str | None:
-        """Resolve model selection by number or name.
-
-        Delegates to the shared resolve_model_selection from models.py.
-        """
-        return resolve_model_selection(self.agent.available_models, choice)
-
-    def _handle_hist_command(self) -> None:
-        """Handle /history command - show grouped message history."""
-        if not self.agent.messages:
-            self._update_info_content("[dim]No messages in history[/]")
-            self._info_pane_mode = "history"
-            return
-
-        groups = format_history_groups(self.agent)
-        lines = ["[bold]Message history (grouped):[/]"]
-
-        for g in groups:
-            if g.first_content:
-                display = self._sanitize_text(g.first_content, 120)
-            else:
-                display = "(empty)"
-
-            role_tag = (
-                f"[bold green]{g.first_role}:[/]"
-                if g.first_role == "user"
-                else f"[bold]{g.first_role}:[/]"
-            )
-            lines.append(f"  [cyan]{g.number}.[/] {role_tag} {escape_markup(display)}")
-
-            for entry in g.entries:
-                if entry.role == "tool":
-                    lines.append(
-                        f"      {self._format_tool_result_preview(entry.content)}"
-                    )
-                elif entry.role == "assistant":
-                    if entry.content:
-                        display = self._sanitize_text(entry.content, 120)
-                        if display:
-                            lines.append(
-                                f"      [magenta]assistant:[/] {escape_markup(display)}"
-                            )
-                    for tc in entry.tool_calls:
-                        preview = self._format_tool_call_preview(
-                            tc["name"], tc["arguments"]
-                        )
-                        lines.append(
-                            f"      [yellow]tool call:[/] {escape_markup(preview)}"
-                        )
-                elif entry.is_interrupt:
-                    if entry.content:
-                        display = self._sanitize_text(entry.content, 120)
-                    else:
-                        display = "(empty)"
-                    lines.append(
-                        f"      [yellow]\u26a1 interrupt:[/] {escape_markup(display)}"
-                    )
-                elif entry.is_injected:
-                    if entry.content:
-                        display = self._sanitize_text(entry.content, 120)
-                    else:
-                        display = "(empty)"
-                    lines.append(
-                        f"      [dim]\u21b3 injected:[/] {escape_markup(display)}"
-                    )
-                elif entry.content:
-                    display = self._sanitize_text(entry.content, 120)
-                    lines.append(
-                        f"      [dim]{entry.role}:[/] {escape_markup(display)}"
-                    )
-
-        lines.append("")
-        lines.append("[dim]Use /delete h N to delete group N[/]")
-        self._update_info_content("\n".join(lines))
-        self._info_pane_mode = "history"
-
-    def _handle_delete_command(self, args: str) -> None:
-        """Handle /delete command."""
-        result = execute_delete(self.agent, args)
-        if result.success:
-            if result.data.get("kind") == "history":
-                self.update_status()
-            self._update_info_content(f"[green]{escape_markup(result.message)}[/]")
-        else:
-            self._update_info_content(f"[red]{escape_markup(result.message)}[/]")
-
     def _handle_help_command(self) -> None:
-        """Handle /help command."""
-        self._update_info_content(
-            "[bold]Commands:[/]\n"
-            "  [yellow]/help[/] - Show this help\n"
-            "  [yellow]/status[/] - Show session status and settings\n"
-            "  [yellow]/model [name][/] - Select model (tab to list)\n"
-            "  [yellow]/history[/] - Show message history\n"
-            "  [yellow]/delete h N[/] - Delete message group N from history\n"
-            "  [yellow]/delete q N[/] - Delete queue item N\n"
-            "  [yellow]/delete s NAME[/] - Delete saved context\n"
-            "  [yellow]/clear[/] - Clear chat window (history preserved)\n"
-            "  [yellow]/rebuild[/] - Rebuild chat window from full message history\n"
-            "  [yellow]/rebuild N[/] - Rebuild chat window showing last N turns\n"
-            "  [yellow]/new_session[/] - Wipe message history + chat window, start a new session\n"
-            "  [yellow]/prompt [name][/] - Switch system prompt (tab to list)\n"
-            "  [yellow]/pretty [on|off][/] - Toggle markdown rendering\n"
-            "  [yellow]/tool-response [raw|json][/] - Set tool response format\n"
-            "  [yellow]/sandbox [mode|pin|unpin][/] - Show/set sandbox mode, pin per-project\n"
-            "  [yellow]/devel [on|off|status|pin|unpin][/] - Show devel-group tools, pin per-project\n"
-            "  [yellow]/cwd [@path][/] - Show or change working directory (prefix @ for path completion)\n"
-            "  [yellow]/mcp [connect|disconnect|reload][/] - List/manage MCP servers\n"
-            "  [yellow]/tools[/] - Show tool usage statistics\n"
-            "  [yellow]/skills[/] - Toggle/list skills mode (on|off|list|status)\n"
-            "\n[bold]Save/Load:[/]\n"
-            "  [yellow]/save <name> [-y][/] - Save context to ./.agent13/saves/<name>.ctx\n"
-            "  [yellow]/load <name>[/] - Load context from ./.agent13/saves/<name>.ctx\n"
-            "\n[bold]Queue commands:[/]\n"
-            "  [yellow]/queue[/] - Show queue items\n"
-            "  [yellow]/pause[/] - Pause agent processing\n"
-            "  [yellow]/resume[/] - Resume agent (after ESC or /pause)\n"
-            "  [yellow]/retry[/] - Retry last message\n"
-            "  [yellow]/prioritise N[/] - Mark queue item as priority\n"
-            "  [yellow]/provider [name|url][/] - Change provider\n"
-            "  [yellow]/deprioritise N[/] - Remove priority from item\n"
-            "\n[bold]Journal mode:[/]\n"
-            "  [yellow]/journal [on|off|last|all|status][/] - Context compaction via reflection\n"
-            "  [yellow]/compact [next-task focus][/] - Compact history, steered toward your next task\n"
-            "  [yellow]/compact --prompt <name>[/] - Compact using a named prompt\n"
-            "  [yellow]/wrapup [name][/] - Update journal + current-truth files now, then idle (no compact); optional name = focus name\\n"
-            "  [yellow]/focus [name][/] - Set the focus name (no args shows current; on an empty history loads its records)\\n"
-            "  [yellow]/chain[/] - Restart the loop: wrap-up (if stale) → clear → inject records\\n"
-            "\n[bold]Reasoning:[/]\n"
-            "  [yellow]/remove-api-reasoning [on|off][/] - Strip reasoning tokens between turns (API context)\n"
-            "  [yellow]/reasoning [hide|show|pin|unpin][/] - Fold the Thoughts/Reflection widgets (display)\n"
-            "  [yellow]/toolview [hide|show|pin|unpin][/] - Fold the tool call/result widgets (display)\n"
-            "\n[bold]Spinner:[/]\n"
-            "  [yellow]/spinner [fast|slow|off|status][/] - Spinner style and speed\n"
-            "\n[bold]Updates:[/]\n"
-            "  [yellow]/upgrade [--copy][/] - Check for updates and apply (or copy command to clipboard)\n"
-            "\n[bold]Clipboard:[/]\n"
-            "  [yellow]/clipboard [osc52|system][/] - Show or set clipboard method\n"
-            "\n[bold]Polite mode (multi-agent):[/]\n"
-            "  [yellow]/polite N[/] - Enable lock coordination with poll interval N seconds\n"
-            "  [yellow]/polite off[/] - Disable polite mode\n"
-            "\n[bold]Bell:[/]\n"
-            "  [yellow]/bell N[/] - Ring bell if a turn takes longer than N seconds\n"
-            "  [yellow]/bell 0[/] - Always ring on return to idle\n"
-            "  [yellow]/bell off[/] - Disable bell\n"
-            "  [yellow]/bell[/] - Show current status\n"
-            "\n[bold]Bell command:[/]\n"
-            "  [yellow]/bell-command <cmd>[/] - Run external command instead of terminal bell\n"
-            "  [yellow]/bell-command off[/] - Revert to terminal bell\n"
-            "  [yellow]/bell-command[/] - Show current command\n"
-            "\n[bold]Auto-context:[/]\n"
-            "  [yellow]/auto_context_threshold N[/] - Context threshold: act when context exceeds N tokens (supports k suffix)\n"
-            "  [yellow]/auto_context_threshold 0[/] - Disable auto-context\n"
-            "  [yellow]/auto_context_threshold[/] - Show current status\n"
-            "  [yellow]/auto_context_action compact|report_and_compact|none[/] - What to do at the threshold\n"
-            "  [yellow]/auto_context_action[/] - Show current value\n"
-            "  [yellow]/auto_context_chain N[/] - Restart the turn up to N times per turn after a compact\n"
-            "  [yellow]/auto_context_chain[/] - Show current value\n"
-            "  [yellow]/auto_context_nudge_cap N[/] - Degeneration guard: stop after N consecutive cut-off/empty outputs (0 = off)\n"
-            "  [yellow]/auto_context_nudge_cap[/] - Show current value\n"
-            "\n[bold]Keyboard shortcuts:[/]\n"
-            "  [yellow]ESC[/] - Cancel request (use /resume to continue)\n"
-            "  [yellow]Ctrl+C[/] - Clear input or quit\n"
-            "  [yellow]Ctrl+D / Ctrl+Q[/] - Quit app\n"
-            "  [yellow]Tab[/] - Tab completion for commands/history\n"
-            "  [yellow]Up/Down[/] - Navigate input history\n"
-            "  [yellow]Shift+Up/Down[/] - Scroll chat\n"
-            "\n[bold]Tips:[/]\n"
-            "  [yellow]![/]message — Priority: queued ahead of normal items (after any interrupts)\n"
-            "  [yellow]!![/]message — Inject: add context into the agent's current turn without cancelling"
-        )
-        self._info_pane_mode = "help"
-
-    def _handle_status_command(self) -> None:
-        """Handle /status command - show session status and settings."""
-        from agent13.status import gather_status, format_duration, fmt_tokens
-
-        # Gather core status data (shared with REPL)
-        sd = gather_status(
-            self.agent,
-            self.provider,
-            self.model,
-            self._session_start_time,
-            self.prompt_manager,
-            self.tracker,
-        )
-
-        # TUI processing override: agent.status doesn't cover the
-        # "user submitted, agent hasn't started yet" window
-        if self.processing:
-            sd.agent_status = "processing"
-
-        # Populate TUI-specific resumed session fields
-        sd.resumed_turn_count = self._resumed_turn_count
-        sd.resumed_saved_at = self._resumed_saved_at
-        sd.resumed_prompt_tokens = self._resumed_prompt_tokens
-        sd.resumed_completion_tokens = self._resumed_completion_tokens
-
-        # ── TUI-specific: last turn info ──
-        last_turn_str = ""
-        if self._last_turn_duration is not None:
-            dur_str = format_duration(self._last_turn_duration)
-            ago = format_duration(time.time() - self._last_turn_end_time)
-            last_turn_str = (
-                f"  last turn: [yellow]{dur_str}[/] (completed {ago} ago)\n"
-                f"  turns: [yellow]{sd.turn_count}[/] | "
-                f"total processing: [yellow]{sd.total_processing}[/]\n"
-            )
-
-        # ── TUI-specific: resumed session info ──
-        resumed_str = ""
-        if self._resumed_turn_count > 0:
-            resumed_lines = []
-            resumed_lines.append("\n[bold]Resumed session[/]")
-            if self._resumed_saved_at:
-                try:
-                    saved_dt = datetime.fromisoformat(self._resumed_saved_at)
-                    ago = int(time.time() - saved_dt.timestamp())
-                    ago_m, ago_s = divmod(ago, 60)
-                    ago_h, ago_m = divmod(ago_m, 60)
-                    if ago_h > 0:
-                        ago_str = f"{ago_h}h {ago_m}m ago"
-                    else:
-                        ago_str = f"{ago_m}m {ago_s}s ago"
-                    saved_str = saved_dt.strftime("%Y-%m-%d %H:%M")
-                    resumed_lines.append(f"  saved: [yellow]{saved_str}[/] ({ago_str})")
-                except (ValueError, OSError):
-                    pass
-            prev_p = fmt_tokens(sd.resumed_prompt_tokens)
-            prev_c = fmt_tokens(sd.resumed_completion_tokens)
-            prev_t = fmt_tokens(sd.resumed_prompt_tokens + sd.resumed_completion_tokens)
-            resumed_lines.append(
-                f"  previous: [yellow]{sd.resumed_turn_count}[/] turns | "
-                f"{prev_p} prompt / {prev_c} completion / {prev_t} total"
-            )
-            delta_p = fmt_tokens(sd.prompt_tokens - sd.resumed_prompt_tokens)
-            delta_c = fmt_tokens(sd.completion_tokens - sd.resumed_completion_tokens)
-            delta_t = fmt_tokens(
-                (sd.prompt_tokens - sd.resumed_prompt_tokens)
-                + (sd.completion_tokens - sd.resumed_completion_tokens)
-            )
-            resumed_lines.append(
-                f"  this session: [yellow]{sd.turn_count}[/] turns | "
-                f"{delta_p} prompt / {delta_c} completion / {delta_t} total"
-            )
-            resumed_str = "\n".join(resumed_lines) + "\n"
-
-        # ── TUI-specific: saves info ──
-        saves_str = ""
-        try:
-            from agent13.config import get_config
-
-            cfg = get_config()
-            saves_loc = cfg.saves_location
-
-            from agent13.persistence import count_saves
-
-            # count_saves classifies with the same rules as /load completion
-            # (the old glob used the central pattern in local mode, so the
-            # auto count was always 0 there and manual included auto-saves).
-            auto_count, manual_count = count_saves()
-            saves_lines = []
-            saves_lines.append("\n[bold]Saves[/]")
-            loc_label = "local" if saves_loc == "local" else "central"
-            saves_lines.append(
-                f"  auto: [yellow]{auto_count}[/] ({loc_label}) | manual: [yellow]{manual_count}[/]"
-            )
-            latest = find_latest_auto_save()
-            if latest:
-                try:
-                    with open(latest) as f:
-                        ctx_data = json.load(f)
-                    saved_at = ctx_data.get("saved_at")
-                    if saved_at:
-                        saved_dt = datetime.fromisoformat(saved_at)
-                        saved_fmt = saved_dt.strftime("%Y-%m-%d %H:%M")
-                        saves_lines.append(f"  restorable: [green]yes[/] ({saved_fmt})")
-                    else:
-                        saves_lines.append("  restorable: [green]yes[/]")
-                except (OSError, json.JSONDecodeError, ValueError):
-                    saves_lines.append("  restorable: [green]yes[/]")
-            else:
-                saves_lines.append("  restorable: [dim]no auto-save found[/]")
-            saves_str = "\n".join(saves_lines) + "\n"
-        except OSError:
-            pass
-
-        # ── Build output (Rich markup) ──
-        tools_str = f"{sd.tool_successes}/{sd.tool_calls}" if sd.tool_calls > 0 else "0"
-        focus_str = (
-            f"  focus: [yellow]{escape_markup(sd.focus_name)}[/]\n"
-            if sd.focus_name
-            else ""
-        )
-        # Session age: original start (persisted in saves, survives resume)
-        # + lifetime compaction total. Both reset only on /new_session.
-        session_age_str = ""
-        if sd.session_started_at:
-            try:
-                start_dt = datetime.fromisoformat(sd.session_started_at)
-                age = format_duration(time.time() - start_dt.timestamp())
-                session_age_str = (
-                    "  session started: "
-                    f"[yellow]{start_dt.strftime('%Y-%m-%d %H:%M')}[/]"
-                    f" ({age} ago)\n"
+        """Handle /help command - generated from the shared command registry."""
+        lines = []
+        for section in format_help_sections(_TUI_LOCAL_COMMANDS):
+            lines.append(f"[bold]{section.title}:[/]")
+            for entry in section.entries:
+                lines.append(
+                    f"  [yellow]/{entry.name}[/] - {escape_markup(entry.description)}"
                 )
-            except (ValueError, OSError):
-                pass
-        chains_str = f"  total chains: [yellow]{sd.chain_count}[/]\n"
-        sandbox_suffix = (
-            f" (pinned: {sd.sandbox_pinned})" if sd.sandbox_pinned is not None else ""
+                for detail in entry.detail:
+                    lines.append(f"      [dim]{escape_markup_open(detail)}[/]")
+            lines.append("")
+        lines.extend(
+            [
+                "[bold]Keyboard shortcuts:[/]",
+                "  [yellow]ESC[/] - Cancel request (use /resume to continue)",
+                "  [yellow]Ctrl+C[/] - Clear input or quit",
+                "  [yellow]Ctrl+D / Ctrl+Q[/] - Quit app",
+                "  [yellow]Tab[/] - Tab completion for commands/history",
+                "  [yellow]Up/Down[/] - Navigate input history",
+                "  [yellow]Shift+Up/Down[/] - Scroll chat",
+                "",
+                "[bold]Tips:[/]",
+                "  [yellow]![/]message - Priority: queued ahead of normal items "
+                "(after any steers)",
+                "  [yellow]!![/]message - Steer: add context into the agent's "
+                "current turn without cancelling",
+                "  [yellow]![/] or [yellow]!![/] alone - promote the most "
+                "recently queued message to that level",
+            ]
         )
-        devel_suffix = (
-            f" (pinned: {'on' if sd.devel_pinned else 'off'})"
-            if sd.devel_pinned is not None
-            else ""
-        )
-
-        self._update_info_content(
-            f"[bold]Session[/]\n"
-            f"  status: [yellow]{sd.agent_status}[/]\n"
-            f"  run time: [yellow]{sd.run_time}[/]\n"
-            f"{session_age_str}"
-            f"{chains_str}"
-            f"  cwd: [yellow]{escape_markup(sd.cwd)}[/]\n"
-            f"{focus_str}"
-            f"{last_turn_str}"
-            f"{resumed_str}"
-            f"{saves_str}"
-            f"\n[bold]Provider[/]\n"
-            f"  provider: [yellow]{escape_markup(sd.provider)}[/]\n"
-            f"  model: [yellow]{escape_markup(sd.model)}[/]\n"
-            f"  prompt: [yellow]{escape_markup(sd.active_prompt)}[/]\n"
-            f"\n[bold]Context[/]\n"
-            f"  prompt tokens: [yellow]{sd.prompt_tokens_fmt}[/]\n"
-            f"  completion tokens: [yellow]{sd.completion_tokens_fmt}[/]\n"
-            f"  total tokens: [yellow]{sd.total_tokens_fmt}[/]\n"
-            f"  queue: [yellow]{sd.queue_count}[/]\n"
-            f"\n[bold]Connectivity[/]\n"
-            f"  mcp: [yellow]{sd.mcp_status}[/]\n"
-            f"\n[bold]Tools[/]\n"
-            f"  success/calls: [yellow]{tools_str}[/]\n"
-            f"  bounded: [yellow]{sd.bounded_count}[/]\n"
-            f"\n[bold]Settings[/]\n"
-            f"  sandbox: [yellow]{escape_markup(sd.sandbox_mode + sandbox_suffix)}[/]\n"
-            f"  pretty: [yellow]{'on' if self.pretty else 'off'}[/]\n"
-            f"  tool-response: [yellow]{escape_markup(self.tool_response_format)}[/]\n"
-            f"  spinner: [yellow]{self._spinner_speed}[/]\n"
-            f"  clipboard: [yellow]{self._clipboard_method}[/]\n"
-            f"  bell: [yellow]{self._bell.status_text()}[/]\n"
-            f"  bell-cmd: [yellow]{escape_markup(self._bell.command) if self._bell.command else '(terminal bell)'}[/]\n"
-            f"  remove-api-reasoning: [yellow]{'on' if sd.remove_reasoning else 'off'}[/]\n"
-            f"  reasoning widgets: [yellow]{'collapsed' if self._reasoning_collapsed else 'expanded'}[/]\n"
-            f"  tool widgets: [yellow]{'collapsed' if self._toolview_collapsed else 'expanded'}[/]\n"
-            f"  devel: [yellow]{'on' if sd.devel_mode else 'off'}{devel_suffix}[/]\n"
-            f"  skill tool: [yellow]{'on' if sd.skills_mode else 'off'}[/]\n"
-            f"  journal: [yellow]{'on' if sd.journal_mode else 'off'}[/]\n"
-            f"  auto-context: [yellow]"
-            f"{'off' if sd.auto_context_threshold == 0 else f'{sd.auto_context_threshold:,} tokens'}"
-            f"[/]\n"
-            f"  auto-action: [yellow]{sd.auto_context_action}[/]\n"
-            f"  auto-chain: [yellow]{sd.auto_context_chain}[/]\n"
-            f"  chains: [yellow]{sd.auto_context_chain_used}/{sd.auto_context_chain}[/]\n"
-            f"  nudges: [yellow]{sd.nudges}[/]"
-        )
-        self._info_pane_mode = "status"
+        self._update_info_content("\n".join(lines))
+        self._info_pane_mode = "help"
 
     def _capture_resumed_stats(self, path: Path | None = None) -> None:
         """Snapshot loaded session stats for /status display.
@@ -4408,286 +4006,33 @@ class AgentTUI(App):
             try:
                 with open(path) as f:
                     ctx_data = json.load(f)
-                self._resumed_saved_at = ctx_data.get("saved_at")
+                self.agent.resumed_saved_at = ctx_data.get("saved_at")
             except (OSError, json.JSONDecodeError):
                 pass
         # Count turn-start user messages for turn count (skips interrupts
         # and native-vision image injections)
-        self._resumed_turn_count = sum(
+        self.agent.resumed_turn_count = sum(
             1 for m in self.agent.messages if is_turn_start(m)
         )
         # Snapshot token counters
-        self._resumed_prompt_tokens = self.prompt_tokens
-        self._resumed_completion_tokens = self.completion_tokens
+        self.agent.resumed_prompt_tokens = self.prompt_tokens
+        self.agent.resumed_completion_tokens = self.completion_tokens
         # Reset session timing (conversation effectively restarts)
-        self._session_start_time = time.time()
-        self.tracker._turn_count = 0
-        self.tracker._total_processing_time = 0.0
-        self._last_turn_duration = None
-        self._last_turn_end_time = None
+        self.agent.session_start_time = time.time()
+        self.agent.tracker._turn_count = 0
+        self.agent.tracker._total_processing_time = 0.0
+        self.agent.last_turn_duration = None
+        self.agent.last_turn_end_time = None
 
-    def _handle_prompt_command(self, args: str) -> None:
-        """Handle /prompt command."""
-        if not args:
-            # Show prompt list via completion system, starting at active prompt
-            matches = list(self.prompt_manager.prompts.keys())
-            self._enter_command_completion(
-                "prompt", matches, self.prompt_manager.active_prompt
-            )
-            return
+    def _show_queue(self, polite_waiting: bool = False) -> None:
+        """Render the queue listing (the shared handler owns the text).
 
-        name = args.strip()
-        if self.prompt_manager.set_active(name):
-            self.agent.reload_agents_md()
-            self.agent.set_system_prompt(self.prompt_manager.get_prompt())
-            self._update_info_content(
-                f"[green]Switched to prompt: {escape_markup(name)}[/]"
-            )
-        else:
-            self._update_info_content(
-                f"[red]Prompt not found: {escape_markup(name)}[/]"
-            )
-
-    def _handle_snippet_command(self, args: str) -> None:
-        """Handle /snippet command."""
-        if not args:
-            self._update_info_content(
-                "[bold]Snippets:[/] Saved user messages invoked as slash commands.\n\n"
-                "[dim]Usage:[/]\n"
-                "  [yellow]/snippet list[/] - List all snippets (re-reads snippets file first)\n"
-                "  [yellow]/snippet add last <name> [-y][/] - Save last user message as snippet\n"
-                "  [yellow]/snippet delete <name>[/] - Delete a snippet\n"
-                "  [yellow]/snippet rename <old> <new>[/] - Rename a snippet\n"
-                "  [yellow]/snippet use <name>[/] - Fill input with snippet\n\n"
-                "[dim]You can also type /<snippet_name> to fill input directly.[/]"
-            )
-            return
-
-        parts = args.split(maxsplit=2)
-        subcmd = parts[0].lower()
-
-        if subcmd == "list":
-            snippets = self.snippet_manager.list_snippets()
-            if not snippets:
-                self._update_info_content("[dim]No snippets defined.[/]")
-                return
-            lines = ["[bold]Available snippets:[/]"]
-            for s in snippets:
-                collision = (
-                    " [red](collision with built-in)[/]" if s["collision"] else ""
-                )
-                lines.append(f"  [yellow]{escape_markup(s['name'])}[/]{collision}")
-                lines.append(f"    [dim]{escape_markup(s['preview'])}[/]")
-            self._update_info_content("\n".join(lines))
-
-        elif subcmd == "add":
-            # /snippet add last <name> [-y]
-            all_parts = args.split()
-            if len(all_parts) < 3 or all_parts[1].lower() != "last":
-                self._update_info_content(
-                    "[red]Usage: /snippet add last <name> [-y][/]\n"
-                    "  Saves your previous user message as a snippet."
-                )
-                return
-            # Parse name and -y flag from remaining parts
-            force = "-y" in all_parts
-            name_parts = [p for p in all_parts[2:] if p != "-y"]
-            if not name_parts:
-                self._update_info_content(
-                    "[red]Usage: /snippet add last <name> [-y][/]"
-                )
-                return
-            name = name_parts[0]
-
-            # Validate name
-            validation_error = self.snippet_manager.validate_name(name)
-            if validation_error:
-                self._update_info_content(f"[red]{validation_error}[/]")
-                return
-
-            # Check overwrite
-            if self.snippet_manager.get_snippet(name) is not None and not force:
-                self._update_info_content(
-                    f"[yellow]Snippet '{escape_markup(name)}' already exists.[/]\n"
-                    f"Use [yellow]/snippet add last {name} -y[/] to overwrite"
-                )
-                return
-
-            # Get last user message
-            content = self._get_last_user_message()
-            if content is None:
-                self._update_info_content("[red]No user message to save[/]")
-                return
-
-            warning = self.snippet_manager.add_snippet(name, content)
-
-            # Register new slash command if no collision
-            if name not in {cmd[1:] for cmd in self._BUILTIN_SLASH_COMMANDS}:
-                slash = f"/{name}"
-                if slash not in self.SLASH_COMMANDS:
-                    self.SLASH_COMMANDS.append(slash)
-
-            msg = f"[green]Saved snippet '{escape_markup(name)}'[/]"
-            if warning:
-                msg += f"\n[yellow]WARNING: {warning}[/]"
-            self._update_info_content(msg)
-
-        elif subcmd == "delete":
-            if len(parts) < 2:
-                self._update_info_content("[red]Usage: /snippet delete <name>[/]")
-                return
-            name = parts[1]
-            if self.snippet_manager.delete_snippet(name):
-                # Remove from slash commands
-                slash = f"/{name}"
-                if slash in self.SLASH_COMMANDS:
-                    self.SLASH_COMMANDS.remove(slash)
-                self._update_info_content(
-                    f"[green]Deleted snippet '{escape_markup(name)}'[/]"
-                )
-            else:
-                self._update_info_content(
-                    f"[red]Snippet not found: {escape_markup(name)}[/]"
-                )
-
-        elif subcmd == "rename":
-            if len(parts) < 3:
-                self._update_info_content("[red]Usage: /snippet rename <old> <new>[/]")
-                return
-            old_name = parts[1]
-            new_name = parts[2]
-            # Remove old slash command
-            old_slash = f"/{old_name}"
-            if old_slash in self.SLASH_COMMANDS:
-                self.SLASH_COMMANDS.remove(old_slash)
-            result = self.snippet_manager.rename_snippet(old_name, new_name)
-            if result and result.startswith("Snippet not found"):
-                self._update_info_content(f"[red]{result}[/]")
-                return
-            if result and result.startswith("Invalid"):
-                self._update_info_content(f"[red]{result}[/]")
-                return
-            # Add new slash command if no collision
-            if new_name not in {cmd[1:] for cmd in self._BUILTIN_SLASH_COMMANDS}:
-                new_slash = f"/{new_name}"
-                if new_slash not in self.SLASH_COMMANDS:
-                    self.SLASH_COMMANDS.append(new_slash)
-            msg = f"[green]Renamed snippet '{escape_markup(old_name)}' → '{escape_markup(new_name)}'[/]"
-            if result:
-                msg += f"\n[yellow]WARNING: {result}[/]"
-            self._update_info_content(msg)
-
-        elif subcmd == "use":
-            if len(parts) < 2:
-                self._update_info_content("[red]Usage: /snippet use <name>[/]")
-                return
-            name = parts[1]
-            snippet = self.snippet_manager.get_snippet(name)
-            if snippet is None:
-                self._update_info_content(
-                    f"[red]Snippet not found: {escape_markup(name)}[/]"
-                )
-                return
-            input_field = self.query_one("#input-field", ChatTextArea)
-            input_field.text = snippet
-            input_field.focus()
-
-        else:
-            self._update_info_content(
-                f"[red]Unknown snippet command: {escape_markup(subcmd)}[/]\n"
-                "[dim]Usage: /snippet [list|add|delete|rename|use][/]"
-            )
-
-    def _get_last_user_message(self) -> str | None:
-        """Get the text of the last non-slash-command user message.
-
-        Returns None if no suitable message is found.
+        Called by the command path through the registry, and internally by
+        the queue-change and polite-wait ticks. ``polite_waiting`` prepends
+        the "Waiting for lock" header; it is not a command form.
         """
-        idx = self.agent.history.find_last_user_idx()
-        if idx is None:
-            return None
-        # Flattened: multimodal content (image blocks) arrives as a list
-        content = content_to_text(self.agent.messages[idx].get("content", ""))
-        if not content or not content.strip():
-            return None
-        return content
-
-    def _handle_pretty_command(self, args: str) -> None:
-        """Handle /pretty command."""
-        if not args:
-            self.pretty = not self.pretty
-        else:
-            arg = args.strip().lower()
-            if arg == "on":
-                self.pretty = True
-            elif arg == "off":
-                self.pretty = False
-            else:
-                self._update_info_content("[red]Usage: /pretty [on|off][/]")
-                return
-        self._update_info_content(
-            f"[green]Pretty mode: {'on' if self.pretty else 'off'}[/]"
-        )
-
-    def _handle_tool_response_command(self, args: str) -> None:
-        """Handle /tool-response command."""
-        if not args:
-            self._update_info_content(
-                f"[bold]Tool response format:[/] {self.tool_response_format}\n"
-                "[dim]Usage: /tool-response [raw|json][/]"
-            )
-            return
-
-        format_arg = args.strip().lower()
-        if format_arg in ("raw", "json"):
-            self.tool_response_format = format_arg
-            response_format = {"type": "json_object"} if format_arg == "json" else None
-            self.agent.set_response_format(response_format)
-            self._update_info_content(
-                f"[green]Tool response format set to: {format_arg}[/]"
-            )
-        else:
-            self._update_info_content("[red]Invalid format. Use 'raw' or 'json'[/]")
-
-    def _handle_queue_command(self, polite_waiting: bool = False) -> None:
-        """Handle /queue command - show queue items.
-
-        The currently running item is shown as an unnumbered header line
-        (it cannot be deleted).  Pending items are numbered 1..N so the
-        numbers match ``/delete q N`` indices.
-
-        When ``polite_waiting`` is True, a "Waiting for lock" header is
-        prepended to indicate the agent is blocked on the polite lock.
-        """
-        items = format_queue_items(self.agent.queue)
-        if not items:
-            self._update_info_content("[dim]Queue is empty[/]")
-            self._info_pane_mode = "queue"
-            return
-
-        pending_count = sum(1 for it in items if not it.running)
-        lines = []
-        if polite_waiting:
-            lines.append("[dim]Waiting for lock[/]")
-        lines.append(f"[bold]Queue ({pending_count} pending):[/]")
-        for item in items:
-            if item.interrupt:
-                priority_marker = "[red]!![/] "
-            elif item.priority:
-                priority_marker = "[yellow]![/] "
-            else:
-                priority_marker = "   "
-            text_preview = " ".join(item.text.split())
-            if item.running:
-                lines.append(
-                    f"  {priority_marker}[dim]→ {escape_markup(text_preview)} (running)[/]"
-                )
-            else:
-                lines.append(
-                    f"  {priority_marker}[cyan]{item.index}.[/] {escape_markup(text_preview)}"
-                )
-        self._update_info_content("\n".join(lines))
-        self._info_pane_mode = "queue"
+        result = execute_queue(self.agent, "", polite_waiting=polite_waiting)
+        self._render_command_result(result, "")
 
     def _handle_pause_command(self) -> None:
         """Handle /pause command - pause agent processing.
@@ -4709,10 +4054,13 @@ class AgentTUI(App):
             self._update_info_content("[yellow]Already pausing[/]")
             return
 
-        if self.processing:
+        if self.processing or self.agent.has_pending_work:
             # Agent is actively processing (turn in flight, or waiting on the
             # polite lock - both report WAITING status) - request pause at
-            # the next safe point.
+            # the next safe point. has_pending_work also covers the window
+            # between submitting a message and the run loop starting it,
+            # where self.processing is still False: taking the idle branch
+            # there stopped the agent loop instead of pausing it.
             self.agent.pause()
             self.update_status()  # Update status to show "pausing"
             self._update_info_content("[yellow]Pausing at next safe point...[/]")
@@ -4769,21 +4117,18 @@ class AgentTUI(App):
         self.update_status()
         self._update_info_content("[green]Agent resumed[/]")
 
-    def _handle_retry_command(self) -> None:
-        """Handle /retry command - retry the last message."""
-        result = execute_retry(self.agent)
-        if not result.success:
-            self._update_info_content(f"[yellow]{result.message}[/]")
-            return
+    def _load_retry_text(self, user_text: str) -> None:
+        """Load /retry's text into the input for editing (like /snippet use).
 
+        The TUI's half of /retry: the shared handler already removed the last
+        group from the history.
+        """
         # Clear error/interrupt state
         self._error_state = False
         self._last_error_type = None
         self._interrupt_requested = False
         self._interrupt_available = False
 
-        # Fill the input with the retried text for editing (like /snippet use)
-        user_text = result.data["user_text"]
         input_field = self.query_one("#input-field", ChatTextArea)
         input_field.text = user_text
         input_field.focus()
@@ -4792,75 +4137,14 @@ class AgentTUI(App):
             "[dim]Last message removed and loaded for editing. Press Enter to retry.[/]"
         )
 
-    def _handle_prioritise_command(self, args: str) -> None:
-        """Handle /prioritise command - mark queue item as priority."""
-        result = execute_prioritise(self.agent, args)
-        if result.success:
-            self._update_info_content(f"[green]{escape_markup(result.message)}[/]")
-        else:
-            self._update_info_content(f"[red]{result.message}[/]")
-
-    def _handle_deprioritise_command(self, args: str) -> None:
-        """Handle /deprioritise command - remove priority from queue item."""
-        result = execute_deprioritise(self.agent, args)
-        if result.success:
-            self._update_info_content(f"[green]{escape_markup(result.message)}[/]")
-        else:
-            self._update_info_content(f"[red]{result.message}[/]")
-
-    def _handle_provider_command(self, args: str) -> None:
-        """Handle /provider command - change provider (use /model to select model after)."""
-        if not args:
-            # Show provider list via completion system, starting at current provider
-            matches = self._get_provider_completions("")
-            if not matches:
-                self._update_info_content(
-                    "[red]No providers configured in ~/.agent13/config.toml[/]"
-                )
-                return
-            self._enter_command_completion("provider", matches, self.provider)
-            return
-
-        # Resolve numeric selection to provider name
-        resolved = resolve_provider_selection(args)
-        if resolved is None:
-            self._update_info_content(
-                f"[red]No provider matching '{escape_markup(args)}'[/]"
-            )
-            return
-
-        try:
-            base_url, api_key, read_timeout, connect_timeout = resolve_provider_arg(
-                resolved
-            )
-        except ValueError as e:
-            self._update_info_content(f"[red]Error: {escape_markup(str(e))}[/]")
-            return
-
-        # Create new client with the new provider
-        self.client = create_client(
-            base_url,
-            api_key,
-            read_timeout=read_timeout,
-            connect_timeout=connect_timeout,
-        )
-        self.agent.set_client(self.client)
-
-        # Update provider name for status bar (empty if URL)
-        self.provider = (
-            ""
-            if resolved.startswith("http://") or resolved.startswith("https://")
-            else resolved
-        )
-        self.update_status()
-
-        # Fetch models from the new provider
-        asyncio.create_task(self._fetch_and_show_models(base_url))
-
     async def _fetch_and_show_models(self, base_url: str) -> None:
-        """Fetch models from provider and show them."""
+        """Fetch models from the new provider and show them.
+
+        The async tail of /provider: the shared handler swapped the client,
+        this fills the model list the picker and /model read.
+        """
         try:
-            model_names = await fetch_models(self.client)
+            model_names = await fetch_models(self.agent.client)
         except Exception as e:
             self._update_info_content(
                 f"[red]Error fetching models: {escape_markup(str(e))}[/]"
@@ -4871,558 +4155,45 @@ class AgentTUI(App):
             self._update_info_content("[red]No models available from provider[/]")
             return
 
-        # Update model list
         self.agent.available_models = model_names
 
-        # Show model list
         lines = [f"[bold]Provider changed to: {escape_markup(base_url)}[/]"]
-        lines.append("[bold]Available models:[/]")
-        for i, name in enumerate(model_names, 1):
-            lines.append(f"  [yellow]{i}.[/] {escape_markup(name)}")
+        for line in format_model_list(model_names).splitlines():
+            lines.append(escape_markup(line))
         lines.append("")
         lines.append("[dim]Use /model <name> or /model <tab> to select[/]")
         self._update_info_content("\n".join(lines))
 
-    def _handle_sandbox_command(self, args: str) -> None:
-        """Handle /sandbox command - show or set sandbox mode."""
-        if not args:
-            # Show current mode
-            current = get_current_sandbox_mode()
-            session = get_session_sandbox_mode()
-            config_default = get_default_sandbox_mode()
-            pinned = get_pinned_sandbox_mode()
+    async def _run_mcp_action(self, action: str) -> None:
+        """Run /mcp connect|disconnect|reload and show the result."""
+        from agent13.commands import run_mcp_action
 
-            lines = ["[bold]Sandbox Configuration:[/]"]
-            lines.append(f"  Current mode: [cyan]{current.value}[/]")
-            if session:
-                lines.append(f"  Session override: [yellow]{session.value}[/]")
-            else:
-                lines.append("  Session override: [dim]none (using config default)[/]")
-            lines.append(f"  Config default: [dim]{config_default.value}[/]")
-            if pinned:
-                lines.append(f"  Pinned: [yellow]{pinned.value}[/]")
-            else:
-                lines.append("  Pinned: [dim]no[/]")
-            lines.append("")
-            lines.append(format_all_sandbox_modes())
-            lines.append("")
-            lines.append("[dim]/sandbox <mode>  set session mode[/]")
-            lines.append("[dim]/sandbox pin     pin current mode for this project[/]")
-            lines.append("[dim]/sandbox unpin   remove pin for this project[/]")
-            self._update_info_content("\n".join(lines))
-            return
-
-        mode_str = args.strip().lower()
-
-        if mode_str == "pin":
-            current = get_current_sandbox_mode()
-            pin_sandbox_mode(current)
-            self._update_info_content(
-                f"[green]Pinned sandbox mode '{current.value}' for this project.[/]\n"
-                "[dim]This mode will auto-apply on startup in this directory.[/]"
-            )
-            return
-
-        if mode_str == "unpin":
-            if unpin_sandbox_mode():
-                self._update_info_content(
-                    "[green]Removed sandbox pin for this project.[/]"
-                )
-            else:
-                self._update_info_content(
-                    "[yellow]No sandbox pin exists for this project.[/]"
-                )
-            return
-
-        # Set session override
-        try:
-            mode = parse_sandbox_mode(mode_str)
-            set_session_sandbox_mode(mode)
-            self._update_info_content(f"[green]Sandbox mode set to: {mode.value}[/]")
-        except ValueError as e:
-            self._update_info_content(f"[red]{escape_markup(str(e))}[/]")
-
-    def _handle_cwd_command(self, args: str) -> None:
-        """Handle /cwd command - show or change working directory."""
-        if not args:
-            self._update_info_content(
-                f"[bold]Working directory:[/]\n  [cyan]{Path.cwd()}[/]"
-            )
-            return
-
-        # Strip @ prefix from path autocomplete (e.g. /cwd @../path)
-        target = Path(args.strip().lstrip("@")).expanduser().resolve()
-        if not target.exists():
-            self._update_info_content(
-                f"[red]Path does not exist: {escape_markup(str(target))}[/]"
-            )
-            return
-        if not target.is_dir():
-            self._update_info_content(
-                f"[red]Not a directory: {escape_markup(str(target))}[/]"
-            )
-            return
-
-        try:
-            os.chdir(target)
-            self._update_info_content(
-                f"[green]Working directory changed to: {escape_markup(str(target))}[/]"
-            )
-        except OSError as e:
-            self._update_info_content(
-                f"[red]Cannot change directory: {escape_markup(str(e))}[/]"
-            )
-
-    def _handle_mcp_command(self, args: str) -> None:
-        """Handle /mcp command - list MCP servers or manage connections."""
-        parts = args.split(maxsplit=1) if args else []
-        subcmd = parts[0].lower() if parts else ""
-
-        if subcmd == "reload":
-            # Reload MCP servers
-            if not self.agent.mcp:
-                self._update_info_content(
-                    "[dim]MCP not initialized (no servers configured)[/]"
-                )
-                return
-
-            async def do_reload():
-                try:
-                    servers = await self.agent.mcp.reload()
-                    self._update_info_content(
-                        f"[dim]MCP reconnected: {list(servers.keys())}[/]"
-                    )
-                except Exception as e:
-                    self.post_message(ErrorMessage(f"MCP reload error: {e}", "mcp"))
-                finally:
-                    self.update_status()
-
-            asyncio.create_task(do_reload())
-
-        elif subcmd == "connect":
-            # Connect to all MCP servers
-            if not self.agent._mcp_server_configs:
-                self._update_info_content("[dim]No MCP servers configured[/]")
-                return
-
-            async def do_connect():
-                try:
-                    mcp = await self.agent._ensure_mcp()
-                    if mcp:
-                        info = await mcp.connect_all()
-                        self._update_info_content(
-                            f"[dim]MCP connected: {list(info.keys())}[/]"
-                        )
-                except Exception as e:
-                    self.post_message(ErrorMessage(f"MCP connect error: {e}", "mcp"))
-                finally:
-                    self.update_status()
-
-            asyncio.create_task(do_connect())
-
-        elif subcmd == "disconnect":
-            # Disconnect from all MCP servers
-            if not self.agent.mcp:
-                self._update_info_content("[dim]MCP not connected[/]")
-                return
-
-            async def do_disconnect():
-                await self.agent.disconnect_mcp()
-                self._update_info_content("[dim]MCP servers disconnected[/]")
-
-            asyncio.create_task(do_disconnect())
-
-        else:
-            # List MCP servers
-            if not self.agent.mcp:
-                configured = len(self.agent._mcp_server_configs)
-                self._update_info_content(
-                    f"[bold]MCP Status:[/]\n"
-                    f"  Status: [dim]Not initialized[/]\n"
-                    f"  Configured servers: {configured}\n\n"
-                    f"[dim]Use /mcp connect to connect to MCP servers.[/]"
-                )
-                return
-
-            servers = self.agent.mcp.get_server_info()
-            if not servers:
-                configured = len(self.agent._mcp_server_configs)
-                self._update_info_content(
-                    f"[bold]MCP Status:[/]\n"
-                    f"  Configured servers: {configured}\n\n"
-                    f"[dim]Use /mcp connect to connect to servers.[/]"
-                )
-                return
-            formatted = format_mcp_servers(servers, use_rich=True)
-            self._update_info_content(formatted)
-
-    def _handle_tools_command(self) -> None:
-        """Handle /tools command - show tool usage statistics."""
-        stats = self.agent.tool_stats
-        total = stats.total_calls
-        successes = stats.total_successes
-
-        if total == 0:
-            self._update_info_content("[dim]No tool calls yet this session[/]")
-            return
-
-        lines = [f"[bold]Tool Usage[/]  {successes}/{total} successful", ""]
-
-        # Sort by call count descending
-        sorted_tools = sorted(stats.calls.items(), key=lambda x: x[1], reverse=True)
-
-        for name, calls in sorted_tools:
-            tool_successes = stats.successes.get(name, 0)
-            success_str = f"{tool_successes}/{calls}"
-
-            # Mode breakdown if available
-            modes = stats.modes.get(name, {})
-            if modes:
-                mode_successes = stats.mode_successes.get(name, {})
-                mode_strs = [
-                    f"{m}={mode_successes.get(m, 0)}/{c}"
-                    for m, c in sorted(modes.items())
-                ]
-                mode_str = f"  modes: {', '.join(mode_strs)}"
-            else:
-                mode_str = ""
-
-            lines.append(f"  [yellow]{name}[/]  {success_str}{mode_str}")
-
-            # Param combo breakdown
-            combos = stats.param_combos.get(name, {})
-            if combos and len(combos) > 1:
-                combo_successes = stats.param_combo_successes.get(name, {})
-                for combo, count in sorted(
-                    combos.items(), key=lambda x: x[1], reverse=True
-                ):
-                    cs = combo_successes.get(combo, 0)
-                    lines.append(f"    [dim]{combo}={cs}/{count}[/]")
-
-        self._update_info_content("\n".join(lines))
-
-    def _handle_skills_command(self, args: str) -> None:
-        """Handle /skills command - toggle the skills list or list available skills.
-
-        on/off toggle the skills *list* (descriptions in the system prompt); 'on'
-        also enables the *tool*. The tool is enabled by --skills, by /skills on,
-        or by the first skill invocation — and never switches off.
-
-        Args:
-            args: Subcommand - 'on', 'off', 'list', 'status', or empty (lists)
-        """
-        if not self.skill_manager:
-            self._update_info_content("[dim]No skill manager configured[/]")
-            return
-
-        args = args.strip().lower()
-
-        if args == "on":
-            self._skills_list_enabled = True
-            self.agent.set_skills_mode(True)
-            self._rebuild_system_prompt_with_skills(True)
-            self._update_info_content(
-                "[green]Skills enabled[/]\n"
-                "Skill descriptions added to system prompt and the "
-                "skill tool is available."
-            )
-        elif args == "off":
-            self._skills_list_enabled = False
-            self._rebuild_system_prompt_with_skills(False)
-            self._update_info_content(
-                "[yellow]Skills list disabled[/]\n"
-                "Skill descriptions removed from the system prompt. "
-                "Note: the skill tool, once enabled, has no off-switch. "
-                "You can still invoke skills via slash commands."
-            )
-        elif args == "status":
-            count = len(self.skill_manager.skills) if self.skill_manager.skills else 0
-            tool_color = "green" if self.agent.skills_mode else "dim"
-            self._update_info_content(
-                "[bold]Skills status[/]\n"
-                "  List in prompt: "
-                f"{'on' if self._skills_list_enabled else 'off'}\n"
-                "  Skill tool:     "
-                f"[{tool_color}]{'on' if self.agent.skills_mode else 'off'}[/] "
-                "(auto-enables after first skill use)\n"
-                f"  {count} skill(s) available"
-            )
-        else:
-            # Default: list skills (also handles 'list' subcommand)
-            skills = self.skill_manager.skills
-            if not skills:
-                self._update_info_content("[dim]No skills available[/]")
-                return
-
-            status = "on" if self.agent.skills_mode else "off"
-            lines = [f"[bold]Available skills[/] (tool: {status})", ""]
-            for name, info in sorted(skills.items()):
-                desc = (
-                    info.description[:60] + "..."
-                    if len(info.description) > 60
-                    else info.description
-                )
-                lines.append(
-                    f"  [yellow]/{escape_markup(name)}[/] - {escape_markup(desc)}"
-                )
-
-            lines.append("")
-            lines.append(
-                "[dim]Invoke a skill to enable the tool · "
-                "/skills on|off toggles the list[/]"
-            )
-            self._update_info_content("\n".join(lines))
-
-    def _rebuild_system_prompt_with_skills(self, include: bool) -> None:
-        """Rebuild the system prompt with or without the skills section.
-
-        Args:
-            include: True to append skills section, False to strip it
-        """
-        from agent13.prompts import get_skills_section
-
-        base = self.prompt_manager.get_prompt()
-        if include and self.skill_manager and self.skill_manager.skills:
-            skills_section = get_skills_section(self.skill_manager.skills)
-            if skills_section:
-                self.agent.set_system_prompt(f"{base}\n\n{skills_section}")
-            else:
-                self.agent.set_system_prompt(base)
-        else:
-            self.agent.set_system_prompt(base)
-
-    def _handle_journal_command(self, args: str) -> None:
-        """Handle /journal command - control journal mode."""
-        args = args.strip().lower()
-        if args == "on":
-            self.agent.journal_mode = True
-            self.update_status()
-            self._update_info_content(
-                "[green]Journal mode enabled[/]\n"
-                "Context will be compacted via reflection before each new message."
-            )
-        elif args == "off":
-            self.agent.journal_mode = False
-            self.update_status()
-            self._update_info_content("[yellow]Journal mode disabled[/]")
-        elif args == "last":
-            # Journal the most recent tool-using turn via the agent queue
-            asyncio.create_task(
-                self.agent.add_message("/journal last", kind="journal_last")
-            )
-        elif args == "all":
-            # Iteratively journal all tool-using turns via the agent queue
-            asyncio.create_task(
-                self.agent.add_message("/journal all", kind="journal_all")
-            )
-        elif args == "status" or not args:
-            status = "on" if self.agent.journal_mode else "off"
-            color = "green" if self.agent.journal_mode else "yellow"
-            self._update_info_content(f"[{color}]Journal mode: {status}[/]")
-        else:
-            self._update_info_content(
-                "[red]Usage: /journal [on|off|last|all|status][/]\n"
-                "  [yellow]/journal on[/] - Enable context compaction\n"
-                "  [yellow]/journal off[/] - Disable context compaction\n"
-                "  [yellow]/journal last[/] - Journal the most recent tool-using turn\n"
-                "  [yellow]/journal all[/] - Journal all tool-using turns iteratively\n"
-                "  [yellow]/journal status[/] - Show current state"
-            )
-
-    def _handle_compact_command(self, args: str) -> None:
-        """Handle /compact command - compact entire history into one pair."""
-        from agent13.prompts import resolve_compact_prompt
-
-        arg = args.strip()
-        compact_prompt_text, error = resolve_compact_prompt(self.prompt_manager, arg)
-        if error:
-            first, *rest = error.splitlines()
-            rest_text = "\n".join(rest)
-            self._update_info_content(
-                f"[red]{first}[/]" + (f"\n{rest_text}" if rest else "")
-            )
-            return
-
-        display = f"/compact {arg}" if arg else "/compact"
-        asyncio.create_task(
-            self.agent.add_message(
-                display,
-                kind="compact",
-                data={
-                    "compact_prompt": compact_prompt_text,
-                    "user_specified_prompt": bool(arg),
-                },
-            )
-        )
-
-    def _handle_wrapup_command(self, args: str = "") -> None:
-        """Handle /wrapup - run the wrap-up turn (journal + current-truth
-        files), then idle. No compaction; history stays intact.
-
-        Optional argument: the focus name (rest of line, may contain
-        spaces), which becomes the authoritative focus name for the
-        {focus} files even if it was never named in the conversation."""
-        arg = args.strip()
-        if arg:
-            asyncio.create_task(
-                self.agent.add_message(
-                    f"/wrapup {arg}",
-                    kind="wrapup",
-                    data={"focus_name": arg},
-                )
-            )
-        else:
-            asyncio.create_task(self.agent.add_message("/wrapup", kind="wrapup"))
-
-    def _handle_focus_command(self, args: str = "") -> None:
-        """Handle /focus - set the authoritative focus name immediately
-        (rest of line, may contain spaces). Not queued: the name must
-        land before a threshold-triggered wrap-up builds its prompt,
-        so record targeting follows a mid-turn /focus. On an empty
-        message history the focus's durable records are seeded into
-        the history; mid-session it is set-only. No arg: report the
-        current name. The result goes to the info pane (like the other
-        state-reporting commands), not a transient toast."""
-
-        async def _apply():
-            message, level = await self.agent.apply_focus_name(args.strip())
-            color = "green" if level == "info" else "yellow"
-            self._update_info_content(f"[{color}]{message}[/]")
-            # No status transition happens on this path (it is not a
-            # queue item), so refresh the status bar's focus segment
-            # explicitly - the periodic timer only runs during a session.
-            self.update_status()
-
-        asyncio.create_task(_apply())
-
-    def _handle_chain_command(self, args: str = "") -> None:
-        """Handle /chain - manual chain restart: wrap-up (if stale) →
-        clear history → inject records. No AI calls when the wrap-up is
-        already current.
-
-        Args:
-            args: "no-skills" (also accepted as --no-skills / no_skills)
-                drops manually-loaded skills from this restart AND forgets
-                them; they are one /skillname away if still needed.
-        """
-        no_skills = (
-            args.strip().lower().lstrip("-").replace("-", "").replace("_", "")
-            == "noskills"
-        )
-        data = {"no_skills": True} if no_skills else {}
-        asyncio.create_task(
-            self.agent.add_message("/chain", kind="chain", data=data)
-        )
-
-    def _handle_remove_reasoning_command(self, args: str) -> None:
-        """Handle /remove-api-reasoning - strip reasoning from API context."""
-        args = args.strip().lower()
-        if args == "on":
-            self.agent.remove_reasoning = True
-            self._update_info_content(
-                "[green]Remove API reasoning enabled[/]\n"
-                "Reasoning tokens will be stripped between turns to save context."
-            )
-        elif args == "off":
-            self.agent.remove_reasoning = False
-            self._update_info_content(
-                "[yellow]Remove API reasoning disabled[/]\n"
-                "Reasoning tokens will be preserved between turns."
-            )
-        elif not args:
-            # Toggle
-            self.agent.remove_reasoning = not self.agent.remove_reasoning
-            status = "on" if self.agent.remove_reasoning else "off"
-            self._update_info_content(f"Remove API reasoning: {status}")
-        else:
-            status = "on" if self.agent.remove_reasoning else "off"
-            self._update_info_content(
-                f"[red]Usage: /remove-api-reasoning [on|off][/]\n"
-                f"  [yellow]/remove-api-reasoning on[/] - Strip reasoning "
-                f"between turns (API context)\n"
-                f"  [yellow]/remove-api-reasoning off[/] - Preserve reasoning "
-                f"between turns\n"
-                f"  To fold the widgets in the chat, use /reasoning hide\n"
-                f"  Current: {status}"
-            )
+        ok, message = await run_mcp_action(self.agent, action)
+        colour = "green" if ok else "red"
+        self._update_info_content(f"[{colour}]{escape_markup_open(message)}[/]")
+        self.update_status()
 
     def _handle_collapse_command(self, kind: str, args: str) -> None:
         """Handle /reasoning and /toolview - fold a widget family (display)."""
         from agent13.commands import execute_collapse
 
         current = (
-            self._reasoning_collapsed
+            self.agent.reasoning_collapsed
             if kind == "reasoning"
-            else self._toolview_collapsed
+            else self.agent.toolview_collapsed
         )
 
         def _set(value: bool) -> None:
             if kind == "reasoning":
-                self._reasoning_collapsed = value
+                self.agent.reasoning_collapsed = value
             else:
-                self._toolview_collapsed = value
+                self.agent.toolview_collapsed = value
 
         result = execute_collapse(kind, args, current, _set)
         # Plain text from the shared command; escape it for the info pane.
         message = escape_markup(result.message)
         color = "green" if result.success else "red"
         self._update_info_content(f"[{color}]{message}[/]")
-
-    def _handle_devel_command(self, args: str) -> None:
-        """Handle /devel command - toggle devel mode (show/hide devel-group tools)."""
-        args = args.strip().lower()
-        if args == "on":
-            self.agent.set_devel_mode(True)
-            self.update_status()
-            self._update_info_content(
-                "[green]Devel mode enabled[/]\n"
-                "Devel-group tools (e.g. TUI viewer) are now visible to the AI."
-            )
-        elif args == "off":
-            self.agent.set_devel_mode(False)
-            self.update_status()
-            self._update_info_content(
-                "[yellow]Devel mode disabled[/]\n"
-                "Devel-group tools are now hidden from the AI."
-            )
-        elif args == "pin":
-            enabled = self.agent.devel_mode
-            pin_devel(enabled)
-            self._update_info_content(
-                f"[green]Pinned devel mode '{'on' if enabled else 'off'}' for this project.[/]\n"
-                "[dim]Devel mode will auto-apply on startup in this directory.[/]"
-            )
-        elif args == "unpin":
-            if unpin_devel():
-                self._update_info_content(
-                    "[green]Removed devel pin for this project.[/]"
-                )
-            else:
-                self._update_info_content(
-                    "[yellow]No devel pin exists for this project.[/]"
-                )
-        elif args == "status" or not args:
-            status = "on" if self.agent.devel_mode else "off"
-            color = "green" if self.agent.devel_mode else "yellow"
-            pinned = get_pinned_devel()
-            if pinned is not None:
-                pinned_text = f"[yellow]{'on' if pinned else 'off'}[/]"
-            else:
-                pinned_text = "[dim]no[/]"
-            self._update_info_content(
-                f"[{color}]Devel mode: {status}[/]\n  Pinned: {pinned_text}"
-            )
-        else:
-            status = "on" if self.agent.devel_mode else "off"
-            self._update_info_content(
-                f"[red]Usage: /devel [on|off|status|pin|unpin][/]\n"
-                f"  [yellow]/devel on[/] - Show devel-group tools to the AI\n"
-                f"  [yellow]/devel off[/] - Hide devel-group tools from the AI\n"
-                f"  [yellow]/devel status[/] - Show current state\n"
-                f"  [yellow]/devel pin[/] - Pin current state for this project\n"
-                f"  [yellow]/devel unpin[/] - Remove pin for this project\n"
-                f"  Current: {status}"
-            )
 
     def _handle_spinner_command(self, args: str) -> None:
         """Handle /spinner command - set spinner animation speed."""
@@ -5437,7 +4208,7 @@ class AgentTUI(App):
             color = {"fast": "green", "slow": "yellow", "off": "red"}[args]
             self._update_info_content(f"[{color}]Spinner: {label}[/]")
         elif args == "status" or not args:
-            speed = self._spinner_speed
+            speed = self.agent.spinner_speed
             label = {
                 "fast": "Fast (100ms, braille)",
                 "slow": "Slow (250ms, classic)",
@@ -5448,7 +4219,7 @@ class AgentTUI(App):
             )
             self._update_info_content(f"[{color}]Spinner: {label}[/]")
         else:
-            speed = self._spinner_speed
+            speed = self.agent.spinner_speed
             self._update_info_content(
                 f"[red]Usage: /spinner [fast|slow|off|status][/]\n"
                 f"  [yellow]/spinner fast[/] - Braille spinner, 100ms (default)\n"
@@ -5458,53 +4229,6 @@ class AgentTUI(App):
                 f"  Current: {speed}"
             )
 
-    def _handle_upgrade_command(self, args: str) -> None:
-        """Handle /upgrade command - check for updates and apply or copy."""
-        from agent13.updater import (
-            check_and_apply_update,
-            UpdateStatus,
-        )
-
-        args = args.strip().lower()
-        copy_mode = "--copy" in args or "copy" in args
-
-        def _on_status(msg: str) -> None:
-            self._update_info_content(f"[yellow]{msg}[/]")
-
-        result = check_and_apply_update(
-            copy_mode=copy_mode,
-            on_status=_on_status,
-            # No confirm callback: the TUI uses --copy for a non-destructive
-            # "show me the command" flow, and the destructive apply path is
-            # gated by explicitly running `/upgrade` without `--copy` (the
-            # user already chose to upgrade). Keeps the flow non-blocking.
-        )
-
-        if result.status is UpdateStatus.COPIED:
-            self.copy_to_clipboard(result.manual_cmd)
-            self._update_info_content(
-                f"[green]Copied to clipboard:[/]\n  [dim]{result.manual_cmd}[/]"
-            )
-        elif result.status is UpdateStatus.UPDATED:
-            self._update_info_content(
-                f"[green]✓ {result.message}[/]\n"
-                f"[dim]Please restart agent13 to use the new version.[/]"
-            )
-        elif result.status is UpdateStatus.UP_TO_DATE:
-            self._update_info_content(f"[green]{result.message}[/]")
-        elif result.status is UpdateStatus.UNREACHABLE:
-            self._update_info_content(
-                f"[red]{result.message}[/]\n"
-                f"[dim]You can manually upgrade with:[/]\n"
-                f"  [dim]uv tool install --force agent13[/]"
-            )
-        elif result.status is UpdateStatus.FAILED:
-            parts = [f"[red]✗ {result.message}[/]"]
-            if result.manual_cmd:
-                parts.append(f"\n  [dim]Manual command: {result.manual_cmd}[/]")
-            self._update_info_content(" ".join(parts))
-        # CANCELLED: no confirm callback is used, so this status can't occur.
-
     def _handle_clipboard_command(self, args: str) -> None:
         """Handle /clipboard command - show or set clipboard method."""
         from agent13.clipboard import VALID_METHODS
@@ -5513,7 +4237,7 @@ class AgentTUI(App):
 
         if not args:
             # Show current method
-            method = self._clipboard_method
+            method = self.agent.clipboard_method
             desc = (
                 "terminal escape sequence (works over SSH)"
                 if method == "osc52"
@@ -5535,7 +4259,7 @@ class AgentTUI(App):
             return
 
         # Update in-memory
-        self._clipboard_method = args
+        self.agent.clipboard_method = args
 
         # Persist to config file
         try:
@@ -5570,271 +4294,6 @@ class AgentTUI(App):
             else "OS-level commands (works in tmux, screen, PowerShell)"
         )
         self._update_info_content(f"[green]Clipboard method: {args}[/]\n  {desc}")
-
-    def _handle_polite_command(self, args: str) -> None:
-        """Handle /polite command - enable/disable polite multi-agent mode."""
-        from agent13.commands import execute_polite
-
-        result = execute_polite(self.agent, args)
-        self.update_status()
-        if not args.strip():
-            # Status query — show in yellow (info, not success/error)
-            self._update_info_content(f"[yellow]{escape_markup(result.message)}[/]")
-        elif result.success:
-            self._update_info_content(f"[green]{escape_markup(result.message)}[/]")
-        else:
-            self._update_info_content(f"[red]{escape_markup(result.message)}[/]")
-
-    def _handle_bell_command(self, args: str) -> None:
-        """Handle /bell command - set or show the terminal bell threshold.
-
-        /bell N     - Ring bell if a turn takes longer than N seconds
-        /bell 0     - Always ring on return to idle
-        /bell off   - Disable bell
-        /bell       - Show current status
-        """
-        args = args.strip().lower()
-        if not args:
-            # Show current status
-            st = self._bell.status_text()
-            if st == "off":
-                self._update_info_content("[red]Bell: off[/]")
-            elif st == "always":
-                self._update_info_content("[green]Bell: on (always)[/]")
-            else:
-                self._update_info_content(f"[green]Bell: on ({st})[/]")
-        elif args == "off":
-            self._bell.disable()
-            self._update_info_content("[red]Bell: off[/]")
-        else:
-            try:
-                val = float(args)
-                if val < 0:
-                    raise ValueError("negative")
-                self._bell.set_threshold(val)
-                if val == 0:
-                    self._update_info_content("[green]Bell: on (always)[/]")
-                else:
-                    self._update_info_content(f"[green]Bell: on ({val:.0f}s)[/]")
-            except ValueError:
-                self._update_info_content(
-                    "[red]Usage: /bell [N|off][/]\n"
-                    "  [yellow]/bell 30[/] - Ring bell after 30s\n"
-                    "  [yellow]/bell 0[/] - Always ring on idle\n"
-                    "  [yellow]/bell off[/] - Disable bell\n"
-                    "  [yellow]/bell[/] - Show current status"
-                )
-
-    def _handle_bell_command_command(self, args: str) -> None:
-        """Handle /bell-command - set or show the external bell command.
-
-        /bell-command <cmd> - Run external command instead of terminal bell
-        /bell-command off   - Clear command, revert to terminal bell
-        /bell-command       - Show current command
-        """
-        args = args.strip()
-        if not args:
-            # Show current status
-            if self._bell.command:
-                self._update_info_content(
-                    f"[green]Bell command: {escape_markup(self._bell.command)}[/]"
-                )
-            else:
-                self._update_info_content("[yellow]Bell command: (terminal bell)[/]")
-        elif args.lower() == "off":
-            self._bell.clear_command()
-            self._update_info_content("[green]Bell command: cleared (terminal bell)[/]")
-        else:
-            # Strip surrounding quotes if present (single or double)
-            if len(args) >= 2 and args[0] in "\"'" and args[-1] == args[0]:
-                args = args[1:-1]
-            if not self._bell.set_command(args):
-                self._update_info_content(
-                    f"[red]Error: '{escape_markup(args.split()[0])}' is not executable[/]\n"
-                    "  The first token must be found in PATH.\n"
-                    "  [yellow]/bell-command off[/] - Revert to terminal bell\n"
-                    "  [yellow]/bell-command[/] - Show current status"
-                )
-                return
-            self._update_info_content(f"[green]Bell command: {escape_markup(args)}[/]")
-
-    def _handle_auto_context_threshold_command(self, args: str) -> None:
-        """Handle /auto_context_threshold - set or show the auto-context threshold.
-
-        /auto_context_threshold N   - Set threshold to N tokens (supports k suffix)
-        /auto_context_threshold 0   - Disable auto-context
-        /auto_context_threshold     - Show current status
-        """
-        args = args.strip()
-        if not args:
-            if self.agent.auto_context_threshold > 0:
-                if self.agent.auto_context_action == "none":
-                    action_line = "Action: none (chain ignored)"
-                else:
-                    action_line = (
-                        f"Action: {self.agent.auto_context_action} "
-                        f"(chain: {self.agent.auto_context_chain})"
-                    )
-                self._update_info_content(
-                    f"[green]Auto-context: on "
-                    f"({self.agent.auto_context_threshold:,} tokens)[/]\n"
-                    f"[dim]{action_line}[/]"
-                )
-            else:
-                self._update_info_content("[yellow]Auto-context: off (threshold 0)[/]")
-            return
-
-        try:
-            threshold = parse_token_count(args)
-            self.agent.auto_context_threshold = threshold
-            if threshold == 0:
-                self._update_info_content("[yellow]Auto-context: off[/]")
-            else:
-                self._update_info_content(
-                    f"[green]Auto-context: on ({threshold:,} tokens)[/]"
-                )
-        except ValueError:
-            self._update_info_content(
-                "[red]Usage: /auto_context_threshold [N|0][/]\n"
-                "  [yellow]/auto_context_threshold 150k[/] - Act at 150,000 tokens\n"
-                "  [yellow]/auto_context_threshold 0[/] - Disable\n"
-                "  [yellow]/auto_context_threshold[/] - Show current status"
-            )
-
-    def _handle_auto_context_chain_command(self, args: str) -> None:
-        """Handle /auto_context_chain - set or show the chain (restarts per turn).
-
-        /auto_context_chain N   - Set the chain to N (minimum 0)
-        /auto_context_chain     - Show current value
-        """
-        args = args.strip()
-        if not args:
-            self._update_info_content(
-                f"[green]Auto-context chain: {self.agent.auto_context_chain}[/] "
-                "[dim](restarts per turn; 0 = stop after the action)[/]"
-            )
-            return
-
-        try:
-            chain = int(args)
-            if chain < 0:
-                raise ValueError("must be >= 0")
-            self.agent.auto_context_chain = chain
-            self._update_info_content(f"[green]Auto-context chain: {chain}[/]")
-        except ValueError:
-            self._update_info_content(
-                "[red]Usage: /auto_context_chain N[/]\n"
-                "  [yellow]/auto_context_chain 2[/] - Restart the turn up to 2 times per turn\n"
-                "  [yellow]/auto_context_chain[/] - Show current value"
-            )
-
-    def _handle_auto_context_nudge_cap_command(self, args: str) -> None:
-        """Handle /auto_context_nudge_cap - set or show the degeneration guard cap.
-
-        /auto_context_nudge_cap N   - Set the cap to N (minimum 0; 0 = guard off)
-        /auto_context_nudge_cap     - Show current value
-        """
-        args = args.strip()
-        if not args:
-            cap = self.agent.auto_context_nudge_cap
-            if cap > 0:
-                self._update_info_content(
-                    f"[green]Degeneration guard: on (cap {cap})[/] "
-                    f"[dim](nudges: {self.agent.degenerate_nudges})[/]"
-                )
-            else:
-                self._update_info_content(
-                    "[green]Degeneration guard: off (nudge cap 0)[/]"
-                )
-            return
-
-        try:
-            nudge_cap = int(args)
-            if nudge_cap < 0:
-                raise ValueError("must be >= 0")
-            self.agent.auto_context_nudge_cap = nudge_cap
-            if nudge_cap == 0:
-                self._update_info_content(
-                    "[green]Degeneration guard: off (nudge cap 0)[/]"
-                )
-            else:
-                self._update_info_content(
-                    f"[green]Degeneration guard cap: {nudge_cap}[/]"
-                )
-        except ValueError:
-            self._update_info_content(
-                "[red]Usage: /auto_context_nudge_cap N[/]\n"
-                "  [yellow]/auto_context_nudge_cap 2[/] - Stop after 2 consecutive degenerate ends\n"
-                "  [yellow]/auto_context_nudge_cap 0[/] - Disable the guard\n"
-                "  [yellow]/auto_context_nudge_cap[/] - Show current value"
-            )
-
-    def _handle_auto_context_action_command(self, args: str) -> None:
-        """Handle /auto_context_action - set or show the auto-context action.
-
-        /auto_context_action <value>  - Set the action (compact|report_and_compact|none)
-        /auto_context_action          - Show current value
-        """
-        args = args.strip()
-        valid = ("compact", "report_and_compact", "none")
-        if not args:
-            self._update_info_content(
-                f"[green]Auto-context action: {self.agent.auto_context_action}[/] "
-                "[dim](valid: compact | report_and_compact | none)[/]"
-            )
-            return
-        if args in valid:
-            self.agent.auto_context_action = args
-            self._update_info_content(f"[green]Auto-context action: {args}[/]")
-        else:
-            self._update_info_content(
-                "[red]Usage: /auto_context_action [compact|report_and_compact|none][/]\n"
-                "  [yellow]/auto_context_action compact[/] - Full compact at the threshold\n"
-                "  [yellow]/auto_context_action report_and_compact[/] - Wrap up, report, then compact\n"
-                "  [yellow]/auto_context_action none[/] - Pause at the threshold (no action)\n"
-                "  [yellow]/auto_context_action[/] - Show current value"
-            )
-
-    def _handle_save_command(self, args: str) -> None:
-        """Handle /save command - save context to file."""
-        result = execute_save(self.agent, args)
-        if result.success:
-            self._update_info_content(f"[green]{escape_markup(result.message)}[/]")
-        else:
-            self._update_info_content(f"[red]{escape_markup(result.message)}[/]")
-
-    def _handle_load_command(self, args: str) -> None:
-        """Handle /load command - load context from file.
-
-        Validates the path synchronously, then queues a kind='load'
-        item for safe deferred processing. The agent processes it at a
-        safe boundary between items, replacing messages without race risk.
-        """
-        args = args.strip()
-
-        if not args:
-            self._update_info_content(
-                "[red]Usage: /load <name>[/]\n"
-                "  [yellow]/load mycontext[/] - Load from ./.agent13/saves/mycontext.ctx\n"
-                "  [yellow]/load 2026-05-25[/] - Load auto-save by date"
-            )
-            return
-
-        from agent13.persistence import resolve_save_path
-
-        path = resolve_save_path(args)
-
-        if not path.exists():
-            self._update_info_content(
-                f"[red]Save file not found: {path}[/]\n"
-                f"Use [yellow]/save {args}[/] to create it"
-            )
-            return
-
-        # Store path for on_context_loaded to capture resumed stats
-        self._pending_load_path = path
-        # Queue the load for safe deferred processing (pass path as string)
-        asyncio.create_task(self.agent.request_load(str(path)))
 
     def _load_auto_save(self) -> None:
         """Load the latest auto-save if available."""
@@ -5924,9 +4383,9 @@ class AgentTUI(App):
         if is_debug_enabled():
             log_tps_tool_call(
                 tool_name=message.name,
-                first_token_time=self.tracker._first_token_time,
-                last_token_time=self.tracker._last_token_time,
-                token_count=self.tracker._token_count,
+                first_token_time=self.agent.tracker._first_token_time,
+                last_token_time=self.agent.tracker._last_token_time,
+                token_count=self.agent.tracker._token_count,
                 pending_token_usage=None,
             )
         self._token_queue.put_nowait(message)
@@ -6005,9 +4464,9 @@ class AgentTUI(App):
             if is_debug_enabled():
                 log_tps_stream_end(
                     reason="is_final",
-                    first_token_time=self.tracker._first_token_time,
-                    last_token_time=self.tracker._last_token_time,
-                    token_count=self.tracker._token_count,
+                    first_token_time=self.agent.tracker._first_token_time,
+                    last_token_time=self.agent.tracker._last_token_time,
+                    token_count=self.agent.tracker._token_count,
                     pending_token_usage=None,
                 )
             self._streaming = False
@@ -6016,10 +4475,10 @@ class AgentTUI(App):
         else:
             # Track timing for TPS calculation
             now = time.time()
-            if self.tracker.is_first_token:
+            if self.agent.tracker.is_first_token:
                 if is_debug_enabled():
-                    log_tps_first_token(token_count=self.tracker._token_count)
-            self.tracker.record_token(now)
+                    log_tps_first_token(token_count=self.agent.tracker._token_count)
+            self.agent.tracker.record_token(now)
 
             # Visible tokens are flowing again: any "⚙ …" placeholder mounted
             # during a silent stretch was a false alarm (the model was just
@@ -6130,7 +4589,7 @@ class AgentTUI(App):
         was_at_bottom = self._is_at_bottom()
         widget = ToolWidget(
             message.name,
-            collapsed=self._toolview_collapsed,
+            collapsed=self.agent.toolview_collapsed,
             kind="call",
             pending=True,
         )
@@ -6156,7 +4615,7 @@ class AgentTUI(App):
         was_at_bottom = self._is_at_bottom()
         widget = ToolWidget(
             "",
-            collapsed=self._toolview_collapsed,
+            collapsed=self.agent.toolview_collapsed,
             kind="call",
             pending=True,
             pending_unknown=True,
@@ -6189,9 +4648,9 @@ class AgentTUI(App):
                 "tool_result",
                 {
                     "tool_name": message.name,
-                    "first_token_time": self.tracker._first_token_time,
-                    "last_token_time": self.tracker._last_token_time,
-                    "token_count": self.tracker._token_count,
+                    "first_token_time": self.agent.tracker._first_token_time,
+                    "last_token_time": self.agent.tracker._last_token_time,
+                    "token_count": self.agent.tracker._token_count,
                 },
             )
         await self._write_tool_result(message.name, message.result, message.seq)
@@ -6209,7 +4668,7 @@ class AgentTUI(App):
             return
         # Widget is created with title pre-rendered
         self._streaming_reasoning_widget = ReasoningMessage(
-            title, collapsed=self._reasoning_collapsed
+            title, collapsed=self.agent.reasoning_collapsed
         )
         self._streaming_reasoning_widget.add_class("reasoning-message")
         if not await self._safe_mount(self._streaming_reasoning_widget):
@@ -6226,7 +4685,7 @@ class AgentTUI(App):
             # First meaningful token - create the widget with title pre-set
             was_at_bottom = self._is_at_bottom()
             self._streaming_reasoning_widget = ReasoningMessage(
-                title, collapsed=self._reasoning_collapsed
+                title, collapsed=self.agent.reasoning_collapsed
             )
             self._streaming_reasoning_widget.add_class("reasoning-message")
             if not await self._safe_mount(self._streaming_reasoning_widget):
@@ -6291,9 +4750,9 @@ class AgentTUI(App):
         if is_debug_enabled():
             log_tps_stream_end(
                 reason="tool_call",
-                first_token_time=self.tracker._first_token_time,
-                last_token_time=self.tracker._last_token_time,
-                token_count=self.tracker._token_count,
+                first_token_time=self.agent.tracker._first_token_time,
+                last_token_time=self.agent.tracker._last_token_time,
+                token_count=self.agent.tracker._token_count,
                 pending_token_usage=None,
             )
         # Finalize reasoning if still open
@@ -6435,33 +4894,9 @@ class AgentTUI(App):
                         partial += "\n" + lines[r]
                     partial += "\n" + lines[end_row][:end_col]
 
-                matches = self._get_completions_for_context(
-                    completion_type, partial, current_text
+                self._start_completion(
+                    input_field, completion_type, partial, current_text, start_loc, end_loc
                 )
-                if matches:
-                    if len(matches) == 1:
-                        # Single match - complete immediately
-                        self._apply_completion(
-                            input_field, matches[0], start_loc, end_loc
-                        )
-                        self._reset_completion_state()
-                        # Only hide info-pane if completions were shown there
-                        if self._info_pane_mode is None:
-                            self._hide_info_pane()
-                    else:
-                        # Multiple matches - enter completion mode
-                        self._completion_matches = matches
-                        self._completion_index = 0
-                        self._completion_prefix = partial
-                        self._completion_start = start_loc
-                        self._completion_end = end_loc
-                        self._apply_completion(
-                            input_field, matches[0], start_loc, end_loc
-                        )
-                        self._completion_text = (
-                            input_field.text
-                        )  # Save text AFTER completion for change detection
-                        self._show_completions(matches, matches[0])
 
             # Re-focus input after Tab handling
             self.call_later(input_field.focus)
@@ -6494,6 +4929,22 @@ class AgentTUI(App):
             # Without completion mode, Up/Down are handled by TextArea (cursor movement)
             return
 
+        # Right arrow at the end of a directory path opens it. This is the way
+        # OUT of a live completion cycle: Tab cycles the level and never
+        # descends, so without this the only escape is an edit (any key ends
+        # the cycle) - a trick nobody can discover.
+        if event.key == "right":
+            descend = self._descend_target(current_text, input_field.cursor_location)
+            if descend is not None:
+                event.stop()
+                partial, start_loc, end_loc = descend
+                self._reset_completion_state()
+                self._start_completion(
+                    input_field, "@filename", partial, current_text, start_loc, end_loc
+                )
+                self.call_later(input_field.focus)
+                return
+
         # Escape is handled by action_interrupt binding
         # No need to handle here - the binding with priority=True catches it first
 
@@ -6510,6 +4961,69 @@ class AgentTUI(App):
         # Enter triggers submission via ChatTextArea.action_submit()
         # Ctrl+J inserts newline via ChatTextArea.action_insert_newline()
         # No special handling needed here
+
+    def _descend_target(
+        self, text: str, cursor: tuple[int, int]
+    ) -> tuple[str, tuple[int, int], tuple[int, int]] | None:
+        """Return the @filename context if the cursor sits at the end of a
+        directory path - the `→` gesture that opens it.
+
+        Requires the cursor at the END OF THE LINE (mid-line `→` is ordinary
+        cursor movement) and the typed path to name a directory.
+        """
+        row, col = cursor
+        lines = text.split("\n")
+        if row >= len(lines) or col != len(lines[row]):
+            return None
+        completion_type, start_loc, end_loc = self._get_completion_context(
+            text, row, col
+        )
+        if completion_type != "@filename" or start_loc[0] != end_loc[0]:
+            return None
+        partial = lines[start_loc[0]][start_loc[1] : end_loc[1]]
+        if not partial.endswith("/") and not os.path.isdir(
+            os.path.expanduser(partial[1:])
+        ):
+            return None
+        return partial, start_loc, end_loc
+
+    def _start_completion(
+        self,
+        input_field: ChatTextArea,
+        completion_type: str,
+        partial: str,
+        current_text: str,
+        start_loc: tuple[int, int],
+        end_loc: tuple[int, int],
+    ) -> None:
+        """Complete `partial` and enter cycling mode.
+
+        The cycle list is the whole directory level for @filename (so a unique
+        match cannot trap the user - Tab keeps moving through the siblings),
+        and the match list for every other context. A partial that is already
+        a complete entry leaves Tab inert: see plan_completion.
+        """
+        matches = self._get_completions_for_context(completion_type, partial, current_text)
+        level = []
+        if completion_type == "@filename":
+            level = filename_completion_scan(partial)[1]
+        plan = plan_completion(matches, level, partial)
+        if plan is None:
+            # Nothing to complete - never replace what the user typed in full
+            self._reset_completion_state()
+            if self._info_pane_mode is None:
+                self._hide_info_pane()
+            return
+
+        cycle, index = plan
+        self._completion_matches = cycle
+        self._completion_index = index
+        self._completion_prefix = partial
+        self._completion_start = start_loc
+        self._completion_end = end_loc
+        self._apply_completion(input_field, matches[0], start_loc, end_loc)
+        self._completion_text = input_field.text  # For change detection
+        self._show_completions(cycle, matches[0])
 
     def _apply_completion(
         self,
@@ -6599,7 +5113,7 @@ class AgentTUI(App):
         """
         from agent13.clipboard import copy_to_clipboard as _copy
 
-        method = self._clipboard_method
+        method = self.agent.clipboard_method
         if method == "system":
             if not _copy(text, method="system"):
                 self._write_error(
@@ -6903,12 +5417,6 @@ Provider names are read from ~/.agent13/config.toml
         type=str,
         help="Sandbox mode for bash tool (permissive-open, permissive-closed, restrictive-open, restrictive-closed, none)",
     )
-    parser.add_argument(
-        "--pretty",
-        choices=["on", "off"],
-        default="on",
-        help="Enable/disable markdown rendering. Default: on",
-    )
     parser.add_argument("--debug", action="store_true", help="Enable debug mode")
     parser.add_argument(
         "--tool-response",
@@ -7058,7 +5566,6 @@ Provider names are read from ~/.agent13/config.toml
         model=model,
         model_names=model_names,
         provider=provider_name,
-        pretty=args.pretty == "on",
         debug=args.debug,
         tool_response_format=args.tool_response,
         prompt_manager=prompt_manager,

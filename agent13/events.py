@@ -85,6 +85,10 @@ class AgentEvent(Enum):
         "polite_waiting"  # Waiting for shared provider lock (elapsed seconds)
     )
     POLITE_ACQUIRED = "polite_acquired"  # Lock won, turn proceeding
+    # The wait ended WITHOUT the lock: cancelled (/polite off, re-key) or
+    # paused. Without it a UI that shows "wait: Ns" has no event to clear on
+    # and keeps the overlay up while the turn runs unlocked.
+    POLITE_WAIT_ENDED = "polite_wait_ended"  # reason: "cancelled" | "paused"
 
 
 @dataclass

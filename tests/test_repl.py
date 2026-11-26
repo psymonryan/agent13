@@ -28,6 +28,7 @@ from unittest.mock import patch, MagicMock
 
 from agent13.durable_records import DurableRecords
 from agent13.queue import AgentQueue
+from agent13.timing import TaskClock
 
 
 # ── Mock infrastructure ──────────────────────────────────────────────
@@ -142,6 +143,29 @@ class MockAgent:
         self.journal_mode = False
         self.devel_mode = False
         self.skills_mode = False
+        # Manager-backed commands (/prompt, /skills, /snippet, /skillname)
+        # read their state from the agent.
+        self.skills_list_enabled = False
+        self.prompt_manager = None
+        self.skill_manager = None
+        self.snippet_manager = None
+        self.system_prompt = ""
+        # Session state the shared /status reads (the real Agent carries it).
+        self.tracker = None
+        self.session_start_time = 0.0
+        self.spinner_speed = "fast"
+        self.clipboard_method = "osc52"
+        self.reasoning_collapsed = True
+        self.toolview_collapsed = True
+        self.last_turn_duration = None
+        self.last_turn_end_time = None
+        # load_context resets the task clock (a loaded context is a new
+        # conversation); the real object, not a mirror.
+        self.task_clock = TaskClock()
+        self.resumed_turn_count = 0
+        self.resumed_saved_at = None
+        self.resumed_prompt_tokens = 0
+        self.resumed_completion_tokens = 0
         self.remove_reasoning = False
         self.auto_context_threshold = 220000
         self.auto_context_action = "report_and_compact"
@@ -172,6 +196,12 @@ class MockAgent:
             self.pause_state == self.PauseState.RUNNING
             and self.status == self.AgentStatus.IDLE
         )
+
+    @property
+    def has_pending_work(self) -> bool:
+        # Mirrors Agent.has_pending_work: a queued message counts as work
+        # even while the run loop has not started it.
+        return not self.is_idle or self.queue.pending_count > 0
 
     def on_event(self, handler):
         self._handlers.append(handler)
@@ -227,8 +257,30 @@ class MockAgent:
     def stop(self, reason=None):
         self._calls.append(("stop",))
 
+    async def emit(self, event, data=None):
+        """Dispatch an event to the handlers registered with on_event."""
+        from agent13.events import AgentEventData
+
+        payload = AgentEventData(event=event, data=data or {})
+        for handler in self._handlers:
+            await handler(payload)
+
     async def request_load(self, path):
+        """Record the queue request, then run the load as the agent loop would.
+
+        The real /load only queues; the agent loop performs the load at a safe
+        boundary and emits CONTEXT_LOADED. Doing both here keeps the REPL's
+        deferred path under test end to end.
+        """
         self._calls.append(("request_load", path))
+        from agent13.events import AgentEvent
+        from agent13.persistence import load_context
+
+        success, message, incomplete = load_context(self, path)
+        await self.emit(
+            AgentEvent.CONTEXT_LOADED,
+            {"success": success, "message": message, "incomplete": incomplete},
+        )
 
     def set_mcp_servers(self, servers):
         pass
@@ -254,6 +306,16 @@ class MockAgent:
         self._calls.append(("set_skills_mode", enabled))
         self.skills_mode = enabled
 
+    def set_system_prompt(self, prompt):
+        self._calls.append(("set_system_prompt", prompt))
+        self.system_prompt = prompt
+
+    def reload_agents_md(self):
+        self._calls.append(("reload_agents_md",))
+
+    def note_skill_loaded(self, name, content):
+        self._calls.append(("note_skill_loaded", name, content))
+
     def disconnect_mcp(self):
         self._calls.append(("disconnect_mcp",))
 
@@ -276,7 +338,13 @@ class MockHistoryStore:
 # ── Scenario runner ──────────────────────────────────────────────────
 
 
-async def run_scenario(inputs, prompt_manager=None, agent_config=None):
+async def run_scenario(
+    inputs,
+    prompt_manager=None,
+    agent_config=None,
+    snippet_manager=None,
+    skill_manager=None,
+):
     """Run a REPL scenario with scripted inputs.
 
     Args:
@@ -342,6 +410,8 @@ async def run_scenario(inputs, prompt_manager=None, agent_config=None):
             pretty=False,
             system_prompt="test prompt",
             prompt_manager=prompt_manager,
+            snippet_manager=snippet_manager,
+            skill_manager=skill_manager,
         )
 
     output = captured_stdout.getvalue()
@@ -415,13 +485,13 @@ class TestBasicSending:
         assert calls[0][1] == "first"
 
 
-# ── Feature: Interrupt prefix (!!) ─────────────────────────────────
+# ── Feature: Steer prefix (!!) ─────────────────────────────────
 
 
-class TestInterruptPrefix:
-    """User uses !! prefix for interrupt messages."""
+class TestSteerPrefix:
+    """User uses !! prefix to steer the running turn."""
 
-    async def test_interrupt_prefix(self):
+    async def test_steer_prefix(self):
         """'!!fix this' sends with interrupt=True."""
         output, agent = await run_scenario(["!!fix this", "", "/quit"])
 
@@ -431,20 +501,20 @@ class TestInterruptPrefix:
         assert call[2] is True  # priority (implied by interrupt)
         assert call[3] is True  # interrupt
 
-    async def test_interrupt_with_space(self):
+    async def test_steer_with_space(self):
         """'!! fix this' (space after !!) — prefix still stripped."""
         output, agent = await run_scenario(["!! fix this", "", "/quit"])
 
         call = find_call(agent, "add_message")
         assert call[1] == "fix this"
 
-    async def test_interrupt_shows_notification(self):
-        """User sees [interrupt] notification."""
+    async def test_steer_shows_notification(self):
+        """User sees [steer] notification."""
         output, agent = await run_scenario(["!!urgent", "", "/quit"])
 
-        assert "interrupt" in output.lower()
+        assert "steer" in output.lower()
 
-    async def test_bare_interrupt_prefix(self):
+    async def test_bare_steer_prefix(self):
         """'!!' with nothing after — no message sent, prompts again."""
         # User types bare !!, gets prompted again, then types real message
         output, agent = await run_scenario(["!!", "real message", "", "/quit"])
@@ -793,14 +863,21 @@ class TestClearCommand:
         assert call is None
         assert "has moved" in output
 
-    async def test_new_session_idle(self):
-        """/new_session when idle — wipes history + resets session counters."""
+    async def test_new_session_defers_the_wipe(self):
+        """/new_session always queues the wipe - it never clears inline.
+
+        "Idle" is not a safe shortcut: agent.is_idle looks at the running
+        turn, not at the queue, so an inline wipe could jump ahead of work
+        already waiting.
+        """
         output, agent = await run_scenario(["/new_session", "/quit"])
 
-        call = find_call(agent, "clear_messages")
+        assert find_call(agent, "clear_messages") is None
+        assert find_call(agent, "reset_session_counters") is None
+        call = find_call(agent, "request_clear")
         assert call is not None
-        assert find_call(agent, "reset_session_counters") is not None
-        assert "New session" in output
+        assert call[1] == "all"
+        assert "New session queued" in output
 
 
 # ── Feature: /history command ──────────────────────────────────────
@@ -826,7 +903,7 @@ class TestHistoryCommand:
         """/history shows grouped messages."""
         output, agent = await run_scenario(["first message", "", "/history", "/quit"])
 
-        assert "groups" in output.lower()
+        assert "1 group" in output
 
 
 # ── Feature: /queue command ────────────────────────────────────────
@@ -977,13 +1054,25 @@ class TestHelpCommand:
         assert "/quit" in output
         assert "/help" in output
         assert "/multi" in output
-        assert "/clear" in output
         assert "/history" in output
         assert "/queue" in output
         assert "/delete" in output
         assert "/status" in output
         assert "/save" in output
         assert "/load" in output
+
+    async def test_help_omits_the_tui_only_clear(self):
+        """/clear is a display wipe, so the REPL does not advertise it."""
+        output, _ = await run_scenario(["/help", "/quit"])
+
+        assert "/clear" not in output
+
+    async def test_clear_still_points_at_new_session(self):
+        """Typing /clear earns a pointer, not "Unknown command"."""
+        output, _ = await run_scenario(["/clear", "/quit"])
+
+        assert "Unknown command" not in output
+        assert "/new_session" in output
 
     async def test_help_shows_mode_info(self):
         """/help mentions input/streaming modes."""
@@ -1042,7 +1131,7 @@ class TestStatusCommand:
         assert "sandbox:" in output
         assert "journal:" in output
         assert "devel:" in output
-        assert "skills:" in output
+        assert "skill tool:" in output
 
     async def test_status_shows_auto_context(self):
         """/status shows the four auto-context settings (live agent values)."""
@@ -1196,6 +1285,81 @@ class TestBanner:
 # ── Feature: /pause and /resume ────────────────────────────────────
 
 
+class TestRetryCommand:
+    """/retry: the shared handler removes the group, the REPL re-queues it.
+
+    The TUI loads the same text into the input for editing instead - that
+    tail is its own.
+    """
+
+    async def test_retry_requeues_the_last_user_text(self):
+        def seed(agent):
+            agent.messages.extend(
+                [
+                    {"role": "user", "content": "first question"},
+                    {"role": "assistant", "content": "first answer"},
+                    {"role": "user", "content": "second question"},
+                    {"role": "assistant", "content": "second answer"},
+                ]
+            )
+
+        output, agent = await run_scenario(["/retry", "/quit"], agent_config=seed)
+
+        calls = find_calls(agent, "add_message")
+        assert calls, "the REPL did not re-queue the retried text"
+        assert calls[0][1] == "second question"
+        assert "Retrying" in output
+        # The last group was deleted and the user text re-queued: the old
+        # answer is gone, the question is back at the tail.
+        assert [m["content"] for m in agent.messages] == [
+            "first question",
+            "first answer",
+            "second question",
+        ]
+
+    async def test_retry_with_no_messages_reports_it(self):
+        output, agent = await run_scenario(["/retry", "/quit"])
+
+        assert not find_calls(agent, "add_message")
+        assert "No messages to retry" in output
+
+
+class TestJournalCommand:
+    """/journal: the flag flips in the handler, the REPL queues last/all."""
+
+    async def test_on_sets_the_flag(self):
+        output, agent = await run_scenario(["/journal on", "/quit"])
+
+        assert agent.journal_mode is True
+        assert "Journal mode enabled" in output
+
+    async def test_off_clears_the_flag(self):
+        output, agent = await run_scenario(["/journal on", "/journal off", "/quit"])
+
+        assert agent.journal_mode is False
+        assert "Journal mode disabled" in output
+
+    async def test_status_shows_the_state(self):
+        output, _ = await run_scenario(["/journal", "/quit"])
+
+        assert "Journal mode: off" in output
+
+    async def test_last_queues_a_journal_item(self):
+        output, agent = await run_scenario(["/journal last", "/quit"])
+
+        calls = find_calls(agent, "add_message")
+        assert calls, "the REPL did not queue the journal item"
+        # (name, text, priority, interrupt, kind, data)
+        assert calls[0][1] == "/journal last"
+        assert calls[0][4] == "journal_last"
+        assert "Journaling the most recent tool-using turn" in output
+
+    async def test_invalid_form_shows_usage(self):
+        output, _ = await run_scenario(["/journal bogus", "/quit"])
+
+        assert "Usage: /journal" in output
+
+
 class TestPauseResume:
     """User pauses and resumes the agent."""
 
@@ -1204,6 +1368,26 @@ class TestPauseResume:
         output, agent = await run_scenario(["/pause", "/quit"])
 
         assert "Nothing to pause" in output
+
+    async def test_pause_with_a_queued_message_is_accepted(self):
+        """/pause right after sending a message must pause, not refuse.
+
+        add_message() only queues; the agent reads idle until the run loop
+        picks the message up. /pause gated on is_idle, so a user who typed a
+        message and immediately typed /pause was told "Nothing to pause" -
+        while their message was about to run.
+        """
+
+        def seed_queue(agent):
+            agent.queue.add("square 4 for me")
+
+        output, agent = await run_scenario(
+            ["/pause", "/quit"], agent_config=seed_queue
+        )
+
+        assert "Pausing at next safe point" in output
+        assert "Nothing to pause" not in output
+        assert ("pause",) in agent._calls
 
     async def test_resume_when_not_paused(self):
         """/resume when not paused — not paused."""
@@ -1814,21 +1998,22 @@ async def run_scenario_with_provider_patches(inputs, provider_side_effect=None):
         stack.enter_context(patch("os.makedirs"))
         stack.enter_context(
             patch(
-                "agent13.repl.resolve_provider_arg",
+                "agent13.config.resolve_provider_arg",
                 side_effect=provider_mock.side_effect
                 if provider_side_effect
                 else provider_mock,
             )
         )
         # Mock resolve_provider_selection to pass through the name directly
+        # (the shared handler passes output= to capture the error text)
         stack.enter_context(
             patch(
-                "agent13.repl.resolve_provider_selection",
-                side_effect=lambda choice: choice,
+                "agent13.config.resolve_provider_selection",
+                side_effect=lambda choice, **kwargs: choice,
             )
         )
         stack.enter_context(
-            patch("agent13.repl.create_client", return_value=MagicMock())
+            patch("agent13.config.create_client", return_value=MagicMock())
         )
 
         async def mock_fetch_models(client):
@@ -1858,7 +2043,7 @@ class TestProviderCommand:
 
     async def test_provider_no_args_shows_list(self):
         """/provider with no args shows provider list."""
-        with patch("agent13.repl.get_provider_names", return_value=["alpha", "beta"]):
+        with patch("agent13.config.get_provider_names", return_value=["alpha", "beta"]):
             output, _ = await run_scenario(
                 ["/provider", "/quit"],
             )
@@ -1928,18 +2113,18 @@ class TestProviderCommand:
             # "1" resolves to "test_provider", then resolve_provider_arg succeeds
             stack.enter_context(
                 patch(
-                    "agent13.repl.resolve_provider_selection",
+                    "agent13.config.resolve_provider_selection",
                     return_value="test_provider",
                 )
             )
             stack.enter_context(
                 patch(
-                    "agent13.repl.resolve_provider_arg",
+                    "agent13.config.resolve_provider_arg",
                     return_value=("http://test.example.com/v1", "key", 2400.0, 30.0),
                 )
             )
             stack.enter_context(
-                patch("agent13.repl.create_client", return_value=MagicMock())
+                patch("agent13.config.create_client", return_value=MagicMock())
             )
 
             async def mock_fetch(client):
@@ -1998,12 +2183,12 @@ class TestSandboxCommand:
 
         with (
             patch(
-                "agent13.repl.get_current_sandbox_mode",
+                "tools.security.get_current_sandbox_mode",
                 return_value=SandboxMode.PERMISSIVE_OPEN,
             ),
-            patch("agent13.repl.get_session_sandbox_mode", return_value=None),
+            patch("tools.security.get_session_sandbox_mode", return_value=None),
             patch(
-                "agent13.repl.get_default_sandbox_mode",
+                "agent13.sandbox.get_default_sandbox_mode",
                 return_value=SandboxMode.PERMISSIVE_OPEN,
             ),
         ):
@@ -2017,7 +2202,7 @@ class TestSandboxCommand:
         from agent13.sandbox import SandboxMode
 
         with (
-            patch("agent13.repl.set_session_sandbox_mode") as mock_set,
+            patch("tools.security.set_session_sandbox_mode") as mock_set,
         ):
             output, _ = await run_scenario(["/sandbox restrictive-open", "/quit"])
 
@@ -2036,15 +2221,15 @@ class TestSandboxCommand:
 
         with (
             patch(
-                "agent13.repl.get_current_sandbox_mode",
+                "tools.security.get_current_sandbox_mode",
                 return_value=SandboxMode.RESTRICTIVE_CLOSED,
             ),
             patch(
-                "agent13.repl.get_session_sandbox_mode",
+                "tools.security.get_session_sandbox_mode",
                 return_value=SandboxMode.RESTRICTIVE_CLOSED,
             ),
             patch(
-                "agent13.repl.get_default_sandbox_mode",
+                "agent13.sandbox.get_default_sandbox_mode",
                 return_value=SandboxMode.PERMISSIVE_OPEN,
             ),
         ):
@@ -2058,7 +2243,7 @@ class TestSandboxCommand:
         from agent13.sandbox import SandboxMode
 
         with (
-            patch("agent13.repl.set_session_sandbox_mode") as mock_set,
+            patch("tools.security.set_session_sandbox_mode") as mock_set,
         ):
             output, _ = await run_scenario(["/sandbox off", "/quit"])
 
@@ -2125,18 +2310,32 @@ class TestToolsCommand:
 
     async def test_tools_with_stats(self):
         """/tools shows tool stats when calls exist."""
-        # We need to patch get_tool_stats_summary to return non-empty data
+        # The shared handler imports the summary from agent13.status.
         mock_summary = {
             "total_calls": 10,
             "total_successes": 8,
             "total_failures": 2,
             "success_rate": 80.0,
             "per_tool": [
-                {"name": "read_file", "calls": 7, "successes": 6},
-                {"name": "edit_file", "calls": 3, "successes": 2},
+                {
+                    "name": "read_file",
+                    "calls": 7,
+                    "successes": 6,
+                    "modes": [],
+                    "param_combos": [],
+                },
+                {
+                    "name": "edit_file",
+                    "calls": 3,
+                    "successes": 2,
+                    "modes": [],
+                    "param_combos": [],
+                },
             ],
         }
-        with patch("agent13.repl.get_tool_stats_summary", return_value=mock_summary):
+        with patch(
+            "agent13.status.get_tool_stats_summary", return_value=mock_summary
+        ):
             output, _ = await run_scenario(["/tools", "/quit"])
 
         assert "8/10" in output
@@ -2152,10 +2351,18 @@ class TestToolsCommand:
             "total_failures": 1,
             "success_rate": 80.0,
             "per_tool": [
-                {"name": "command", "calls": 5, "successes": 4},
+                {
+                    "name": "command",
+                    "calls": 5,
+                    "successes": 4,
+                    "modes": [],
+                    "param_combos": [],
+                },
             ],
         }
-        with patch("agent13.repl.get_tool_stats_summary", return_value=mock_summary):
+        with patch(
+            "agent13.status.get_tool_stats_summary", return_value=mock_summary
+        ):
             output, _ = await run_scenario(["/tools", "/quit"])
 
         assert "4/5" in output
@@ -2269,3 +2476,168 @@ class TestHelpIncludesBatch2Commands:
     async def test_help_lists_mcp(self):
         output, _ = await run_scenario(["/help", "/quit"])
         assert "/mcp" in output
+
+
+# -- Feature: manager-backed commands (/prompt, /skills, /snippet) ----------
+
+SKILL_MD = """---
+name: alpha
+description: A skill.
+---
+
+# Alpha
+
+Do the thing.
+"""
+
+
+def _snippet_manager(tmp_path):
+    """A real SnippetManager backed by a temp snippets file."""
+    from agent13.snippets import SnippetManager
+
+    path = tmp_path / "snippets.yaml"
+    path.write_text("mine: the snippet body\n", encoding="utf-8")
+    return SnippetManager(config_path=str(path))
+
+
+def _skill_manager(tmp_path):
+    """A real SkillManager with one skill on disk (temp search path)."""
+    from agent13.config import Config
+    from agent13.skills.manager import SkillManager
+
+    skill_dir = tmp_path / "skills" / "alpha"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text(SKILL_MD, encoding="utf-8")
+
+    config = Config()
+    config.skill_paths = [tmp_path / "skills"]
+    return SkillManager(lambda: config)
+
+
+class TestManagerCommandsReachable:
+    """The three manager commands used to be TUI-only; the REPL has them now."""
+
+    async def test_help_lists_prompt(self):
+        output, _ = await run_scenario(["/help", "/quit"])
+        assert "/prompt" in output
+
+    async def test_help_lists_skills(self):
+        output, _ = await run_scenario(["/help", "/quit"])
+        assert "/skills" in output
+
+    async def test_help_lists_snippet(self):
+        output, _ = await run_scenario(["/help", "/quit"])
+        assert "/snippet" in output
+
+    async def test_prompt_no_args_lists_the_prompts(self):
+        from agent13.prompts import PromptManager
+
+        pm = PromptManager()
+        output, _ = await run_scenario(["/prompt", "/quit"], prompt_manager=pm)
+
+        assert "Available prompts:" in output
+        assert pm.active_prompt in output
+
+    async def test_prompt_switches_the_system_prompt(self):
+        from agent13.prompts import PromptManager
+
+        pm = PromptManager()
+        other = next(n for n in pm.prompts if n != pm.active_prompt)
+        output, agent = await run_scenario(
+            [f"/prompt {other}", "/quit"], prompt_manager=pm
+        )
+
+        assert f"Switched to prompt: {other}" in output
+        assert find_call(agent, "set_system_prompt") is not None
+        assert find_call(agent, "reload_agents_md") is not None
+
+    async def test_snippet_without_a_manager_explains_itself(self):
+        output, _ = await run_scenario(["/snippet list", "/quit"])
+
+        assert "No snippet manager configured" in output
+
+    async def test_snippet_list_uses_the_manager(self, tmp_path):
+        sm = _snippet_manager(tmp_path)
+        output, _ = await run_scenario(
+            ["/snippet list", "/quit"], snippet_manager=sm
+        )
+
+        assert "Available snippets:" in output
+        assert "mine" in output
+
+    async def test_snippet_use_prints_the_text(self, tmp_path):
+        sm = _snippet_manager(tmp_path)
+        output, _ = await run_scenario(
+            ["/snippet use mine", "/quit"], snippet_manager=sm
+        )
+
+        assert "the snippet body" in output
+
+    async def test_skills_without_a_manager_explains_itself(self):
+        output, _ = await run_scenario(["/skills status", "/quit"])
+
+        assert "No skill manager configured" in output
+
+
+class TestSkillInvocation:
+    """Dynamic /skillname works in the REPL, not just the TUI."""
+
+    async def test_unknown_command_still_reports_unknown(self):
+        output, _ = await run_scenario(["/nosuchthing", "/quit"])
+
+        assert "Unknown command: /nosuchthing" in output
+
+    async def test_skill_name_queues_the_content(self, tmp_path):
+        sm = _skill_manager(tmp_path)
+
+        output, agent = await run_scenario(["/alpha", "/quit"], skill_manager=sm)
+
+        assert "Skill loaded: alpha" in output
+        queued = find_call(agent, "add_message")
+        assert queued is not None
+        assert '<skill_content name="alpha">' in queued[1]
+        assert find_call(agent, "note_skill_loaded") is not None
+        assert find_call(agent, "set_skills_mode") == ("set_skills_mode", True)
+
+    async def test_skill_args_are_appended(self, tmp_path):
+        sm = _skill_manager(tmp_path)
+
+        output, agent = await run_scenario(
+            ["/alpha do the thing", "/quit"], skill_manager=sm
+        )
+
+        assert "Skill loaded: alpha" in output
+        assert find_call(agent, "add_message")[1].endswith("do the thing")
+
+
+class TestCompactCommand:
+    """/compact was front-end-local; the shared handler serves both now."""
+
+    async def test_compact_queues_the_turn(self):
+        output, agent = await run_scenario(["/compact finish the work", "/quit"])
+
+        assert "Compaction queued" in output
+        queued = find_call(agent, "add_message")
+        assert queued is not None
+        assert queued[1] == "/compact finish the work"
+        assert queued[4] == "compact", "kind drives the compaction path"
+        assert queued[5]["user_specified_prompt"] is True
+
+    async def test_compact_prompt_flag_uses_the_named_prompt(self):
+        from agent13.prompts import PromptManager
+
+        pm = PromptManager()
+        output, agent = await run_scenario(
+            ["/compact --prompt concise", "/quit"], prompt_manager=pm
+        )
+
+        assert "Compaction queued" in output
+        assert find_call(agent, "add_message")[5]["compact_prompt"] == pm.get_prompt(
+            "concise"
+        )
+
+    async def test_compact_unknown_prompt_reports_and_queues_nothing(self):
+        output, agent = await run_scenario(["/compact --prompt nope", "/quit"])
+
+        assert "not found" in output
+        assert find_call(agent, "add_message") is None

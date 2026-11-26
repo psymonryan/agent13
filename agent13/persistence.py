@@ -350,7 +350,8 @@ def save_context(agent: "Agent", path: Path | str) -> None:
     """Save agent context to a file.
 
     Saves messages, model, system_prompt, session_date, focus name, token
-    usage, and incomplete turn flag.
+    usage, and incomplete turn flag - plus, for a mid-turn save, the turn's
+    own request and its arrival time (see the anchor block at the end).
     Strips reasoning tokens from messages before saving.
     Applies pending compaction if available (without modifying agent state).
 
@@ -366,12 +367,14 @@ def save_context(agent: "Agent", path: Path | str) -> None:
     # Save messages as-is (including reasoning_content) so that on load
     # the KV cache prefix still matches and avoids a cache miss.
     messages_copy = [dict(msg) for msg in agent.messages]
+    incomplete_turn = _is_incomplete_turn(messages_copy)
 
     context = {
         "version": CONTEXT_VERSION,
         "model": agent.model,
         "system_prompt": agent.system_prompt,
         "session_date": getattr(agent, "session_date", None),
+        "last_datetime_nudge_at": getattr(agent, "_last_datetime_nudge_at", None),
         # Focus name (durable-records state, agent13.durable_records). The
         # record paths derive from the name, so only the name is saved.
         **agent.durable_records.save(),
@@ -382,13 +385,22 @@ def save_context(agent: "Agent", path: Path | str) -> None:
         # Session-lifetime degenerate-nudge total (additive - absent in older
         # saves; load defaults 0 = keep current).
         "nudges_total": getattr(agent, "_degenerate_nudges_total", 0),
+        # Goal window (/grind). Persisted so a process restart resumes with
+        # the REAL remaining time instead of restarting the clock. The two
+        # question flags ride along for the crash case; load clears them
+        # unconditionally (a question in flight is not resumable).
+        "goal_text": getattr(agent, "_goal_text", ""),
+        "goal_deadline": getattr(agent, "_goal_deadline", 0.0),
+        "goal_set_at": getattr(agent, "_goal_set_at", 0.0),
+        "goal_question_pending": getattr(agent, "_goal_question_pending", False),
+        "goal_answer_pending": getattr(agent, "_goal_answer_pending", False),
         "messages": messages_copy,
         "token_usage": {
             "prompt": agent.prompt_tokens,
             "completion": agent.completion_tokens,
         },
         "saved_at": datetime.now().isoformat(),
-        "incomplete_turn": _is_incomplete_turn(messages_copy),
+        "incomplete_turn": incomplete_turn,
     }
 
     with open(path, "w") as f:
@@ -453,6 +465,12 @@ def load_context(agent: "Agent", path: Path | str) -> tuple[bool, str, bool]:
         agent.system_prompt = context["system_prompt"]
     if "session_date" in context and context["session_date"]:
         agent.session_date = context["session_date"]
+    # Absent in saves written before the datetime nudge existed: the agent keeps
+    # the stamp it was constructed with, so an old save resumes with a fresh
+    # clock rather than a fabricated one. (_session_started_at itself is
+    # restored below, with the other session-lifetime counters.)
+    if "last_datetime_nudge_at" in context and context["last_datetime_nudge_at"]:
+        agent._last_datetime_nudge_at = context["last_datetime_nudge_at"]
     if "token_usage" in context:
         agent.prompt_tokens = context["token_usage"].get("prompt", 0)
         agent.completion_tokens = context["token_usage"].get("completion", 0)
@@ -471,8 +489,34 @@ def load_context(agent: "Agent", path: Path | str) -> tuple[bool, str, bool]:
     saved_start = context.get("session_started_at", "")
     if saved_start:
         agent._session_started_at = saved_start
+    # Goal window (/grind): restore the deadline so a process restart resumes
+    # with the REAL remaining time rather than restarting the clock. Additive
+    # fields - absent in older saves, where the defaults mean "no window".
+    agent._goal_text = context.get("goal_text") or ""
+    try:
+        agent._goal_deadline = float(context.get("goal_deadline") or 0.0)
+        agent._goal_set_at = float(context.get("goal_set_at") or 0.0)
+    except (TypeError, ValueError):
+        # A hand-edited or corrupt field must not fail the whole load.
+        agent._goal_deadline = 0.0
+        agent._goal_set_at = 0.0
+    # A question in flight is NOT resumable: the answer it was waiting for is
+    # gone. Clearing is the safe direction - waiting forever is a deadlock
+    # (the hook sees the flag, does nothing, and the window stops silently,
+    # which is the failure the window exists to prevent), and re-asking on
+    # load would put a queue operation in the load path. The pair stays in
+    # history; the model then sees its own previous answer when the question
+    # is asked again, which is harmless and arguably useful.
+    agent._goal_question_pending = False
+    agent._goal_answer_pending = False
+
     # Degenerate-nudge total (additive; absent = keep the fresh value).
     agent._degenerate_nudges_total = int(context.get("nudges_total", 0) or 0)
+
+    # A loaded context is a new conversation: forget the previous task's
+    # duration so the status bar's "dur:" starts from nothing rather than
+    # showing time from a task that is no longer loaded.
+    agent.task_clock.reset()
 
     # Check for incomplete turn and set agent flag.
     # Set unconditionally (True or False) so a later /load of a complete

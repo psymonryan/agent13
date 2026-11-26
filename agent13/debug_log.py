@@ -353,6 +353,16 @@ def log_degenerate_stop(data: dict) -> None:
     log_event("degenerate_stop", data)
 
 
+def log_idle_save(data: dict) -> None:
+    """Log an idle auto-save (or a failed attempt).
+
+    Fields: path + messages on success; error + path on failure. The
+    absence of this event over a long idle stretch means the save never
+    became due (disabled, or the history was unchanged).
+    """
+    log_event("idle_save", data)
+
+
 def log_queue_start(text: str, item_id: int) -> None:
     """Log queue start processing event.
 
@@ -454,7 +464,11 @@ def log_tps_event(event_type: str, data: dict[str, Any] = None) -> None:
     """
     if data is None:
         data = {}
-    data["source"] = "tps_debug"
+    # setdefault, not assignment: a caller that carries its own `source` (the
+    # seed's json|matched|floor) must not have it silently overwritten. Nothing
+    # reads the "tps_debug" marker - the event NAME already carries the tps_
+    # prefix - so an explicit value is strictly more informative.
+    data.setdefault("source", "tps_debug")
     log_event(f"tps_{event_type}", data)
 
 

@@ -10,7 +10,12 @@ from unittest.mock import patch
 
 import pytest
 
-from agent13.history import History, get_history_path, get_default_history_path
+from agent13.history import (
+    HISTORY_LOAD_FILES,
+    History,
+    get_history_path,
+    get_default_history_path,
+)
 
 TODAY = datetime.now().strftime("%Y-%m-%d")
 NEXT_DAY = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
@@ -406,6 +411,107 @@ class TestProjectScoping:
             all_cmds = h2.get_all()
             assert "from instance2" in all_cmds
             assert "from instance1" in all_cmds
+
+
+class TestLoadWindow:
+    """History loads the most recent N files, not the last 7 days.
+
+    Regression: a fixed 7-day window meant a project returned to after a
+    longer gap loaded NOTHING, so its history silently vanished - edmac,
+    an 11-day gap, 2026-11-22. The bound is now a file COUNT.
+    """
+
+    @staticmethod
+    def _write(directory, project, date, command):
+        path = os.path.join(directory, f"history-{project}-{date}")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(f"# {date} 10:00:00\n{command}\n")
+        return path
+
+    def test_loads_across_a_gap_longer_than_a_week(self, temp_dir):
+        """The regression: an 11-day gap must still load the older file."""
+        old = (datetime.now() - timedelta(days=11)).strftime("%Y-%m-%d")
+        today = datetime.now().strftime("%Y-%m-%d")
+        self._write(temp_dir, "edmac", old, "old command")
+        self._write(temp_dir, "edmac", today, "today command")
+
+        path = os.path.join(temp_dir, f"history-edmac-{today}")
+        with patch.object(History, "_get_path", return_value=path):
+            h = History("edmac")
+
+        assert h.get_all() == ["today command", "old command"]
+
+    def test_caps_at_the_most_recent_files(self, temp_dir):
+        """Only the newest HISTORY_LOAD_FILES files are read."""
+        base = datetime.now()
+        dates = [
+            (base - timedelta(days=n)).strftime("%Y-%m-%d")
+            for n in range(HISTORY_LOAD_FILES + 5)
+        ]
+        for d in dates:
+            self._write(temp_dir, "proj", d, f"cmd {d}")
+
+        path = os.path.join(temp_dir, f"history-proj-{dates[0]}")
+        with patch.object(History, "_get_path", return_value=path):
+            h = History("proj")
+
+        assert len(h.file_items) == HISTORY_LOAD_FILES
+        # The newest are kept, the oldest dropped
+        assert h.get_all()[0] == f"cmd {dates[0]}"
+        assert f"cmd {dates[-1]}" not in h.get_all()
+
+    def test_navigation_is_newest_first(self, temp_dir):
+        """up() walks back from the most recent command."""
+        base = datetime.now()
+        d1 = (base - timedelta(days=2)).strftime("%Y-%m-%d")
+        d2 = (base - timedelta(days=1)).strftime("%Y-%m-%d")
+        d3 = base.strftime("%Y-%m-%d")
+        self._write(temp_dir, "proj", d1, "first")
+        self._write(temp_dir, "proj", d2, "second")
+        self._write(temp_dir, "proj", d3, "third")
+
+        path = os.path.join(temp_dir, f"history-proj-{d3}")
+        with patch.object(History, "_get_path", return_value=path):
+            h = History("proj")
+
+        assert [h.up(), h.up(), h.up()] == ["third", "second", "first"]
+
+    def test_test_suffix_files_are_not_mixed_in(self, temp_dir):
+        """A real session must not read a pytest run's history."""
+        today = datetime.now().strftime("%Y-%m-%d")
+        self._write(temp_dir, "proj", today, "real command")
+        with open(
+            os.path.join(temp_dir, f"history-proj_test-{today}"), "w",
+            encoding="utf-8",
+        ) as f:
+            f.write(f"# {today} 10:00:00\ntest command\n")
+
+        path = os.path.join(temp_dir, f"history-proj-{today}")
+        with patch.object(History, "_get_path", return_value=path):
+            h = History("proj")
+
+        assert h.get_all() == ["real command"]
+
+    def test_a_longer_project_name_is_not_loaded(self, temp_dir):
+        """'proj' must not pick up 'proj2' files."""
+        today = datetime.now().strftime("%Y-%m-%d")
+        self._write(temp_dir, "proj", today, "mine")
+        self._write(temp_dir, "proj2", today, "not mine")
+
+        path = os.path.join(temp_dir, f"history-proj-{today}")
+        with patch.object(History, "_get_path", return_value=path):
+            h = History("proj")
+
+        assert h.get_all() == ["mine"]
+
+    def test_missing_directory_is_empty(self, temp_dir):
+        """No history directory at all is not an error."""
+        path = os.path.join(temp_dir, "nope", f"history-proj-{TODAY}")
+        with patch.object(History, "_get_path", return_value=path):
+            h = History("proj")
+
+        assert h.get_all() == []
+        assert h.up() is None
 
 
 class TestSlashCommandBlacklist:

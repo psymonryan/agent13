@@ -88,19 +88,20 @@ def preprocess_env(tmp_path, preprocess_llm_server):
     """
     server = preprocess_llm_server[0]
 
-    # The focus's durable records in the temp cwd.
-    docs = tmp_path / "docs_archive"
-    docs.mkdir()
-    (docs / f"{FOCUS_NAME}_current_truth.md").write_text(
+    config_dir = tmp_path / "agent13-config"
+    config_dir.mkdir()
+
+    # The focus's durable records live in the PROJECT's records directory -
+    # the temp dir the REPL is spawned in.
+    records = tmp_path / "records"
+    records.mkdir(parents=True)
+    (records / f"{FOCUS_NAME}_current_truth.md").write_text(
         f"# truth\n\n{TRUTH_MARKER}\n", encoding="utf-8"
     )
-    (docs / f"{FOCUS_NAME}_journal.md").write_text(
+    (records / f"{FOCUS_NAME}_journal.md").write_text(
         f"# journal\n\n## 2026-01-01 00:00 - old entry\n\n## 2026-01-02 00:00 - last entry\n\n{JOURNAL_MARKER}\n",
         encoding="utf-8",
     )
-
-    config_dir = tmp_path / "agent13-config"
-    config_dir.mkdir()
     config_content = f"""[[providers]]
 name = "test_mock"
 api_base = "http://localhost:{server.port}/v1"
@@ -113,7 +114,6 @@ chain = 0
 """
     (config_dir / "config.toml").write_text(config_content)
 
-    # The REPL must run in the temp cwd so it finds docs_archive/.
     env = os.environ.copy()
     env["AGENT13_CONFIG_DIR"] = str(config_dir)
     env["AGENT13_SAVES_DIR"] = str(tmp_path / "saves")
@@ -169,8 +169,9 @@ class TestFocusPreprocessExperience:
         the records and the ack."""
         _, captured = preprocess_llm_server
         env, tmp = preprocess_env
-        # The spawned REPL inherits this process's cwd - it must run in the
-        # temp dir to find docs_archive/<focus>_*.
+        # The spawned REPL inherits this process's cwd, and the memory
+        # directory is <cwd>/records - so it must run in the temp
+        # project to find the records.
         monkeypatch.chdir(tmp)
         proc = spawn_repl(env)
 

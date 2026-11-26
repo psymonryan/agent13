@@ -195,18 +195,18 @@ class TestHelpExperience:
     """User asks for help."""
 
     def test_help_shows_commands_header(self, repl_env):
-        """User types /help and sees 'Commands:' header."""
+        """User types /help and sees the grouped command list."""
         proc = spawn_repl(repl_env)
 
         try:
             proc.sendline("/help")
             time.sleep(1)
 
-            # Should see commands header
-            proc.expect("Commands:", timeout=5)
+            # Should see a section header
+            proc.expect("Session:", timeout=5)
 
             # Should see at least one command
-            proc.expect("/quit", timeout=5)
+            proc.expect("/help", timeout=5)
 
             wait_for_prompt(proc)
         finally:
@@ -560,6 +560,39 @@ class TestQueueExperience:
 # ─── Test: /history ────────────────────────────────────────────────
 
 
+class TestPromoteLatestExperience:
+    """A bare "!"/"!!" is a promotion, not an empty message.
+
+    The promotion itself is front-end independent (agent13.commands
+    .promote_latest, unit-tested in test_queue_promote.py and driven end to
+    end through the TUI in test_queue_promote_integration.py). What these
+    pin is the REPL's own branch: a bare prefix must reach the helper
+    instead of being silently dropped.
+    """
+
+    def test_bare_steer_with_nothing_queued(self, repl_env):
+        """User types !! with an empty queue and sees the hint."""
+        proc = spawn_repl(repl_env)
+
+        try:
+            proc.sendline("!!")
+            proc.expect(r"\[steer\] nothing queued", timeout=10)
+            wait_for_prompt(proc)
+        finally:
+            proc.close()
+
+    def test_bare_priority_with_nothing_queued(self, repl_env):
+        """User types ! with an empty queue and sees the hint."""
+        proc = spawn_repl(repl_env)
+
+        try:
+            proc.sendline("!")
+            proc.expect(r"\[priority\] nothing queued", timeout=10)
+            wait_for_prompt(proc)
+        finally:
+            proc.close()
+
+
 class TestHistoryExperience:
     """User views message history."""
 
@@ -643,22 +676,22 @@ class TestPauseResumeExperience:
             proc.close()
 
 
-# ─── Test: Interrupt prefix ───────────────────────────────────────
+# ─── Test: Steer prefix ───────────────────────────────────────
 
 
-class TestInterruptExperience:
-    """User sends interrupt-priority messages."""
+class TestSteerExperience:
+    """User sends steer-priority messages."""
 
-    def test_interrupt_prefix_shows_notification(self, repl_env):
-        """User sends !! message and sees interrupt notification."""
+    def test_steer_prefix_shows_notification(self, repl_env):
+        """User sends !! message and sees the steer notification."""
         proc = spawn_repl(repl_env)
 
         try:
             proc.sendline("!!fix this now")
             time.sleep(3)
 
-            # Should see interrupt notification
-            proc.expect("(?i)interrupt", timeout=10)
+            # Should see the steer notification
+            proc.expect("(?i)steer", timeout=10)
 
             wait_for_prompt(proc)
         finally:

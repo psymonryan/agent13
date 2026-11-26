@@ -1,15 +1,16 @@
-"""Wiring tests for the shared per-project pins store and /devel pin.
+"""Wiring tests for the shared per-project pins store, /devel and /sandbox.
 
 Covers agent13.pins (file format, section isolation, devel typed helpers),
-the sandbox pin delegation (enum in/out, public API unchanged), and the TUI
-/devel handler's pin/unpin/status branches.
+the sandbox pin delegation (enum in/out, public API unchanged), and the
+shared /devel and /sandbox handlers' pin/unpin/status branches.
 """
 
 import tomllib
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import pytest
 
+from agent13.commands import execute_devel, execute_sandbox
 from agent13.pins import (
     SECTION_DEVEL,
     SECTION_SANDBOX,
@@ -155,82 +156,123 @@ class TestSandboxPinDelegation:
         assert get_pinned_sandbox_mode() is None
 
 
-def _make_tui_app(agent_devel_mode: bool):
-    """Build a real AgentTUI with a stub agent (see test_skills_slash_args)."""
-    from ui.tui import AgentTUI as ChatApp
-
-    with patch("ui.tui.get_config", return_value=MagicMock()):
-        app = ChatApp(
-            client=MagicMock(),
-            model="test-model",
-            model_names=["test-model"],
-            provider="test",
-        )
+def _make_agent(devel_mode: bool):
+    """Stub agent carrying the only state /devel touches."""
     agent = MagicMock()
-    agent.devel_mode = agent_devel_mode
-    app.agent = agent
-    return app, agent
+    agent.devel_mode = devel_mode
+    return agent
 
 
-@pytest.mark.asyncio
-class TestTuiDevelHandler:
-    """TUI /devel handler pin/unpin/status branches (real handler code)."""
+class TestDevelCommandHandler:
+    """/devel shared handler: pin/unpin/status/usage branches."""
 
-    async def test_pin_on(self, pins_env):
-        app, agent = _make_tui_app(True)
-        captured = []
-        app._update_info_content = lambda text: captured.append(text)
-        app._handle_devel_command("pin")
+    def test_pin_on(self, pins_env):
+        result = execute_devel(_make_agent(True), "pin")
+        assert result.success
         assert get_pinned_devel() is True
-        assert "Pinned devel mode 'on'" in captured[0]
+        assert "Pinned devel mode 'on'" in result.message
 
-    async def test_pin_off(self, pins_env):
-        app, agent = _make_tui_app(False)
-        captured = []
-        app._update_info_content = lambda text: captured.append(text)
-        app._handle_devel_command("pin")
+    def test_pin_off(self, pins_env):
+        result = execute_devel(_make_agent(False), "pin")
         assert get_pinned_devel() is False
-        assert "Pinned devel mode 'off'" in captured[0]
+        assert "Pinned devel mode 'off'" in result.message
 
-    async def test_unpin_with_pin(self, pins_env):
+    def test_unpin_with_pin(self, pins_env):
         pin_devel(True)
-        app, agent = _make_tui_app(True)
-        captured = []
-        app._update_info_content = lambda text: captured.append(text)
-        app._handle_devel_command("unpin")
+        result = execute_devel(_make_agent(True), "unpin")
+        assert result.success
         assert get_pinned_devel() is None
-        assert "Removed devel pin" in captured[0]
+        assert "Removed devel pin" in result.message
 
-    async def test_unpin_without_pin(self, pins_env):
-        app, agent = _make_tui_app(False)
-        captured = []
-        app._update_info_content = lambda text: captured.append(text)
-        app._handle_devel_command("unpin")
-        assert get_pinned_devel() is None
-        assert "No devel pin exists" in captured[0]
+    def test_unpin_without_pin(self, pins_env):
+        result = execute_devel(_make_agent(False), "unpin")
+        assert not result.success
+        assert "No devel pin exists" in result.message
 
-    async def test_status_shows_pinned(self, pins_env):
-        """Status branch reads the pin store - verify via the info content."""
+    def test_status_shows_pinned(self, pins_env):
+        """The status branch reads the pin store."""
         pin_devel(True)
-        app, agent = _make_tui_app(True)
-        captured = []
-        app._update_info_content = lambda text: captured.append(text)
-        app._handle_devel_command("")  # no args = status
-        assert captured, "handler did not update info content"
-        assert "Pinned: [yellow]on[/]" in captured[0]
-        assert "Devel mode: on" in captured[0]
+        result = execute_devel(_make_agent(True), "")  # no args = status
+        assert result.success
+        assert "Devel mode: on" in result.message
+        assert "Pinned: on" in result.message
 
-    async def test_status_no_pin(self, pins_env):
-        app, agent = _make_tui_app(False)
-        captured = []
-        app._update_info_content = lambda text: captured.append(text)
-        app._handle_devel_command("status")
-        assert "Pinned: [dim]no[/]" in captured[0]
+    def test_status_no_pin(self, pins_env):
+        result = execute_devel(_make_agent(False), "status")
+        assert "Devel mode: off" in result.message
+        assert "Pinned: no" in result.message
 
-    async def test_usage_text_lists_pin(self, pins_env):
-        app, agent = _make_tui_app(False)
-        captured = []
-        app._update_info_content = lambda text: captured.append(text)
-        app._handle_devel_command("bogus")
-        assert "/devel pin" in captured[0]
-        assert "/devel unpin" in captured[0]
+    def test_usage_text_lists_pin(self, pins_env):
+        result = execute_devel(_make_agent(False), "bogus")
+        assert not result.success
+        assert "/devel pin" in result.message
+        assert "/devel unpin" in result.message
+
+    def test_on_off_set_the_flag_and_refresh_the_status_bar(self, pins_env):
+        agent = _make_agent(False)
+        result = execute_devel(agent, "on")
+        agent.set_devel_mode.assert_called_once_with(True)
+        assert result.refresh_status is True
+        assert "Devel mode enabled" in result.message
+
+        agent = _make_agent(True)
+        result = execute_devel(agent, "off")
+        agent.set_devel_mode.assert_called_once_with(False)
+        assert result.refresh_status is True
+        assert "Devel mode disabled" in result.message
+
+
+class TestSandboxCommandHandler:
+    """/sandbox shared handler: status, set, pin, unpin, bad mode."""
+
+    @pytest.fixture(autouse=True)
+    def _restore_session_mode(self):
+        """The session override is a process-wide global - put it back.
+
+        Leaving it set would sandbox every later test in the same run.
+        """
+        from tools import security
+
+        saved = security._session_sandbox_mode
+        yield
+        security._session_sandbox_mode = saved
+
+    def test_status_lists_the_four_sources(self, pins_env):
+        result = execute_sandbox(None, "")
+        assert result.success
+        for label in (
+            "Sandbox Configuration:",
+            "Current mode:",
+            "Session override:",
+            "Config default:",
+            "Pinned:",
+        ):
+            assert label in result.message
+
+    def test_set_mode(self, pins_env):
+        from tools.security import get_session_sandbox_mode
+
+        result = execute_sandbox(None, "off")
+        assert result.success
+        assert "Sandbox mode set to: off" in result.message
+        assert get_session_sandbox_mode() is SandboxMode.OFF
+
+    def test_invalid_mode_says_error_and_usage(self, pins_env):
+        result = execute_sandbox(None, "bogus")
+        assert not result.success
+        assert "Error" in result.message
+        assert "/sandbox pin" in result.message
+
+    def test_pin_and_unpin(self, pins_env):
+        execute_sandbox(None, "restrictive-open")
+        result = execute_sandbox(None, "pin")
+        assert result.success
+        assert get_pinned_sandbox_mode() is SandboxMode.RESTRICTIVE_OPEN
+
+        result = execute_sandbox(None, "unpin")
+        assert result.success
+        assert get_pinned_sandbox_mode() is None
+
+        result = execute_sandbox(None, "unpin")
+        assert not result.success
+        assert "No sandbox pin exists" in result.message

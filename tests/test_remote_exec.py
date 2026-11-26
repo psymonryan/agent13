@@ -165,7 +165,7 @@ class TestBuildRemoteArgv:
         The stdin-pipe form is racy: a child the script spawns (e.g. csc.exe
         from Add-Type) inherits the script's stdin pipe and can steal bytes,
         truncating the script -> empty/partial stdout with exit 0. Reproduced
-        15/15 on c122 with an Add-Type + same-line continuation script.
+        15/15 on Windows with an Add-Type + same-line continuation script.
         See commandv2issues.md section 1.
         """
         argv = build_remote_argv("myhost", "powershell")

@@ -66,6 +66,10 @@ def _make_app(mcp):
 
     agent = MagicMock()
     agent.durable_records = DurableRecords()
+    # The status bar reads model/provider from the agent (single source
+    # of truth), so the stub must carry real strings, not MagicMocks.
+    agent.model = "test-model"
+    agent.provider_name = "test"
     agent.mcp = mcp
     agent._mcp = mcp
     agent._mcp_server_configs = []

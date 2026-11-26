@@ -2,6 +2,7 @@
 
 from agent13.skills.models import SkillInfo, SkillMetadata
 from agent13.skills.manager import SkillManager, ensure_default_skills
+from agent13.skills.defaults import sync_default_skills
 from agent13.skills.parser import parse_frontmatter, SkillParseError
 
 __all__ = [
@@ -9,6 +10,7 @@ __all__ = [
     "SkillMetadata",
     "SkillManager",
     "ensure_default_skills",
+    "sync_default_skills",
     "parse_frontmatter",
     "SkillParseError",
 ]

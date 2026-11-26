@@ -10,6 +10,24 @@ check_interval_hours = 24
 [saves]
 location = "local"
 
+# Idle auto-save
+# The daily auto-save is written on exit. With idle_seconds > 0 it is ALSO
+# written once after this many seconds with nothing to do (the same file, so
+# --continue picks up the freshest state). It fires once per idle period and
+# only when the history changed - a long quiet stretch never rewrites an
+# unchanged file. 0 = off.
+# Equivalent CLI flag: --auto-save-idle N
+[auto_save]
+idle_seconds = 300
+
+# The model's clock. The system prompt's "Session started" line is frozen for
+# the whole session (a mid-session rewrite would invalidate the KV-cache
+# prefix), so "now" reaches the model as an injected message instead: during a
+# long turn, and at the start of a turn after the session sat idle. A day
+# change always fires, whatever this is set to. 0 disables.
+[datetime]
+nudge_seconds = 3600
+
 # Clipboard method
 # "osc52" = terminal escape sequence (default, works over SSH)
 #   Requires terminal support: Alacritty, Ghostty, Kitty, iTerm2,
@@ -58,6 +76,13 @@ threshold = 180000
 # user turn. 0 = no restarts (the action fires once, then idle). Ignored when
 # action = "none". Change at runtime with: /auto_context_chain N
 # chain = 3
+# Inject a TOPIC INDEX of the current-truth file instead of the whole file.
+# Each topic is one line plus its first fact, with the file line number to read
+# on demand; the ticket section is injected verbatim. Only applies to a record
+# that has been migrated to "### TOPIC" headings - an unmigrated or
+# half-migrated record is injected unchanged, so this is safe to leave on.
+# Default false: the whole file is the known-good behaviour.
+# truth_index = false
 
 # Tool output bounding
 # Tool results are the dominant unbounded source of context growth. A result
@@ -70,6 +95,17 @@ threshold = 180000
 # Set to 0 to disable bounding entirely.
 [tools]
 max_result_chars = 30000
+# Mind maps (.itmz): refuse a write when the file was written this recently.
+# The iThoughts app autosaves 10-20 s after an edit, so a fresh mtime means the
+# user may be typing in the map - and the app silently discards their unsaved
+# edit when the file changes underneath it. 0 disables the guard.
+# The map tools are default-visible; to hide them entirely, add
+#   disabled_tools = ["*map*"]
+# to the global tool filter below.
+mindmap_quiet_seconds = 20
+# An .itmz whose style.xml is copied into maps made by create_map. Empty uses
+# the bundled outline style. Point it at any map you like the look of.
+# mindmap_style_template = "~/maps/journal.itmz"
 
 # UI settings
 # cursor_blink = false  → solid cursor, no periodic terminal output (default, tmux-friendly)
@@ -86,6 +122,28 @@ max_result_chars = 30000
 cursor_blink = false
 reasoning_collapsed = true
 toolview_collapsed = true
+# Status-bar colours. fg = text colour, bg = background; "" = leave that
+# channel alone (fg falls back to the bar's text colour, bg to its own).
+# Any name the terminal knows works: red, yellow, orange, black, #ff8800 ...
+#
+# The bar itself. DEFAULT: the theme's own colours (white on the primary
+# colour). Uncomment to pin your own, e.g. a dark grey bar:
+# status_fg = "white"
+# status_bg = "#333333"
+#
+# The Ctx segment turns warn at 80% and crit at 90% of the [auto_context]
+# threshold. DEFAULT: coloured text on the bar's own background.
+ctx_warn_fg = "yellow"
+ctx_warn_bg = ""
+ctx_crit_fg = "red"
+ctx_crit_bg = ""
+# SOLID BLOCK alternative - black text on a coloured background, visually
+# distinct from a foreground-only red (e.g. a bell indicator).
+# To use it: comment out the four lines above, uncomment the four below.
+# ctx_warn_fg = "black"
+# ctx_warn_bg = "yellow"
+# ctx_crit_fg = "black"
+# ctx_crit_bg = "red"
 
 # Vision support — lets the agent "see" images returned by tools.
 # Uncomment and configure to enable.
@@ -106,14 +164,17 @@ toolview_collapsed = true
 # Config directory: ~/.agent13 (or $AGENT13_CONFIG_DIR)
 # Environment: ~/.env then ./.env (local overrides global)
 
+# Providers. These are EXAMPLES: replace api_base with your own host - a
+# hostname, an IP, or localhost. A provider is selected by name on the command
+# line (`agent13 studio`); `--list-providers` shows what is configured.
 [[providers]]
 name = "studio"
-api_base = "http://c10:8012/v1"
+api_base = "http://localhost:8012/v1"
 api_key_env_var = "OPENAI_API_KEY"
 
 [[providers]]
 name = "studiomlx"
-api_base = "http://c10:8111/v1"
+api_base = "http://localhost:8111/v1"
 api_key_env_var = "OPENAI_API_KEY"
 
 [[providers]]
@@ -121,21 +182,23 @@ name = "openrouter"
 api_base = "https://openrouter.ai/api/v1"
 api_key_env_var = "OPENROUTER_API_KEY"
 
+# A model server on another machine on your network. "example-host" stands in
+# for its hostname or IP.
 [[providers]]
-name = "c144mlx"
-api_base = "http://c144:8111/v1"
+name = "lanmlx"
+api_base = "http://example-host:8111/v1"
 api_key_env_var = "OPENAI_API_KEY"
 # read_timeout = 2400  # Seconds to wait for tokens during streaming (default: 2400)
 # connect_timeout = 30  # Seconds to wait for initial connection (default: 30)
 
 [[providers]]
-name = "c144"
-api_base = "http://c144:8012/v1"
+name = "lanstudio"
+api_base = "http://example-host:8012/v1"
 api_key_env_var = "OPENAI_API_KEY"
 
 [[providers]]
-name = "green"
-api_base = "http://green:9292/v1"
+name = "lanserver"
+api_base = "http://example-host:9292/v1"
 api_key_env_var = "OPENAI_API_KEY"
 
 # Global tool filtering (applies to ALL tools: builtin + MCP)
@@ -156,7 +219,7 @@ api_key_env_var = "OPENAI_API_KEY"
 # [[mcp_servers]]
 # name = "hvac_server"
 # transport = "http"
-# url = "http://c10:4040/mcp"
+# url = "http://localhost:4040/mcp"
 # enabled_tools = []
 # disabled_tools = []
 # connect_timeout = 300  # Seconds to establish the connection (default: 300)
